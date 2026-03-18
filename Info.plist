@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.local.CameraShot</string>
+    <key>CFBundleName</key>
+    <string>CameraShot</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>CameraShot</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSCameraUsageDescription</key>
+    <string>CameraShot captures screenshots from your camera at a configurable interval.</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>LSUIElement</key>
+    <false/>
+</dict>
+</plist>

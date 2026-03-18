@@ -1,0 +1,30 @@
+# Swift build artifacts
+.build/
+*.o
+*.d
+
+# Xcode / SPM
+.swiftpm/
+xcuserdata/
+*.xcworkspace
+*.xcodeproj
+DerivedData/
+
+# macOS app bundle (built output, not source)
+CameraShot.app/
+
+# macOS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment / secrets
+.env
+*.enc
