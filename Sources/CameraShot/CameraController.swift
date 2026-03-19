@@ -12,6 +12,8 @@ final class CameraController: NSObject {
 
     /// Invoked on the main thread after each screenshot is saved.
     var onScreenshotSaved: ((URL, Int) -> Void)?
+    /// Capture gate from app flow-control (e.g. AI queue backpressure).
+    var shouldCaptureFrame: (() -> Bool)?
 
     // MARK: - Private
 
@@ -22,6 +24,7 @@ final class CameraController: NSObject {
     private let jpegQuality:  Double
     private var lastSaveTime: CFAbsoluteTime = 0
     private var saveCount     = 0
+    private let changeFilter  = FrameChangeFilter(minimumChangedRatio: 0.03)
 
     /// Rolling buffer — oldest file is deleted once this exceeds maxFiles.
     private var savedFiles:   [URL] = []
@@ -61,6 +64,12 @@ final class CameraController: NSObject {
 
     func start() { captureQueue.async { self.session.startRunning() } }
     func stop()  { session.stopRunning() }
+    /// Allows next frame to bypass interval timing gate once.
+    func requestImmediateCapture() {
+        captureQueue.async { [weak self] in
+            self?.lastSaveTime = 0
+        }
+    }
 
     // MARK: - Session setup
 
@@ -107,6 +116,7 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
     ) {
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastSaveTime >= interval else { return }
+        guard shouldCaptureFrame?() ?? true else { return }
         lastSaveTime = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
@@ -116,6 +126,10 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
     private func persistFrame(_ pixelBuffer: CVPixelBuffer) {
         let ci = CIImage(cvPixelBuffer: pixelBuffer)
         guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return }
+        guard changeFilter.shouldAccept(cg) else {
+            print("Skipped: frame difference below 3%")
+            return
+        }
 
         let usePNG = jpegQuality >= 1.0
         let ts     = dateFormatter.string(from: Date())

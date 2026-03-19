@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.local.CameraShot</string>
+    <string>com.camerashot.CameraShot</string>
     <key>CFBundleName</key>
     <string>CameraShot</string>
     <key>CFBundleVersion</key>
@@ -14,10 +14,20 @@
     <string>CameraShot</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>NSCameraUsageDescription</key>
     <string>CameraShot captures screenshots from your camera at a configurable interval.</string>
+    <key>NSScreenRecordingUsageDescription</key>
+    <string>CameraShot can capture your screen or a specific window at a configurable interval for AI analysis.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2025. All rights reserved.</string>
+    <key>NSApplicationSupportsSecureRestorableState</key>
+    <true/>
     <key>LSUIElement</key>
     <false/>
 </dict>

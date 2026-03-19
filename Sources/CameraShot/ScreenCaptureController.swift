@@ -13,35 +13,32 @@ enum ScreenTarget {
 
 // MARK: - ScreenCaptureController
 
+/// Takes one-shot screenshots at a fixed interval using SCScreenshotManager.
+/// No persistent SCStream is held, so apps like Chrome do not show a recording indicator.
 final class ScreenCaptureController: NSObject {
 
     // MARK: – Public
 
     var onScreenshotSaved: ((URL, Int) -> Void)?
-    /// Throttled preview frames (~10 fps) delivered on the main thread.
-    var onPreviewFrame: ((CGImage) -> Void)?
+    /// Capture gate from app flow-control (e.g. AI queue backpressure).
+    var shouldCaptureFrame: (() -> Bool)?
 
     // MARK: – Private
 
-    private let target: ScreenTarget
-
-    private let captureQueue = DispatchQueue(label: "shot.screen.capture", qos: .userInteractive)
-    private let saveQueue    = DispatchQueue(label: "shot.screen.save",    qos: .utility)
-
+    private let target:      ScreenTarget
+    private let saveQueue  = DispatchQueue(label: "shot.screen.save", qos: .utility)
     private let interval:    TimeInterval
     private let jpegQuality: Double
+    private var saveCount  = 0
+    private let changeFilter = FrameChangeFilter(minimumChangedRatio: 0.03)
+    private var savedFiles:  [URL] = []
+    private let maxFiles   = 30
+    private let outputDir:   URL
+    private let ciContext:   CIContext
 
-    private var lastSaveTime:    CFAbsoluteTime = 0
-    private var lastPreviewTime: CFAbsoluteTime = 0
-    private var saveCount = 0
-
-    /// Rolling buffer — oldest file deleted once count exceeds maxFiles.
-    private var savedFiles: [URL] = []
-    private let maxFiles    = 30
-
-    private let outputDir: URL
-    private let ciContext: CIContext
-    private var stream: SCStream?
+    private var captureTask: Task<Void, Never>?
+    private var sleepTask:   Task<Void, Error>?
+    private var immediateRequested = false
 
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -71,115 +68,67 @@ final class ScreenCaptureController: NSObject {
     // MARK: – Control
 
     func start() async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-
-        let filter:    SCContentFilter
-        let cfgWidth:  Int
-        let cfgHeight: Int
-
-        switch target {
-
-        case .display(let id):
-            guard let display = content.displays.first(where: { $0.displayID == id }) else {
-                throw ScreenCaptureError.targetNotFound
-            }
-            let scale = screenScale(forDisplayID: id)
-            filter    = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-            cfgWidth  = Int(Double(display.width)  * scale)
-            cfgHeight = Int(Double(display.height) * scale)
-
-        case .window(let id):
-            guard let window = content.windows.first(where: { $0.windowID == id }) else {
-                throw ScreenCaptureError.targetNotFound
-            }
-            let scale = screenScale(forWindowFrame: window.frame)
-            filter    = SCContentFilter(desktopIndependentWindow: window)
-            cfgWidth  = max(100, Int(window.frame.width  * scale))
-            cfgHeight = max(100, Int(window.frame.height * scale))
+        let filter = try await buildFilter()
+        captureTask = Task { [weak self] in
+            await self?.captureLoop(filter: filter)
         }
-
-        let config = SCStreamConfiguration()
-        config.width                = cfgWidth
-        config.height               = cfgHeight
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        config.queueDepth           = 3
-        config.pixelFormat          = kCVPixelFormatType_32BGRA
-        config.showsCursor          = true
-
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
-        try await stream.startCapture()
-        self.stream = stream
     }
 
     func stop() {
-        Task { try? await stream?.stopCapture() }
+        captureTask?.cancel()
+        sleepTask?.cancel()
+        captureTask = nil
+        sleepTask   = nil
     }
 
-    // MARK: – Helpers
-
-    private func screenScale(forDisplayID id: CGDirectDisplayID) -> Double {
-        Double(NSScreen.screens.first(where: {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == id
-        })?.backingScaleFactor ?? 1.0)
+    /// Wakes the interval sleep so the next screenshot fires immediately.
+    func requestImmediateCapture() {
+        immediateRequested = true
+        sleepTask?.cancel()
     }
 
-    private func screenScale(forWindowFrame frame: CGRect) -> Double {
-        let mid = CGPoint(x: frame.midX, y: frame.midY)
-        return Double(NSScreen.screens.first(where: { $0.frame.contains(mid) })?.backingScaleFactor ?? 1.0)
-    }
+    // MARK: – Capture loop
 
-    // MARK: – Errors
-
-    enum ScreenCaptureError: LocalizedError {
-        case targetNotFound
-
-        var errorDescription: String? {
-            "The selected display or window could not be found. It may have been closed or disconnected."
-        }
-    }
-}
-
-// MARK: - SCStreamDelegate
-
-extension ScreenCaptureController: SCStreamDelegate {
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        fputs("Screen capture stopped: \(error.localizedDescription)\n", stderr)
-    }
-}
-
-// MARK: - SCStreamOutput
-
-extension ScreenCaptureController: SCStreamOutput {
-
-    func stream(
-        _ stream: SCStream,
-        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
-        of outputType: SCStreamOutputType
-    ) {
-        guard outputType == .screen,
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
-        let now = CFAbsoluteTimeGetCurrent()
-
-        // Throttled preview (~10 fps).
-        if now - lastPreviewTime >= 0.10 {
-            lastPreviewTime = now
-            let ci = CIImage(cvPixelBuffer: pixelBuffer)
-            if let cg = ciContext.createCGImage(ci, from: ci.extent) {
-                DispatchQueue.main.async { [weak self] in self?.onPreviewFrame?(cg) }
+    private func captureLoop(filter: SCContentFilter) async {
+        while !Task.isCancelled {
+            if shouldCaptureFrame?() ?? true {
+                await takeScreenshot(filter: filter)
             }
+
+            // Skip sleep if an immediate capture was requested before we got here.
+            guard !immediateRequested else {
+                immediateRequested = false
+                continue
+            }
+
+            let st = Task { try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000)) }
+            sleepTask = st
+            try? await st.value
         }
-
-        guard now - lastSaveTime >= interval else { return }
-        lastSaveTime = now
-
-        saveQueue.async { [weak self, pixelBuffer] in self?.persistFrame(pixelBuffer) }
     }
 
-    private func persistFrame(_ pixelBuffer: CVPixelBuffer) {
-        let ci = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return }
+    private func takeScreenshot(filter: SCContentFilter) async {
+        let config = SCStreamConfiguration()
+        config.showsCursor = true
+
+        do {
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: config
+            )
+            saveQueue.async { [weak self] in self?.persistImage(image) }
+        } catch {
+            fputs("Screenshot failed: \(error.localizedDescription)\n", stderr)
+        }
+    }
+
+    // MARK: – Persistence
+
+    private func persistImage(_ cgImage: CGImage) {
+        guard changeFilter.shouldAccept(cgImage) else {
+            print("Skipped: frame difference below 3%")
+            return
+        }
 
         let usePNG = jpegQuality >= 1.0
         let prefix = if case .window = target { "win" } else { "scr" }
@@ -189,10 +138,9 @@ extension ScreenCaptureController: SCStreamOutput {
 
         guard let dest = CGImageDestinationCreateWithURL(url as CFURL, uti as CFString, 1, nil) else { return }
         let props: CFDictionary? = usePNG ? nil : [kCGImageDestinationLossyCompressionQuality: jpegQuality] as CFDictionary
-        CGImageDestinationAddImage(dest, cg, props)
+        CGImageDestinationAddImage(dest, cgImage, props)
         guard CGImageDestinationFinalize(dest) else { return }
 
-        // Rolling buffer: keep only the last `maxFiles` screenshots.
         savedFiles.append(url)
         if savedFiles.count > maxFiles {
             let oldest = savedFiles.removeFirst()
@@ -203,5 +151,34 @@ extension ScreenCaptureController: SCStreamOutput {
         let n = saveCount
         print("[\(n)] Saved: \(url.lastPathComponent)")
         DispatchQueue.main.async { [weak self] in self?.onScreenshotSaved?(url, n) }
+    }
+
+    // MARK: – Filter builder
+
+    private func buildFilter() async throws -> SCContentFilter {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+
+        switch target {
+        case .display(let id):
+            guard let display = content.displays.first(where: { $0.displayID == id }) else {
+                throw ScreenCaptureError.targetNotFound
+            }
+            return SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+
+        case .window(let id):
+            guard let window = content.windows.first(where: { $0.windowID == id }) else {
+                throw ScreenCaptureError.targetNotFound
+            }
+            return SCContentFilter(desktopIndependentWindow: window)
+        }
+    }
+
+    // MARK: – Helpers
+
+    enum ScreenCaptureError: LocalizedError {
+        case targetNotFound
+        var errorDescription: String? {
+            "The selected display or window could not be found. It may have been closed or disconnected."
+        }
     }
 }

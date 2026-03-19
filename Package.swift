@@ -3,11 +3,12 @@ import PackageDescription
 
 let package = Package(
     name: "CameraShot",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
             name: "CameraShot",
-            path: "Sources/CameraShot"
+            path: "Sources/CameraShot",
+            resources: [.process("Resources")]
         )
     ]
 )

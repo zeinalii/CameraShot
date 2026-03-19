@@ -1,5 +1,4 @@
 APP       := CameraShot.app
-BINARY    := .build/release/CameraShot
 MACOS     := $(APP)/Contents/MacOS
 RESOURCES := $(APP)/Contents/Resources
 
@@ -7,8 +6,9 @@ RESOURCES := $(APP)/Contents/Resources
 
 build:
 	swift build -c release
-	@mkdir -p $(MACOS) $(RESOURCES)
-	@cp $(BINARY) $(MACOS)/CameraShot
+	@mkdir -p $(MACOS) $(RESOURCES)/Resources
+	@BUILD_DIR=$$(swift build -c release --show-bin-path); cp "$$BUILD_DIR/CameraShot" $(MACOS)/CameraShot
+	@cp -R Sources/CameraShot/Resources/. $(RESOURCES)/Resources/
 	@cp Info.plist $(APP)/Contents/Info.plist
 	@codesign --force --sign - --entitlements CameraShot.entitlements $(APP)
 	@echo "✓ Built: $(APP)"

@@ -19,18 +19,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureCtrl: CaptureWindowController?
     private var aiProcessor: AIProcessor?
     private var aiPaused = false
+    /// Max number of concurrent AI responses; set to 1 for strict response-paced capture.
+    private let responseQueueLimit = 1
+    private let responseFlowStateQueue = DispatchQueue(label: "camerashot.response-flow.state")
+    private var responseFlowEnabled = false
+    private var inFlightResponses = 0
 
     // MARK: – Session key (derived from passphrase, held only in RAM)
     private var sessionKey:    SymmetricKey?
     private var sessionSalt:   Data?
-    private var sessionAPIKey: String?   // decrypted API key for this launch
+    private var sessionAPIKey: String?
 
     func applicationDidFinishLaunching(_ _: Notification) {
         buildMenu()
         requestCameraPermission { [weak self] in self?.autoUnlock() }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ _: NSApplication) -> Bool { true }
+    /// Keep the app running when windows close so Stop can return to setup reliably.
+    func applicationShouldTerminateAfterLastWindowClosed(_ _: NSApplication) -> Bool { false }
 
     // MARK: – Auto-unlock
 
@@ -50,8 +56,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self?.showSetup()
                     }
                 } catch {
-                    // Passphrase was changed externally or file is corrupt.
-                    // Wipe the stale file and start fresh.
                     EncryptedKeyStore.delete()
                     DispatchQueue.main.async { [weak self] in
                         self?.initFreshSession(passphrase: passphrase)
@@ -92,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         captureCtrl?.close()
         cameraCtrl = nil; screenCtrl = nil; captureCtrl = nil
         aiProcessor = nil
+        configureResponseFlow(enabled: false)
         showSetup()
     }
 
@@ -126,9 +131,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func makeAIProcessor(config: AIConfig, window: CaptureWindowController) -> AIProcessor? {
         guard config.enabled else { return nil }
-        let proc = AIProcessor(config: config, apiKey: sessionAPIKey)
-        proc.onResult = { [weak window] text, url in window?.appendResult(response: text, imageURL: url) }
-        proc.onError  = { [weak window] msg        in window?.appendError(msg) }
+        let proc = AIProcessor(
+            config: config,
+            apiKey: sessionAPIKey,
+            maxConcurrentRequests: responseQueueLimit
+        )
+        proc.onResult = { [weak self, weak window] text, url in
+            self?.releaseResponseSlot()
+            window?.appendResult(response: text, imageURL: url)
+        }
+        proc.onStreamChunk = { [weak window] chunk, url in window?.appendStreamingChunk(chunk, imageURL: url) }
+        proc.onError = { [weak self, weak window] msg, imageURL in
+            self?.releaseResponseSlot()
+            window?.appendError(msg, imageURL: imageURL)
+        }
         return proc
     }
 
@@ -138,12 +154,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         source: CaptureSource, interval: TimeInterval,
         quality: Double, outputDir: URL, aiConfig: AIConfig
     ) {
+        configureResponseFlow(enabled: aiConfig.enabled)
+        clearPreviousScreenshots(in: outputDir)
+
         switch source {
         case .camera(let device):
             let ctrl = CameraController(device: device, interval: interval,
                                         jpegQuality: quality, outputDir: outputDir)
-            let wc   = CaptureWindowController(source: .camera(ctrl.session),
-                                               name: device.localizedName, interval: interval)
+            ctrl.shouldCaptureFrame = { [weak self] in
+                self?.canCaptureNextFrame() ?? false
+            }
+            let wc   = CaptureWindowController(name: device.localizedName, interval: interval)
             aiProcessor = makeAIProcessor(config: aiConfig, window: wc)
             ctrl.onScreenshotSaved = { [weak self, weak wc] url, n in
                 wc?.updateStatus(filename: url.lastPathComponent, count: n)
@@ -154,8 +175,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ctrl?.stop()
                 self?.aiProcessor = nil
                 self?.aiPaused = false
-                wc?.close()
+                self?.configureResponseFlow(enabled: false)
                 self?.showSetup()
+                NSApp.activate(ignoringOtherApps: true)
+                DispatchQueue.main.async { wc?.close() }
             }
             cameraCtrl = ctrl; screenCtrl = nil; captureCtrl = wc
             setupCtrl?.close(); wc.showWindow(nil); ctrl.start()
@@ -179,20 +202,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) {
         let ctrl = ScreenCaptureController(target: target, interval: interval,
                                            jpegQuality: quality, outputDir: outputDir)
-        let wc   = CaptureWindowController(source: .screen, name: name, interval: interval)
+        ctrl.shouldCaptureFrame = { [weak self] in
+            self?.canCaptureNextFrame() ?? false
+        }
+        let wc   = CaptureWindowController(name: name, interval: interval)
         aiProcessor = makeAIProcessor(config: aiConfig, window: wc)
         ctrl.onScreenshotSaved = { [weak self, weak wc] url, n in
             wc?.updateStatus(filename: url.lastPathComponent, count: n)
             self?.handleNewScreenshot(url, window: wc)
         }
-        ctrl.onPreviewFrame = { [weak wc] img in wc?.updatePreviewImage(img) }
         wc.onPauseAI = { [weak self] paused in self?.aiPaused = paused }
         wc.onStop = { [weak self, weak ctrl, weak wc] in
             ctrl?.stop()
             self?.aiProcessor = nil
             self?.aiPaused = false
-            wc?.close()
+            self?.configureResponseFlow(enabled: false)
             self?.showSetup()
+            NSApp.activate(ignoringOtherApps: true)
+            DispatchQueue.main.async { wc?.close() }
         }
         screenCtrl = ctrl; cameraCtrl = nil; captureCtrl = wc
         setupCtrl?.close(); wc.showWindow(nil)
@@ -204,8 +231,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleNewScreenshot(_ url: URL, window: CaptureWindowController?) {
         guard let proc = aiProcessor, !aiPaused else { return }
-        window?.markProcessingStarted()
+        guard reserveResponseSlotIfPossible() else { return }
+        window?.markProcessingStarted(imageURL: url)
         proc.process(imageURL: url)
+    }
+
+    // MARK: – Response pacing / capture flow
+
+    private func configureResponseFlow(enabled: Bool) {
+        responseFlowStateQueue.sync {
+            responseFlowEnabled = enabled
+            inFlightResponses = 0
+        }
+    }
+
+    private func canCaptureNextFrame() -> Bool {
+        responseFlowStateQueue.sync {
+            !responseFlowEnabled || inFlightResponses < responseQueueLimit
+        }
+    }
+
+    private func reserveResponseSlotIfPossible() -> Bool {
+        responseFlowStateQueue.sync {
+            guard responseFlowEnabled else { return true }
+            guard inFlightResponses < responseQueueLimit else { return false }
+            inFlightResponses += 1
+            return true
+        }
+    }
+
+    private func releaseResponseSlot() {
+        var shouldTriggerCapture = false
+        responseFlowStateQueue.sync {
+            guard responseFlowEnabled else { return }
+            inFlightResponses = max(0, inFlightResponses - 1)
+            shouldTriggerCapture = inFlightResponses < responseQueueLimit
+        }
+        guard shouldTriggerCapture else { return }
+        cameraCtrl?.requestImmediateCapture()
+        screenCtrl?.requestImmediateCapture()
+    }
+
+    private func clearPreviousScreenshots(in outputDir: URL) {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        guard let files = try? fm.contentsOfDirectory(
+            at: outputDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for file in files {
+            let ext = file.pathExtension.lowercased()
+            guard ext == "jpg" || ext == "jpeg" || ext == "png" else { continue }
+            let name = file.lastPathComponent.lowercased()
+            let isCaptureFile = name.hasPrefix("frame_") || name.hasPrefix("scr_") || name.hasPrefix("win_")
+            guard isCaptureFile else { continue }
+            try? fm.removeItem(at: file)
+        }
     }
 
     // MARK: – Permissions / errors
@@ -214,11 +297,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized: action()
         case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { granted in
-                DispatchQueue.main.async { granted ? action() : NSApp.terminate(nil) }
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    if granted { action() } else { self?.showCameraDeniedAndQuit() }
+                }
             }
-        default: NSApp.terminate(nil)
+        default: showCameraDeniedAndQuit()
         }
+    }
+
+    private func showCameraDeniedAndQuit() {
+        let alert = NSAlert()
+        alert.messageText = "Camera Access Required"
+        alert.informativeText = "CameraShot needs camera access to capture from your camera. Please enable it in System Settings → Privacy & Security → Camera, then relaunch."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Quit")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(
+                URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera")!
+            )
+        }
+        NSApp.terminate(nil)
     }
 
     private func showScreenCaptureError(_ error: Error) {

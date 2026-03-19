@@ -1,39 +1,24 @@
 import AppKit
-import AVFoundation
-import QuartzCore
 import WebKit
-
-// MARK: - PreviewContent
-
-enum PreviewContent {
-    case camera(AVCaptureSession)
-    case screen
-}
 
 // MARK: - CaptureWindowController
 
-/// Single window shown after capture starts.
-/// Tab 0 — Preview: live camera or screen feed with status overlay.
-/// Tab 1 — AI Responses: WKWebView with full markdown + syntax highlighting.
 final class CaptureWindowController: NSWindowController {
-
-    // MARK: – Preview
-
-    private weak var previewPane: NSView!
-    private weak var screenLayer: CALayer?
-    private weak var statusField: NSTextField!
 
     // MARK: – AI
 
     private var webView: WKWebView!
-    private weak var aiPane:   NSView!
+    private var aiPageReady = false
+    private var pendingEntries: [(header: String, body: String, isError: Bool)] = []
     private weak var spinner:  NSProgressIndicator!
     private weak var aiStatus: NSTextField!
+    private weak var countLabel: NSTextField!
     private var pendingCount = 0 { didSet { updateAIStatus() } }
+    private var nextStreamingEntryId = 0
+    private var entryIdByImageURL: [URL: Int] = [:]
 
     // MARK: – Toolbar
 
-    private weak var tabCtrl:    NSSegmentedControl!
     private weak var pauseButton: NSButton!
     private weak var stopButton:  NSButton!
     private var aiPaused = false
@@ -45,7 +30,7 @@ final class CaptureWindowController: NSWindowController {
 
     // MARK: – Init
 
-    init(source: PreviewContent, name: String, interval: TimeInterval) {
+    init(name: String, interval: TimeInterval) {
         let screen = NSScreen.main ?? NSScreen.screens[0]
         let w: CGFloat = 1280, h: CGFloat = 760
         let origin = NSPoint(x: screen.visibleFrame.midX - w / 2,
@@ -58,122 +43,83 @@ final class CaptureWindowController: NSWindowController {
         )
         win.title           = "CameraShot  ·  \(name)"
         win.minSize         = NSSize(width: 700, height: 440)
-        win.backgroundColor = .black
         win.isMovableByWindowBackground = true
         super.init(window: win)
-        buildUI(source: source, name: name, interval: interval)
+        buildUI(name: name, interval: interval)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
 
-    // MARK: – Public — preview
+    // MARK: – Public
 
     func updateStatus(filename: String, count: Int) {
         DispatchQueue.main.async { [weak self] in
-            self?.statusField.stringValue = "Last: \(filename)  ·  saved \(count)"
+            self?.countLabel.stringValue = "saved \(count)"
         }
-    }
-
-    func updatePreviewImage(_ image: CGImage) {
-        guard let layer = screenLayer else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.contents = image
-        CATransaction.commit()
     }
 
     // MARK: – Public — AI results
 
-    func markProcessingStarted() {
-        DispatchQueue.main.async { [weak self] in self?.pendingCount += 1 }
-    }
-
-    func appendResult(response: String, imageURL: URL) {
+    func markProcessingStarted(imageURL: URL) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.pendingCount = max(0, self.pendingCount - 1)
-            let ts = Self.timeString()
-            self.appendEntry(header: "[\(ts)]  \(imageURL.lastPathComponent)",
-                             body: response, isError: false)
+            pendingCount += 1
+            let entryId = nextStreamingEntryId
+            nextStreamingEntryId += 1
+            entryIdByImageURL[imageURL] = entryId
+            startStreamingEntry(imageURL: imageURL, entryId: entryId)
         }
     }
 
-    func appendError(_ message: String) {
+    func appendStreamingChunk(_ chunk: String, imageURL: URL) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  let entryId = entryIdByImageURL[imageURL],
+                  let js = jsLiteral(chunk) else { return }
+            webView.evaluateJavaScript("appendStreamingChunk(\(entryId), \(js))", completionHandler: nil)
+        }
+    }
+
+    func endStreamingWithResult(fullMarkdown: String, imageURL: URL) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.pendingCount = max(0, self.pendingCount - 1)
-            let ts = Self.timeString()
-            self.appendEntry(header: "[\(ts)]  Error", body: message, isError: true)
+            pendingCount = max(0, pendingCount - 1)
+            guard let entryId = entryIdByImageURL.removeValue(forKey: imageURL) else { return }
+            guard let js = jsLiteral(fullMarkdown) else { return }
+            webView.evaluateJavaScript("endStreamingEntry(\(entryId), \(js))", completionHandler: nil)
+        }
+    }
+
+    func appendResult(response: String, imageURL: URL) {
+        endStreamingWithResult(fullMarkdown: response, imageURL: imageURL)
+    }
+
+    func appendError(_ message: String, imageURL: URL? = nil) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            pendingCount = max(0, pendingCount - 1)
+            if let imageURL,
+               let entryId = entryIdByImageURL.removeValue(forKey: imageURL),
+               let js = jsLiteral(message) {
+                webView.evaluateJavaScript("endStreamingEntryAsError(\(entryId), \(js))", completionHandler: nil)
+                return
+            }
+            let header = "[\(Self.timeString())]  Error"
+            appendEntry(header: header, body: message, isError: true)
         }
     }
 
     // MARK: – UI construction
 
-    private func buildUI(source: PreviewContent, name: String, interval: TimeInterval) {
+    private func buildUI(name: String, interval: TimeInterval) {
         guard let root = window?.contentView else { return }
-        root.wantsLayer = true
 
-        let toolbar = makeToolbar(name: name)
+        let toolbar = makeToolbar(name: name, interval: interval)
         root.addSubview(toolbar)
 
-        // ── Preview pane ─────────────────────────────────────────────────────
-        let pvPane = NSView()
-        pvPane.wantsLayer = true
-        pvPane.layer?.backgroundColor = NSColor.black.cgColor
-        pvPane.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(pvPane)
-        previewPane = pvPane
-
-        switch source {
-        case .camera(let session):
-            let cv = CameraPreviewView(frame: .zero, session: session)
-            cv.translatesAutoresizingMaskIntoConstraints = false
-            pvPane.addSubview(cv)
-            NSLayoutConstraint.activate([
-                cv.topAnchor.constraint(equalTo: pvPane.topAnchor),
-                cv.leadingAnchor.constraint(equalTo: pvPane.leadingAnchor),
-                cv.trailingAnchor.constraint(equalTo: pvPane.trailingAnchor),
-                cv.bottomAnchor.constraint(equalTo: pvPane.bottomAnchor),
-            ])
-        case .screen:
-            let sl = CALayer()
-            sl.contentsGravity  = .resizeAspect
-            sl.backgroundColor  = NSColor.black.cgColor
-            sl.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-            pvPane.layer?.addSublayer(sl)
-            screenLayer = sl
-        }
-
-        let statusOverlay = NSView()
-        statusOverlay.wantsLayer = true
-        statusOverlay.layer?.backgroundColor = NSColor(white: 0, alpha: 0.65).cgColor
-        statusOverlay.translatesAutoresizingMaskIntoConstraints = false
-        pvPane.addSubview(statusOverlay)
-
-        let sf = NSTextField(labelWithString: "\(name)  ·  every \(Int(interval))s  ·  saved 0")
-        sf.font          = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
-        sf.textColor     = .white
-        sf.lineBreakMode = .byTruncatingTail
-        sf.translatesAutoresizingMaskIntoConstraints = false
-        statusOverlay.addSubview(sf)
-        statusField = sf
-
-        NSLayoutConstraint.activate([
-            statusOverlay.leadingAnchor.constraint(equalTo: pvPane.leadingAnchor),
-            statusOverlay.trailingAnchor.constraint(equalTo: pvPane.trailingAnchor),
-            statusOverlay.bottomAnchor.constraint(equalTo: pvPane.bottomAnchor),
-            statusOverlay.heightAnchor.constraint(equalToConstant: 28),
-            sf.leadingAnchor.constraint(equalTo: statusOverlay.leadingAnchor, constant: 12),
-            sf.trailingAnchor.constraint(equalTo: statusOverlay.trailingAnchor, constant: -12),
-            sf.centerYAnchor.constraint(equalTo: statusOverlay.centerYAnchor),
-        ])
-
-        // ── AI pane ──────────────────────────────────────────────────────────
-        let ap = buildAIPane()
-        ap.isHidden = true
-        root.addSubview(ap)
-        aiPane = ap
+        let aiPane = buildAIPane()
+        root.addSubview(aiPane)
 
         NSLayoutConstraint.activate([
             toolbar.topAnchor.constraint(equalTo: root.topAnchor),
@@ -181,19 +127,14 @@ final class CaptureWindowController: NSWindowController {
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             toolbar.heightAnchor.constraint(equalToConstant: 44),
 
-            pvPane.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
-            pvPane.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            pvPane.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            pvPane.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-
-            ap.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
-            ap.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            ap.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            ap.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            aiPane.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+            aiPane.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            aiPane.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            aiPane.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
     }
 
-    private func makeToolbar(name: String) -> NSView {
+    private func makeToolbar(name: String, interval: TimeInterval) -> NSView {
         let bar = NSView()
         bar.wantsLayer = true
         bar.layer?.backgroundColor = NSColor(white: 0.10, alpha: 1.0).cgColor
@@ -206,15 +147,12 @@ final class CaptureWindowController: NSWindowController {
         title.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(title)
 
-        let tabs = NSSegmentedControl(
-            labels: ["Preview", "AI Responses"],
-            trackingMode: .selectOne, target: self, action: #selector(tabChanged)
-        )
-        tabs.selectedSegment = 0
-        tabs.controlSize     = .small
-        tabs.translatesAutoresizingMaskIntoConstraints = false
-        tabCtrl = tabs
-        bar.addSubview(tabs)
+        let cl = NSTextField(labelWithString: "saved 0")
+        cl.font      = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        cl.textColor = NSColor(white: 0.45, alpha: 1)
+        cl.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(cl)
+        countLabel = cl
 
         let spin = NSProgressIndicator()
         spin.style = .spinning; spin.controlSize = .small
@@ -228,7 +166,6 @@ final class CaptureWindowController: NSWindowController {
         sl.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(sl); aiStatus = sl
 
-        // Pause AI button (yellow)
         let pauseBtn = NSButton(title: "⏸  Pause AI", target: self, action: #selector(pauseAITapped))
         pauseBtn.bezelStyle = .rounded
         pauseBtn.controlSize = .small
@@ -237,7 +174,6 @@ final class CaptureWindowController: NSWindowController {
         bar.addSubview(pauseBtn)
         pauseButton = pauseBtn
 
-        // Stop button (red)
         let stopBtn = NSButton(title: "■  Stop", target: self, action: #selector(stopTapped))
         stopBtn.bezelStyle = .rounded
         stopBtn.controlSize = .small
@@ -249,10 +185,10 @@ final class CaptureWindowController: NSWindowController {
         NSLayoutConstraint.activate([
             title.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 16),
             title.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
-            title.widthAnchor.constraint(lessThanOrEqualToConstant: 180),
+            title.widthAnchor.constraint(lessThanOrEqualToConstant: 200),
 
-            tabs.centerXAnchor.constraint(equalTo: bar.centerXAnchor),
-            tabs.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            cl.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 12),
+            cl.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
 
             stopBtn.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -14),
             stopBtn.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
@@ -288,21 +224,26 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func buildAIPane() -> NSView {
-        // WKWebView config — register copy-code message handler
         let config = WKWebViewConfiguration()
-        let handler = CopyCodeHandler()
+        let handler = CopyCodeHandler(pageReady: { [weak self] in
+            DispatchQueue.main.async {
+                self?.aiPageReady = true
+                self?.flushPendingEntries()
+            }
+        })
         config.userContentController.add(handler, name: "copyCode")
+        config.userContentController.add(handler, name: "pageReady")
 
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.translatesAutoresizingMaskIntoConstraints = false
-        // Transparent background so the system appearance shows through
-        wv.setValue(false, forKey: "drawsBackground")
+        wv.wantsLayer = true
+        wv.layer?.backgroundColor = NSColor.clear.cgColor
+        wv.navigationDelegate = self
         webView = wv
 
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
 
-        // Inner top bar with zoom + clear
         let innerBar = NSView()
         innerBar.wantsLayer = true
         innerBar.layer?.backgroundColor = NSColor(named: "controlBackground")?.cgColor
@@ -352,37 +293,71 @@ final class CaptureWindowController: NSWindowController {
             wv.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
-        wv.loadHTMLString(Self.htmlTemplate, baseURL: nil)
+        let baseURL: URL? = Self.resourcesBaseURL()
+        wv.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         return container
-    }
-
-    // MARK: – Tab switching
-
-    @objc private func tabChanged() {
-        let isAI = tabCtrl.selectedSegment == 1
-        previewPane.isHidden = isAI
-        aiPane.isHidden      = !isAI
-        window?.backgroundColor = isAI ? .windowBackgroundColor : .black
     }
 
     // MARK: – AI helpers
 
+    private func startStreamingEntry(imageURL: URL, entryId: Int) {
+        let header = "[\(Self.timeString())]  \(imageURL.lastPathComponent)"
+        guard let hJS = jsLiteral(header) else { return }
+        webView.evaluateJavaScript("startStreamingEntry(\(hJS), null, \(entryId))", completionHandler: nil)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let dataURL = Self.thumbnailDataURL(for: imageURL, maxWidth: 280)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let url = dataURL, let urlJS = self.jsLiteral(url) {
+                    self.webView.evaluateJavaScript("setStreamingEntryThumbnail(\(entryId), \(urlJS))", completionHandler: nil)
+                }
+            }
+        }
+    }
+
+    private static func thumbnailDataURL(for url: URL, maxWidth: CGFloat) -> String? {
+        guard let img = NSImage(contentsOf: url) else { return nil }
+        let size = img.size
+        guard size.width > 0, size.height > 0 else { return nil }
+        let scale = min(1, maxWidth / size.width)
+        let w = Int(size.width * scale)
+        let h = Int(size.height * scale)
+        guard w > 0, h > 0 else { return nil }
+        let small = NSImage(size: NSSize(width: w, height: h))
+        small.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .medium
+        img.draw(in: NSRect(x: 0, y: 0, width: w, height: h),
+                 from: NSRect(x: 0, y: 0, width: size.width, height: size.height),
+                 operation: .copy, fraction: 1)
+        small.unlockFocus()
+        guard let tiff = small.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else { return nil }
+        return "data:image/jpeg;base64,\(jpeg.base64EncodedString())"
+    }
+
     private func appendEntry(header: String, body: String, isError: Bool) {
-        guard let hJS = jsLiteral(header), let bJS = jsLiteral(body) else { return }
-        let js = "appendEntry(\(hJS), \(bJS), \(isError ? "true" : "false"))"
-        webView.evaluateJavaScript(js, completionHandler: nil)
+        pendingEntries.append((header, body, isError))
+        flushPendingEntries()
+    }
+
+    private func flushPendingEntries() {
+        guard aiPageReady, !pendingEntries.isEmpty else { return }
+        for item in pendingEntries {
+            guard let hJS = jsLiteral(item.header), let bJS = jsLiteral(item.body) else { continue }
+            let js = "appendEntry(\(hJS), \(bJS), \(item.isError ? "true" : "false"))"
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+        pendingEntries.removeAll()
     }
 
     @objc private func zoomIn()  { webView.evaluateJavaScript("adjustZoom(1)",  completionHandler: nil) }
     @objc private func zoomOut() { webView.evaluateJavaScript("adjustZoom(-1)", completionHandler: nil) }
     @objc private func clearAI() { webView.evaluateJavaScript("clearFeed()",    completionHandler: nil) }
 
-    /// Encodes a Swift string as a JSON string literal safe to embed in JS.
-    /// Wraps in an array so JSONSerialization accepts it, then strips the [ ].
     private func jsLiteral(_ s: String) -> String? {
         guard let data = try? JSONSerialization.data(withJSONObject: [s]),
               let str  = String(data: data, encoding: .utf8) else { return nil }
-        // str is e.g. ["hello \"world\""] — strip the outer brackets
         return String(str.dropFirst().dropLast())
     }
 
@@ -390,12 +365,22 @@ final class CaptureWindowController: NSWindowController {
         if pendingCount > 0 {
             spinner.startAnimation(nil)
             aiStatus.stringValue = pendingCount == 1 ? "Processing…" : "Processing \(pendingCount)…"
-            tabCtrl.setLabel("AI Responses ●", forSegment: 1)
         } else {
             spinner.stopAnimation(nil)
             aiStatus.stringValue = ""
-            tabCtrl.setLabel("AI Responses", forSegment: 1)
         }
+    }
+
+    private static func resourcesBaseURL() -> URL? {
+        func hasMarked(at base: URL) -> Bool {
+            FileManager.default.fileExists(atPath: base.appendingPathComponent("marked.min.js").path)
+        }
+        let appResources = Bundle.main.resourceURL?.appendingPathComponent("Resources")
+        if let url = appResources, hasMarked(at: url) { return url }
+        #if SWIFT_PACKAGE
+        if let url = Bundle.module.resourceURL, hasMarked(at: url) { return url }
+        #endif
+        return appResources
     }
 
     private static func timeString() -> String {
@@ -409,11 +394,10 @@ final class CaptureWindowController: NSWindowController {
     <html>
     <head>
     <meta charset="UTF-8">
-    <link rel="stylesheet"
-          href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark-dimmed.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="github-dark-dimmed.min.css">
+    <script src="marked.min.js"></script>
+    <script src="highlight.min.js"></script>
+    <script src="mermaid.min.js"></script>
     <style>
       *, *::before, *::after { box-sizing: border-box; }
 
@@ -448,7 +432,6 @@ final class CaptureWindowController: NSWindowController {
 
       #feed { padding: 24px; }
 
-      /* Typography */
       h1 { font-size: 1.45em; margin: 20px 0 8px; }
       h2 { font-size: 1.25em; margin: 18px 0 8px; }
       h3 { font-size: 1.1em;  margin: 14px 0 6px; }
@@ -465,7 +448,6 @@ final class CaptureWindowController: NSWindowController {
         color: var(--fg2);
       }
 
-      /* Inline code */
       code:not(pre > code) {
         background: var(--code-bg);
         border-radius: 4px;
@@ -474,7 +456,6 @@ final class CaptureWindowController: NSWindowController {
         font-size: 0.87em;
       }
 
-      /* Code block wrapper */
       .code-wrapper {
         position: relative;
         margin: 14px 0;
@@ -496,7 +477,6 @@ final class CaptureWindowController: NSWindowController {
         padding: 0 !important;
       }
 
-      /* Language badge */
       .lang-label {
         position: absolute;
         top: 8px;
@@ -509,7 +489,6 @@ final class CaptureWindowController: NSWindowController {
         user-select: none;
       }
 
-      /* Copy button */
       .copy-btn {
         position: absolute;
         top: 7px;
@@ -529,7 +508,6 @@ final class CaptureWindowController: NSWindowController {
       .copy-btn:hover  { background: rgba(255,255,255,0.20); color: #fff; }
       .copy-btn.copied { color: #32d74b; border-color: #32d74b; }
 
-      /* Entry header */
       .entry-header {
         font-family: 'SF Mono', monospace;
         font-size: 11px;
@@ -537,24 +515,38 @@ final class CaptureWindowController: NSWindowController {
         margin-bottom: 10px;
       }
 
-      /* Divider between entries */
+      .entry-thumbnail {
+        max-width: 280px;
+        max-height: 160px;
+        width: auto;
+        height: auto;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        display: block;
+        border: 1px solid var(--border);
+      }
+
+      .streaming-body {
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        min-height: 1em;
+      }
+
       .entry-divider {
         border: none;
         border-top: 1px solid var(--border);
         margin: 28px 0;
       }
 
-      /* Error body */
       .entry-error-body {
         color: #ff3b30;
       }
 
-      /* Tables */
       table { border-collapse: collapse; width: 100%; margin: 12px 0; }
       th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
       th { background: var(--code-bg); font-weight: 600; }
 
-      /* Mermaid diagrams */
       .mermaid-wrapper {
         background: #1e1e2e;
         border-radius: 10px;
@@ -564,10 +556,7 @@ final class CaptureWindowController: NSWindowController {
         justify-content: center;
         overflow-x: auto;
       }
-      .mermaid-wrapper svg {
-        max-width: 100%;
-        height: auto;
-      }
+      .mermaid-wrapper svg { max-width: 100%; height: auto; }
       .mermaid-error {
         color: #ff3b30;
         font-family: 'SF Mono', monospace;
@@ -579,150 +568,233 @@ final class CaptureWindowController: NSWindowController {
     <body>
     <div id="feed"></div>
     <script>
-      mermaid.initialize({
-        startOnLoad: false,
-        theme: 'dark',
-        securityLevel: 'loose',
-        fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif'
-      });
-
-      marked.use({
-        gfm: true,
-        breaks: true,
-        highlight: function(code, lang) {
-          if (lang && lang !== 'mermaid' && hljs.getLanguage(lang)) {
-            return hljs.highlight(code, { language: lang }).value;
-          }
-          return lang === 'mermaid' ? code : hljs.highlightAuto(code).value;
-        }
-      });
-
       var currentFontSize = 14;
-
-      // Track whether the user has scrolled up away from the bottom.
-      // Only auto-scroll when they are already pinned to the bottom.
       var userScrolledUp = false;
+      var streamingBodiesById = Object.create(null);
       window.addEventListener('scroll', function() {
         var sv = document.scrollingElement || document.documentElement;
         userScrolledUp = sv.scrollTop + sv.clientHeight < sv.scrollHeight - 60;
       }, { passive: true });
 
-      function appendEntry(header, markdown, isError) {
-        var sv = document.scrollingElement || document.documentElement;
-
-        var feed = document.getElementById('feed');
-
-        // Divider between entries (not before the first one)
-        if (feed.children.length > 0) {
-          var hr = document.createElement('hr');
-          hr.className = 'entry-divider';
-          feed.appendChild(hr);
+      function escapeHtml(s) {
+        var div = document.createElement('div');
+        div.textContent = s;
+        return div.innerHTML;
+      }
+      function startStreamingEntry(header, imageDataURL, entryId) {
+        try {
+          var feed = document.getElementById('feed');
+          if (!feed) return;
+          if (feed.children.length > 0) {
+            var hr = document.createElement('hr');
+            hr.className = 'entry-divider';
+            feed.appendChild(hr);
+          }
+          var entry = document.createElement('div');
+          entry.dataset.entryId = String(entryId);
+          var hdr = document.createElement('div');
+          hdr.className = 'entry-header';
+          hdr.textContent = header;
+          entry.appendChild(hdr);
+          var img = document.createElement('img');
+          img.className = 'entry-thumbnail';
+          if (imageDataURL) img.src = imageDataURL;
+          img.alt = 'Screenshot';
+          entry.appendChild(img);
+          var body = document.createElement('div');
+          body.className = 'streaming-body';
+          body.textContent = '';
+          entry.appendChild(body);
+          feed.appendChild(entry);
+          streamingBodiesById[String(entryId)] = body;
+          var sv = document.scrollingElement || document.documentElement;
+          if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+        } catch (e) { console.error('startStreamingEntry', e); }
+      }
+      function setStreamingEntryThumbnail(entryId, dataURL) {
+        var entry = document.querySelector('[data-entry-id="' + entryId + '"]');
+        if (entry) {
+          var img = entry.querySelector('img.entry-thumbnail');
+          if (img && dataURL) img.src = dataURL;
         }
-
-        var entry = document.createElement('div');
-
-        // Header row
-        var hdr = document.createElement('div');
-        hdr.className = 'entry-header';
-        hdr.textContent = header;
-        entry.appendChild(hdr);
-
-        // Body
-        var body = document.createElement('div');
-        if (isError) {
-          body.className = 'entry-error-body';
-          body.textContent = markdown;
-        } else {
-          body.innerHTML = marked.parse(markdown);
-
-          // Process each code block
-          var mermaidNodes = [];
-          body.querySelectorAll('pre').forEach(function(pre) {
-            var codeEl = pre.querySelector('code');
-            var lang = '';
-            if (codeEl) {
-              var cls = codeEl.className || '';
-              var m = cls.match(/language-(\\S+)/);
-              if (m) lang = m[1];
-            }
-
-            // ── Mermaid: render as diagram ────────────────────────────────
-            if (lang === 'mermaid') {
-              var diagram = codeEl ? codeEl.textContent : pre.textContent;
-              var wrapper = document.createElement('div');
-              wrapper.className = 'mermaid-wrapper';
-              var inner = document.createElement('div');
-              inner.className = 'mermaid';
-              inner.textContent = diagram;
-              wrapper.appendChild(inner);
-              pre.parentNode.insertBefore(wrapper, pre);
-              pre.parentNode.removeChild(pre);
-              mermaidNodes.push(inner);
-              return;
-            }
-
-            // ── Regular code block ────────────────────────────────────────
-            if (codeEl) {
-              if (lang && hljs.getLanguage(lang)) {
-                codeEl.innerHTML = hljs.highlight(codeEl.textContent, { language: lang }).value;
-              } else {
-                hljs.highlightElement(codeEl);
-              }
-            }
-
+      }
+      function appendStreamingChunk(entryId, text) {
+        var body = streamingBodiesById[String(entryId)];
+        if (body) {
+          body.textContent += text;
+          var sv = document.scrollingElement || document.documentElement;
+          if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+        }
+      }
+      function endStreamingEntry(entryId, markdown) {
+        var key = String(entryId);
+        var body = streamingBodiesById[key];
+        if (!body) return;
+        delete streamingBodiesById[key];
+        body.classList.remove('streaming-body');
+        var html = (typeof marked !== 'undefined' && marked.parse) ? marked.parse(markdown) : markdown.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\n/g, '<br>');
+        body.innerHTML = html;
+        var mermaidNodes = [];
+        Array.from(body.querySelectorAll('pre')).forEach(function(pre) {
+          var codeEl = pre.querySelector('code');
+          var lang = '';
+          if (codeEl) { var m = (codeEl.className || '').match(/language-(\\S+)/); if (m) lang = m[1]; }
+          if (lang === 'mermaid' && typeof mermaid !== 'undefined' && mermaid.run) {
+            var diagram = codeEl ? codeEl.textContent : pre.textContent;
             var wrapper = document.createElement('div');
-            wrapper.className = 'code-wrapper';
+            wrapper.className = 'mermaid-wrapper';
+            var inner = document.createElement('div');
+            inner.className = 'mermaid';
+            inner.textContent = diagram;
+            wrapper.appendChild(inner);
             pre.parentNode.insertBefore(wrapper, pre);
-            wrapper.appendChild(pre);
-
-            if (lang) {
-              var badge = document.createElement('span');
-              badge.className = 'lang-label';
-              badge.textContent = lang;
-              wrapper.appendChild(badge);
-            }
-
-            var btn = document.createElement('button');
-            btn.className = 'copy-btn';
-            btn.textContent = 'Copy';
-            btn.addEventListener('click', function() {
-              var text = codeEl ? codeEl.innerText : pre.innerText;
-              window.webkit.messageHandlers.copyCode.postMessage(text);
-              btn.textContent = 'Copied!';
-              btn.classList.add('copied');
-              setTimeout(function() {
-                btn.textContent = 'Copy';
-                btn.classList.remove('copied');
-              }, 1600);
-            });
-            wrapper.appendChild(btn);
+            pre.parentNode.removeChild(pre);
+            mermaidNodes.push(inner);
+            return;
+          }
+          if (codeEl && typeof hljs !== 'undefined') {
+            if (lang && hljs.getLanguage(lang)) codeEl.innerHTML = hljs.highlight(codeEl.textContent, { language: lang }).value;
+            else hljs.highlightElement(codeEl);
+          }
+          var wrapper = document.createElement('div');
+          wrapper.className = 'code-wrapper';
+          pre.parentNode.insertBefore(wrapper, pre);
+          wrapper.appendChild(pre);
+          if (lang) { var badge = document.createElement('span'); badge.className = 'lang-label'; badge.textContent = lang; wrapper.appendChild(badge); }
+          var btn = document.createElement('button');
+          btn.className = 'copy-btn';
+          btn.textContent = 'Copy';
+          btn.addEventListener('click', function() {
+            var text = codeEl ? codeEl.innerText : pre.innerText;
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.copyCode) window.webkit.messageHandlers.copyCode.postMessage(text);
+            btn.textContent = 'Copied!'; btn.classList.add('copied');
+            setTimeout(function() { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1600);
           });
+          wrapper.appendChild(btn);
+        });
+        if (mermaidNodes.length > 0 && typeof mermaid !== 'undefined' && mermaid.run) {
+          mermaid.run({ nodes: mermaidNodes }).catch(function(err) {
+            mermaidNodes.forEach(function(n) { n.innerHTML = '<span class="mermaid-error">Mermaid error: ' + err.message + '</span>'; });
+          });
+        }
+        var sv = document.scrollingElement || document.documentElement;
+        if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+      }
+      function endStreamingEntryAsError(entryId, message) {
+        var key = String(entryId);
+        var body = streamingBodiesById[key];
+        if (!body) return;
+        delete streamingBodiesById[key];
+        body.classList.remove('streaming-body');
+        body.classList.add('entry-error-body');
+        body.textContent = message;
+      }
 
-          // Run mermaid on collected diagram nodes
-          if (mermaidNodes.length > 0) {
-            mermaid.run({ nodes: mermaidNodes }).catch(function(err) {
-              mermaidNodes.forEach(function(n) {
-                n.innerHTML = '<span class="mermaid-error">Mermaid error: ' + err.message + '</span>';
+      function appendEntry(header, markdown, isError) {
+        try {
+          var sv = document.scrollingElement || document.documentElement;
+          var feed = document.getElementById('feed');
+          if (!feed) return;
+          if (feed.children.length > 0) {
+            var hr = document.createElement('hr');
+            hr.className = 'entry-divider';
+            feed.appendChild(hr);
+          }
+          var entry = document.createElement('div');
+          var hdr = document.createElement('div');
+          hdr.className = 'entry-header';
+          hdr.textContent = header;
+          entry.appendChild(hdr);
+          var body = document.createElement('div');
+          if (isError) {
+            body.className = 'entry-error-body';
+            body.textContent = markdown;
+          } else {
+            var html = (typeof marked !== 'undefined' && marked.parse)
+              ? marked.parse(markdown)
+              : markdown.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\n/g, '<br>');
+            body.innerHTML = html;
+            var mermaidNodes = [];
+            body.querySelectorAll('pre').forEach(function(pre) {
+              var codeEl = pre.querySelector('code');
+              var lang = '';
+              if (codeEl) { var m = (codeEl.className || '').match(/language-(\\S+)/); if (m) lang = m[1]; }
+              if (lang === 'mermaid' && typeof mermaid !== 'undefined' && mermaid.run) {
+                var diagram = codeEl ? codeEl.textContent : pre.textContent;
+                var wrapper = document.createElement('div');
+                wrapper.className = 'mermaid-wrapper';
+                var inner = document.createElement('div');
+                inner.className = 'mermaid';
+                inner.textContent = diagram;
+                wrapper.appendChild(inner);
+                pre.parentNode.insertBefore(wrapper, pre);
+                pre.parentNode.removeChild(pre);
+                mermaidNodes.push(inner);
+                return;
+              }
+              if (codeEl && typeof hljs !== 'undefined') {
+                if (lang && hljs.getLanguage(lang)) codeEl.innerHTML = hljs.highlight(codeEl.textContent, { language: lang }).value;
+                else hljs.highlightElement(codeEl);
+              }
+              var wrapper = document.createElement('div');
+              wrapper.className = 'code-wrapper';
+              pre.parentNode.insertBefore(wrapper, pre);
+              wrapper.appendChild(pre);
+              if (lang) { var badge = document.createElement('span'); badge.className = 'lang-label'; badge.textContent = lang; wrapper.appendChild(badge); }
+              var btn = document.createElement('button');
+              btn.className = 'copy-btn';
+              btn.textContent = 'Copy';
+              btn.addEventListener('click', function() {
+                var text = codeEl ? codeEl.innerText : pre.innerText;
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.copyCode) window.webkit.messageHandlers.copyCode.postMessage(text);
+                btn.textContent = 'Copied!'; btn.classList.add('copied');
+                setTimeout(function() { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1600);
               });
+              wrapper.appendChild(btn);
             });
+            if (mermaidNodes.length > 0 && typeof mermaid !== 'undefined' && mermaid.run) {
+              mermaid.run({ nodes: mermaidNodes }).catch(function(err) {
+                mermaidNodes.forEach(function(n) { n.innerHTML = '<span class="mermaid-error">Mermaid error: ' + err.message + '</span>'; });
+              });
+            }
+          }
+          entry.appendChild(body);
+          feed.appendChild(entry);
+          if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+        } catch (e) {
+          var feed = document.getElementById('feed');
+          if (feed) {
+            var errDiv = document.createElement('div');
+            errDiv.className = 'entry-error-body';
+            errDiv.textContent = 'Display error: ' + e.message + ' | Raw: ' + (markdown ? markdown.substring(0, 200) : '');
+            feed.appendChild(errDiv);
           }
         }
-
-        entry.appendChild(body);
-        feed.appendChild(entry);
-
-        if (!userScrolledUp) {
-          sv.scrollTop = sv.scrollHeight;
-        }
       }
 
-      function clearFeed() {
-        document.getElementById('feed').innerHTML = '';
-      }
+      function clearFeed() { document.getElementById('feed').innerHTML = ''; }
 
       function adjustZoom(delta) {
         currentFontSize = Math.min(Math.max(currentFontSize + delta, 9), 30);
         document.documentElement.style.setProperty('--font-size', currentFontSize + 'px');
+      }
+
+      if (typeof mermaid !== 'undefined') {
+        mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'loose', fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif' });
+      }
+      if (typeof marked !== 'undefined' && marked.use) {
+        marked.use({
+          gfm: true,
+          breaks: true,
+          highlight: function(code, lang) {
+            if (typeof hljs === 'undefined') return code;
+            if (lang && lang !== 'mermaid' && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
+            return lang === 'mermaid' ? code : hljs.highlightAuto(code).value;
+          }
+        });
+      }
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.pageReady) {
+        window.webkit.messageHandlers.pageReady.postMessage('ready');
       }
     </script>
     </body>
@@ -730,34 +802,32 @@ final class CaptureWindowController: NSWindowController {
     """
 }
 
-// MARK: - CopyCodeHandler
+// MARK: - WKNavigationDelegate
 
-/// Receives copy requests from the web page and writes to NSPasteboard.
-private final class CopyCodeHandler: NSObject, WKScriptMessageHandler {
-    func userContentController(_ ucc: WKUserContentController,
-                                didReceive message: WKScriptMessage) {
-        guard message.name == "copyCode", let text = message.body as? String else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+extension CaptureWindowController: WKNavigationDelegate {
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        aiPageReady = true
+        flushPendingEntries()
     }
 }
 
-// MARK: - CameraPreviewView
+// MARK: - CopyCodeHandler
 
-private final class CameraPreviewView: NSView {
-    private let captureSession: AVCaptureSession
-    init(frame: NSRect, session: AVCaptureSession) {
-        captureSession = session; super.init(frame: frame); wantsLayer = true
+private final class CopyCodeHandler: NSObject, WKScriptMessageHandler {
+    var onPageReady: (() -> Void)?
+
+    init(pageReady: (() -> Void)? = nil) {
+        self.onPageReady = pageReady
     }
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { nil }
-    override func makeBackingLayer() -> CALayer {
-        let l = AVCaptureVideoPreviewLayer(session: captureSession)
-        l.videoGravity = .resizeAspect; l.backgroundColor = NSColor.black.cgColor; return l
-    }
-    override func layout() {
-        super.layout()
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        layer?.frame = bounds; CATransaction.commit()
+
+    func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "pageReady" {
+            onPageReady?()
+            return
+        }
+        if message.name == "copyCode", let text = message.body as? String {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+        }
     }
 }

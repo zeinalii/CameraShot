@@ -19,7 +19,7 @@ final class SetupWindowController: NSWindowController {
     /// Stored in each popup menu item's representedObject.
     private enum CaptureTarget {
         case display(id: CGDirectDisplayID, name: String)
-        case window(id: CGWindowID, appName: String, title: String)
+        case window(id: CGWindowID, appName: String, title: String, scWindow: SCWindow?)
     }
 
     // MARK: – State
@@ -28,10 +28,18 @@ final class SetupWindowController: NSWindowController {
     private var sourceType:  SourceType = .screen
     private var cameras: [AVCaptureDevice] = []
 
-    private var selectedOutputDir: URL = {
-        FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CameraShots")
-    }()
+    /// Default save folder; no security-scoped bookmark needed (entitlement grants access).
+    private static var defaultOutputDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("CameraShot")
+    }
+
+    private var selectedOutputDir: URL = SetupWindowController.defaultOutputDirectory
+
+    /// When non-nil, we have called startAccessingSecurityScopedResource and may write to this folder (sandbox).
+    private var securityScopedOutputURL: URL?
+
+    private static let screenshotOutputBookmarkKey = "screenshotOutputBookmark"
 
     private var previewSession: AVCaptureSession?
     private let previewQueue = DispatchQueue(label: "setup.preview", qos: .userInteractive)
@@ -98,6 +106,7 @@ final class SetupWindowController: NSWindowController {
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
+        restoreSavedOutputFolder()
 
         let fx = NSVisualEffectView()
         fx.material = .windowBackground; fx.blendingMode = .behindWindow
@@ -290,7 +299,7 @@ final class SetupWindowController: NSWindowController {
 
         let mf = NSTextField(string: "claude-sonnet-4-5")
         mf.font = .systemFont(ofSize: 13)
-        mf.placeholderString = "e.g. claude-sonnet-4-5, gpt-4o, gemini/gemini-1.5-pro"
+        mf.placeholderString = "e.g. claude-sonnet-4-5, claude-3-5-sonnet-20241022"
         modelField = mf
         s.addArrangedSubview(mf)
         mf.widthAnchor.constraint(equalToConstant: 376).isActive = true
@@ -325,19 +334,6 @@ final class SetupWindowController: NSWindowController {
         s.addArrangedSubview(scroll)
         s.setCustomSpacing(14, after: scroll)
 
-        // Setup note
-        let noteText = """
-            Requires: pip install litellm
-            Set your API key in the environment, e.g.:
-              export OPENAI_API_KEY=sk-...
-            litellm supports OpenAI, Anthropic, Gemini, and 100+ providers.
-            """
-        let note = NSTextField(wrappingLabelWithString: noteText)
-        note.font      = .systemFont(ofSize: 11)
-        note.textColor = .tertiaryLabelColor
-        s.addArrangedSubview(note)
-        note.widthAnchor.constraint(equalToConstant: 376).isActive = true
-
         promptsStack = s
         return s
     }
@@ -362,7 +358,7 @@ final class SetupWindowController: NSWindowController {
         s.setCustomSpacing(6, after: titleRow)
 
         let desc = NSTextField(wrappingLabelWithString:
-            "Your key is encrypted with AES-256-GCM using your master passphrase. " +
+            "Your key is encrypted with AES-256-GCM using your machine passphrase (UUID). " +
             "It is never stored as plain text — only decrypted in memory while the app is running.")
         desc.font      = .systemFont(ofSize: 12)
         desc.textColor = .secondaryLabelColor
@@ -482,18 +478,59 @@ final class SetupWindowController: NSWindowController {
     }
 
     @objc private func browseTapped() {
-        guard let win = window else { return }
+        promptForSaveFolder { _ in }
+    }
+
+    private func restoreSavedOutputFolder() {
+        guard let data = UserDefaults.standard.data(forKey: Self.screenshotOutputBookmarkKey) else { return }
+        var stale = false
+        do {
+            let url = try URL(resolvingBookmarkData: data, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
+            guard url.startAccessingSecurityScopedResource() else { return }
+            securityScopedOutputURL?.stopAccessingSecurityScopedResource()
+            securityScopedOutputURL = url
+            selectedOutputDir = url
+            if stale {
+                persistOutputBookmark(for: url)
+            }
+        } catch {
+            UserDefaults.standard.removeObject(forKey: Self.screenshotOutputBookmarkKey)
+        }
+    }
+
+    private func persistOutputBookmark(for url: URL) {
+        do {
+            let data = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+            UserDefaults.standard.set(data, forKey: Self.screenshotOutputBookmarkKey)
+        } catch {
+            UserDefaults.standard.removeObject(forKey: Self.screenshotOutputBookmarkKey)
+        }
+    }
+
+    /// Opens the folder picker. If user picks a folder, grants security-scoped access and calls completion(true). On cancel, completion(false).
+    private func promptForSaveFolder(completion: @escaping (Bool) -> Void) {
+        guard let win = window else { completion(false); return }
         let panel = NSOpenPanel()
         panel.canChooseFiles       = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.directoryURL         = selectedOutputDir
         panel.prompt               = "Choose"
-        panel.message              = "Choose a folder to save screenshots into"
+        panel.message              = "Choose a folder to save screenshots into. The app needs your permission to write here."
         panel.beginSheetModal(for: win) { [weak self] response in
-            guard response == .OK, let url = panel.url, let self else { return }
+            guard let self else { completion(false); return }
+            guard response == .OK, let url = panel.url else {
+                completion(false)
+                return
+            }
+            self.securityScopedOutputURL?.stopAccessingSecurityScopedResource()
+            self.securityScopedOutputURL = nil
+            _ = url.startAccessingSecurityScopedResource()
+            self.securityScopedOutputURL = url
             self.selectedOutputDir = url
+            self.persistOutputBookmark(for: url)
             self.folderField?.stringValue = self.abbreviatedPath(url)
+            completion(true)
         }
     }
 
@@ -530,8 +567,11 @@ final class SetupWindowController: NSWindowController {
     }
 
     private func stopCameraPreview() {
-        previewQueue.async { [weak self] in self?.previewSession?.stopRunning() }
+        let session = previewSession
         previewSession = nil
+        previewQueue.async {
+            session?.stopRunning()
+        }
     }
 
     // MARK: – Screen (unified displays + windows)
@@ -609,7 +649,7 @@ final class SetupWindowController: NSWindowController {
                 let item = makePickerItem(
                     title:  "      \(title)",
                     symbol: "macwindow",
-                    target: CaptureTarget.window(id: w.windowID, appName: appName, title: title)
+                    target: CaptureTarget.window(id: w.windowID, appName: appName, title: title, scWindow: w)
                 )
                 screenPopup.menu?.addItem(item)
             }
@@ -652,14 +692,25 @@ final class SetupWindowController: NSWindowController {
                 guard let img = CGDisplayCreateImage(id) else { return }
                 DispatchQueue.main.async { self?.livePreview.showImage(img) }
             }
-        case .window(let id, _, _):
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let img = CGWindowListCreateImage(
-                    .null, .optionIncludingWindow, id,
-                    [.boundsIgnoreFraming, .bestResolution]
-                )
-                guard let img else { return }
-                DispatchQueue.main.async { self?.livePreview.showImage(img) }
+        case .window(let id, _, _, let scWindow):
+            if #available(macOS 14.2, *), let scWindow = scWindow {
+                let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+                let config = SCStreamConfiguration()
+                config.width = Int(filter.contentRect.width * CGFloat(filter.pointPixelScale))
+                config.height = Int(filter.contentRect.height * CGFloat(filter.pointPixelScale))
+                SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { [weak self] img, _ in
+                    guard let img else { return }
+                    DispatchQueue.main.async { self?.livePreview.showImage(img) }
+                }
+            } else {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let img = CGWindowListCreateImage(
+                        .null, .optionIncludingWindow, id,
+                        [.boundsIgnoreFraming, .bestResolution]
+                    )
+                    guard let img else { return }
+                    DispatchQueue.main.async { self?.livePreview.showImage(img) }
+                }
             }
         }
     }
@@ -696,13 +747,36 @@ final class SetupWindowController: NSWindowController {
         let qmap:   [Double] = [0.75, 0.92, 1.0]
         let quality = qmap[qualityControl.selectedSegment]
 
+        let aiEnabled = aiEnabledCheckbox.state == .on
         let aiConfig = AIConfig(
-            enabled: aiEnabledCheckbox.state == .on,
+            enabled: aiEnabled,
             prompt:  promptTextView.string.isEmpty
                          ? "try to solve this question that you see on the screen."
                          : promptTextView.string,
             model:   modelField.stringValue.isEmpty ? "claude-sonnet-4-5" : modelField.stringValue
         )
+
+        if aiEnabled && !EncryptedKeyStore.fileExists() {
+            let alert = NSAlert()
+            alert.messageText = "API Key Required"
+            alert.informativeText = "AI processing is enabled but no API key is saved. Open the \"API Keys\" tab, enter your Anthropic API key, and click \"Save Key\" before starting capture."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        if securityScopedOutputURL == nil && selectedOutputDir != Self.defaultOutputDirectory {
+            promptForSaveFolder { [weak self] granted in
+                guard granted else { return }
+                self?.startTapped()
+            }
+            return
+        }
+
+        if selectedOutputDir == Self.defaultOutputDirectory {
+            try? FileManager.default.createDirectory(at: selectedOutputDir, withIntermediateDirectories: true)
+        }
 
         switch sourceType {
         case .camera:
@@ -716,7 +790,7 @@ final class SetupWindowController: NSWindowController {
             switch target {
             case .display(let id, let name):
                 onStart?(.display(id: id, name: name), iv, quality, selectedOutputDir, aiConfig)
-            case .window(let id, let appName, let title):
+            case .window(let id, let appName, let title, _):
                 onStart?(.window(id: id, name: "\(appName)  —  \(title)"), iv, quality, selectedOutputDir, aiConfig)
             }
         }
