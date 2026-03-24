@@ -26,9 +26,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var inFlightResponses = 0
 
     // MARK: – Session key (derived from passphrase, held only in RAM)
-    private var sessionKey:    SymmetricKey?
-    private var sessionSalt:   Data?
-    private var sessionAPIKey: String?
+    private var sessionKey:       SymmetricKey?
+    private var sessionSalt:      Data?
+    private var sessionAPIKey:    String?
+
+    // MARK: – Voice / Audio AI controllers
+    private var voiceCtrl:    TranscriptionController?
+    private var audioAIProc:  AudioAIProcessor?
 
     func applicationDidFinishLaunching(_ _: Notification) {
         buildMenu()
@@ -50,9 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 do {
                     let (apiKey, key, salt) = try EncryptedKeyStore.load(passphrase: passphrase)
                     DispatchQueue.main.async { [weak self] in
-                        self?.sessionKey    = key
-                        self?.sessionSalt   = salt
-                        self?.sessionAPIKey = apiKey
+                        self?.sessionKey       = key
+                        self?.sessionSalt      = salt
+                        self?.sessionAPIKey    = apiKey
                         self?.showSetup()
                     }
                 } catch {
@@ -96,6 +100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         captureCtrl?.close()
         cameraCtrl = nil; screenCtrl = nil; captureCtrl = nil
         aiProcessor = nil
+        voiceCtrl?.stop(); voiceCtrl = nil
+        audioAIProc = nil
         configureResponseFlow(enabled: false)
         showSetup()
     }
@@ -118,9 +124,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.sessionAPIKey = raw
         }
 
-        wc.onStart = { [weak self] source, interval, quality, outputDir, aiConfig in
+        wc.onStart = { [weak self] source, interval, quality, outputDir, aiConfig, voiceConfig in
             self?.startCapture(source: source, interval: interval, quality: quality,
-                               outputDir: outputDir, aiConfig: aiConfig)
+                               outputDir: outputDir, aiConfig: aiConfig, voiceConfig: voiceConfig)
         }
         setupCtrl = wc
         wc.showWindow(nil)
@@ -152,7 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startCapture(
         source: CaptureSource, interval: TimeInterval,
-        quality: Double, outputDir: URL, aiConfig: AIConfig
+        quality: Double, outputDir: URL, aiConfig: AIConfig, voiceConfig: VoiceConfig
     ) {
         configureResponseFlow(enabled: aiConfig.enabled)
         clearPreviousScreenshots(in: outputDir)
@@ -164,7 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ctrl.shouldCaptureFrame = { [weak self] in
                 self?.canCaptureNextFrame() ?? false
             }
-            let wc   = CaptureWindowController(name: device.localizedName, interval: interval)
+            let wc = CaptureWindowController(name: device.localizedName, interval: interval)
             aiProcessor = makeAIProcessor(config: aiConfig, window: wc)
             ctrl.onScreenshotSaved = { [weak self, weak wc] url, n in
                 wc?.updateStatus(filename: url.lastPathComponent, count: n)
@@ -175,6 +181,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ctrl?.stop()
                 self?.aiProcessor = nil
                 self?.aiPaused = false
+                self?.voiceCtrl?.stop(); self?.voiceCtrl = nil
+                self?.audioAIProc = nil
                 self?.configureResponseFlow(enabled: false)
                 self?.showSetup()
                 NSApp.activate(ignoringOtherApps: true)
@@ -186,26 +194,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .display(let id, let name):
             launchScreenCapture(target: .display(id), name: name,
                                 interval: interval, quality: quality, outputDir: outputDir,
-                                aiConfig: aiConfig)
+                                aiConfig: aiConfig, voiceConfig: voiceConfig)
         case .window(let id, let name):
             launchScreenCapture(target: .window(id), name: name,
                                 interval: interval, quality: quality, outputDir: outputDir,
-                                aiConfig: aiConfig)
+                                aiConfig: aiConfig, voiceConfig: voiceConfig)
         }
+
+        startVoiceControllerIfNeeded(config: voiceConfig)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func startVoiceControllerIfNeeded(config: VoiceConfig) {
+        guard config.enabled else { return }
+
+        // Transcription controller
+        let vc = TranscriptionController(config: config)
+        vc.onPartialTranscript = { [weak self] text in
+            self?.captureCtrl?.appendPartialTranscript(text)
+        }
+        vc.onFinalTranscript = { [weak self] text in
+            self?.captureCtrl?.appendFinalTranscript(text)
+        }
+        vc.onError = { [weak self] msg in
+            self?.captureCtrl?.appendAudioError(msg)
+        }
+        voiceCtrl = vc
+        Task { [weak vc, weak self] in
+            do { try await vc?.start() }
+            catch {
+                await MainActor.run { [weak self] in
+                    self?.captureCtrl?.appendAudioError(
+                        "Voice setup failed: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        // Audio AI processor — requires Anthropic key
+        guard let apiKey = sessionAPIKey, !apiKey.isEmpty else { return }
+        let proc = AudioAIProcessor(apiKey: apiKey, systemPrompt: config.audioAIPrompt)
+        proc.onChunk = { [weak self] chunk in self?.captureCtrl?.appendAudioAIChunk(chunk) }
+        proc.onDone  = { [weak self] in self?.captureCtrl?.finalizeAudioAI() }
+        proc.onError = { [weak self] msg in self?.captureCtrl?.appendAudioAIError(msg) }
+        audioAIProc = proc
+
+        // Wire the Ask AI button + interval timer
+        captureCtrl?.audioAITokenLimit = config.transcriptTokenLimit
+        captureCtrl?.onAudioAIRequest = { [weak proc] transcript in
+            proc?.query(transcript: transcript)
+        }
+        captureCtrl?.startAudioAITimer()
     }
 
     private func launchScreenCapture(
         target: ScreenTarget, name: String,
         interval: TimeInterval, quality: Double, outputDir: URL,
-        aiConfig: AIConfig
+        aiConfig: AIConfig, voiceConfig: VoiceConfig
     ) {
         let ctrl = ScreenCaptureController(target: target, interval: interval,
                                            jpegQuality: quality, outputDir: outputDir)
         ctrl.shouldCaptureFrame = { [weak self] in
             self?.canCaptureNextFrame() ?? false
         }
-        let wc   = CaptureWindowController(name: name, interval: interval)
+        let wc = CaptureWindowController(name: name, interval: interval)
         aiProcessor = makeAIProcessor(config: aiConfig, window: wc)
         ctrl.onScreenshotSaved = { [weak self, weak wc] url, n in
             wc?.updateStatus(filename: url.lastPathComponent, count: n)
@@ -216,6 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ctrl?.stop()
             self?.aiProcessor = nil
             self?.aiPaused = false
+            self?.voiceCtrl?.stop(); self?.voiceCtrl = nil
             self?.configureResponseFlow(enabled: false)
             self?.showSetup()
             NSApp.activate(ignoringOtherApps: true)

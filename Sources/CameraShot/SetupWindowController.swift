@@ -6,13 +6,13 @@ import ScreenCaptureKit
 
 final class SetupWindowController: NSWindowController {
 
-    var onStart:    ((CaptureSource, TimeInterval, Double, URL, AIConfig) -> Void)?
-    /// Encrypt and persist the raw API key using the current session.
-    var saveAPIKey: ((String) throws -> Void)?
+    var onStart:       ((CaptureSource, TimeInterval, Double, URL, AIConfig, VoiceConfig) -> Void)?
+    /// Encrypt and persist the Anthropic API key using the current session.
+    var saveAPIKey:    ((String) throws -> Void)?
 
     // MARK: – Types
 
-    private enum TabPage { case capture, prompts, apiKeys }
+    private enum TabPage { case capture, prompts, apiKeys, audioPrompt }
 
     private enum SourceType { case camera, screen }
 
@@ -40,6 +40,13 @@ final class SetupWindowController: NSWindowController {
     private var securityScopedOutputURL: URL?
 
     private static let screenshotOutputBookmarkKey = "screenshotOutputBookmark"
+    private static let aiEnabledDefaultsKey = "setup.aiEnabled"
+    private static let aiModelDefaultsKey = "setup.aiModel"
+    private static let aiPromptDefaultsKey = "setup.aiPrompt"
+    private static let voiceInputEnabledDefaultsKey = "setup.voiceInputEnabled"
+    private static let voiceServerURLDefaultsKey = "setup.voiceServerURL"
+    private static let audioPromptDefaultsKey = "setup.audioPrompt"
+    private static let audioTokenLimitDefaultsKey = "setup.audioTokenLimit"
 
     private var previewSession: AVCaptureSession?
     private let previewQueue = DispatchQueue(label: "setup.preview", qos: .userInteractive)
@@ -68,12 +75,28 @@ final class SetupWindowController: NSWindowController {
     private weak var aiEnabledCheckbox:  NSButton!
     private weak var modelField:         NSTextField!
     private      var promptTextView:     NSTextView!   // strong: NSTextView inside scroll
+    private weak var promptSaveStatusLabel: NSTextField!
 
     // MARK: – Outlets — API Keys tab
 
-    private weak var apiKeysStack:   NSStackView!
-    private weak var apiKeyField:    NSTextField!
-    private weak var keyStatusLabel: NSTextField!
+    private weak var apiKeysStack:        NSStackView!
+    private weak var apiKeyField:         NSTextField!
+    private weak var keyStatusLabel:      NSTextField!
+
+    // MARK: – Outlets — Voice Input URL (in Capture tab)
+
+    private weak var audioModelField: NSTextField!
+
+    // MARK: – Outlets — Voice Input (in Capture tab)
+
+    private weak var voiceInputCheckbox: NSButton!
+
+    // MARK: – Outlets — Audio Prompt tab
+
+    private weak var audioPromptStack:         NSStackView!
+    private      var audioAIPromptTextView:    NSTextView!
+    private weak var tokenLimitField:          NSTextField!
+    private weak var audioPromptSaveStatusLabel: NSTextField!
 
     // MARK: – Init
 
@@ -100,7 +123,10 @@ final class SetupWindowController: NSWindowController {
         if sourceType == .camera { startCameraPreview() } else { loadScreenContent() }
     }
 
-    deinit { stopCameraPreview() }
+    deinit {
+        stopCameraPreview()
+        NotificationCenter.default.removeObserver(self)
+    }
 
     // MARK: – UI construction
 
@@ -133,7 +159,7 @@ final class SetupWindowController: NSWindowController {
 
         // ── Tab bar ──────────────────────────────────────────────
         let tabs = NSSegmentedControl(
-            labels: ["Capture", "Prompts", "API Keys"],
+            labels: ["Capture", "Prompts", "API Keys", "Audio Prompt"],
             trackingMode: .selectOne,
             target: self,
             action: #selector(tabChanged)
@@ -142,7 +168,7 @@ final class SetupWindowController: NSWindowController {
         tabs.segmentStyle    = .automatic
         tabControl = tabs
         root.addArrangedSubview(tabs)
-        tabs.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        tabs.widthAnchor.constraint(equalToConstant: 380).isActive = true
         root.setCustomSpacing(20, after: tabs)
 
         // ── Capture tab content ──────────────────────────────────
@@ -156,6 +182,12 @@ final class SetupWindowController: NSWindowController {
         // ── API Keys tab content (hidden initially) ───────────────
         root.addArrangedSubview(buildApiKeysStack())
         root.setCustomSpacing(20, after: apiKeysStack)
+
+        // ── Audio Prompt tab content (hidden initially) ───────────
+        root.addArrangedSubview(buildAudioPromptStack())
+        root.setCustomSpacing(20, after: audioPromptStack)
+        restoreSavedPromptSettings()
+        installPromptSettingsObservers()
 
         // ── Start button (always visible) ────────────────────────
         let btn = NSButton(title: "Start Capture", target: self, action: #selector(startTapped))
@@ -272,9 +304,61 @@ final class SetupWindowController: NSWindowController {
 
         s.addArrangedSubview(folderRow)
         folderRow.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(22, after: folderRow)
+
+        // ── Voice Input ──────────────────────────────────────────
+        let divider = NSBox(); divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        s.addArrangedSubview(divider)
+        divider.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(14, after: divider)
+
+        let vcb = NSButton(checkboxWithTitle: "Voice Input  (Live Transcription)",
+                           target: self, action: #selector(voiceInputToggled))
+        vcb.state = .off
+        voiceInputCheckbox = vcb
+        s.addArrangedSubview(vcb)
+        vcb.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(6, after: vcb)
+
+        let hint = NSTextField(wrappingLabelWithString:
+            "Captures all system audio output (speakers/headphones) via ScreenCaptureKit.")
+        hint.font      = .systemFont(ofSize: 11)
+        hint.textColor = .tertiaryLabelColor
+        hint.isHidden  = true
+        s.addArrangedSubview(hint)
+        hint.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(6, after: hint)
+
+        // Server URL row (hidden until voice input is enabled)
+        let urlRow = hstack(spacing: 8); urlRow.alignment = .centerY
+        urlRow.isHidden = true
+        let urlLabel = plainLabel("Server:", size: 12, weight: .regular)
+        urlLabel.textColor = .secondaryLabelColor
+        urlRow.addArrangedSubview(urlLabel)
+        let urlField = NSTextField(string: "ws://aseman:8765")
+        urlField.font              = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        urlField.placeholderString = "ws://hostname:port"
+        urlField.isBezeled         = true
+        urlField.bezelStyle        = .roundedBezel
+        urlField.isEditable        = true
+        audioModelField = urlField
+        urlRow.addArrangedSubview(urlField)
+        s.addArrangedSubview(urlRow)
+        urlRow.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(4, after: urlRow)
 
         captureStack = s
         return s
+    }
+
+    @objc private func voiceInputToggled() {
+        let enabled = voiceInputCheckbox.state == .on
+        guard let idx = captureStack.arrangedSubviews.firstIndex(of: voiceInputCheckbox) else { return }
+        // hint label is idx+1, url row is idx+2
+        captureStack.arrangedSubviews[safe: idx + 1]?.isHidden = !enabled
+        captureStack.arrangedSubviews[safe: idx + 2]?.isHidden = !enabled
+        persistPromptSettings()
     }
 
     // MARK: – Prompts stack
@@ -333,6 +417,20 @@ final class SetupWindowController: NSWindowController {
 
         s.addArrangedSubview(scroll)
         s.setCustomSpacing(14, after: scroll)
+
+        let saveRow = hstack(spacing: 10); saveRow.alignment = .centerY
+        let saveBtn = NSButton(title: "Save Prompt", target: self, action: #selector(savePromptTapped))
+        saveBtn.bezelStyle = .rounded
+        saveRow.addArrangedSubview(saveBtn)
+
+        let sl = NSTextField(labelWithString: "Auto-saves as you type")
+        sl.font      = .systemFont(ofSize: 12)
+        sl.textColor = .secondaryLabelColor
+        promptSaveStatusLabel = sl
+        saveRow.addArrangedSubview(sl)
+        s.addArrangedSubview(saveRow)
+        saveRow.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(10, after: saveRow)
 
         promptsStack = s
         return s
@@ -408,9 +506,86 @@ final class SetupWindowController: NSWindowController {
         removeBtn.widthAnchor.constraint(equalToConstant: 376).isActive = true
         s.setCustomSpacing(22, after: removeBtn)
 
-        
         apiKeysStack = s
         refreshKeyStatus()
+        return s
+    }
+
+    // MARK: – Audio Prompt stack
+
+    private func buildAudioPromptStack() -> NSStackView {
+        let s = vstack(spacing: 0)
+        s.alignment = .centerX
+        s.isHidden  = true
+
+        // Token limit row
+        let tokenRow = hstack(spacing: 8); tokenRow.alignment = .centerY
+        tokenRow.addArrangedSubview(sectionLabel("Transcript Tokens Sent to Claude"))
+        tokenRow.addArrangedSubview(hFlex())
+        let tf = NSTextField(string: "500")
+        tf.font              = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        tf.alignment         = .right
+        tf.isBezeled         = true
+        tf.bezelStyle        = .roundedBezel
+        tf.isEditable        = true
+        tf.placeholderString = "500"
+        tf.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        tokenLimitField = tf
+        tokenRow.addArrangedSubview(tf)
+        s.addArrangedSubview(tokenRow)
+        tokenRow.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(4, after: tokenRow)
+
+        let hint = NSTextField(wrappingLabelWithString:
+            "Claude receives this many tokens of transcript + the system prompt below each interval.")
+        hint.font      = .systemFont(ofSize: 11)
+        hint.textColor = .tertiaryLabelColor
+        s.addArrangedSubview(hint)
+        hint.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(14, after: hint)
+
+        s.addArrangedSubview(sectionLabel("Audio AI System Prompt"))
+        s.setCustomSpacing(5, after: s.arrangedSubviews.last!)
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller   = true
+        scroll.autohidesScrollers    = true
+        scroll.hasHorizontalScroller = false
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            scroll.widthAnchor.constraint(equalToConstant: 376),
+            scroll.heightAnchor.constraint(equalToConstant: 180),
+        ])
+
+        let tv = NSTextView()
+        tv.font    = .systemFont(ofSize: 13)
+        tv.string  = "You are listening to a live conversation or meeting. Based on the transcript, answer questions being asked, summarize key points, or provide helpful context. Be concise."
+        tv.isEditable   = true
+        tv.isSelectable = true
+        tv.autoresizingMask = [.width]
+        tv.textContainerInset = NSSize(width: 4, height: 6)
+        tv.textContainer?.widthTracksTextView = true
+        scroll.documentView = tv
+        audioAIPromptTextView = tv
+
+        s.addArrangedSubview(scroll)
+        s.setCustomSpacing(14, after: scroll)
+
+        let saveRow = hstack(spacing: 10); saveRow.alignment = .centerY
+        let saveBtn = NSButton(title: "Save Prompt", target: self, action: #selector(saveAudioPromptTapped))
+        saveBtn.bezelStyle = .rounded
+        saveRow.addArrangedSubview(saveBtn)
+
+        let asl = NSTextField(labelWithString: "Auto-saves as you type")
+        asl.font      = .systemFont(ofSize: 12)
+        asl.textColor = .secondaryLabelColor
+        audioPromptSaveStatusLabel = asl
+        saveRow.addArrangedSubview(asl)
+        s.addArrangedSubview(saveRow)
+        saveRow.widthAnchor.constraint(equalToConstant: 376).isActive = true
+
+        audioPromptStack = s
         return s
     }
 
@@ -459,14 +634,20 @@ final class SetupWindowController: NSWindowController {
 
     @objc private func tabChanged() {
         let seg = tabControl.selectedSegment
-        let page: TabPage = seg == 0 ? .capture : seg == 1 ? .prompts : .apiKeys
+        let page: TabPage
+        switch seg {
+        case 0:  page = .capture
+        case 1:  page = .prompts
+        case 2:  page = .apiKeys
+        default: page = .audioPrompt
+        }
         guard page != activePage else { return }
         activePage = page
-        captureStack.isHidden  = page != .capture
-        promptsStack.isHidden  = page != .prompts
-        apiKeysStack.isHidden  = page != .apiKeys
+        captureStack.isHidden     = page != .capture
+        promptsStack.isHidden     = page != .prompts
+        apiKeysStack.isHidden     = page != .apiKeys
+        audioPromptStack.isHidden = page != .audioPrompt
 
-        // Refresh status label whenever the API Keys tab is shown.
         if page == .apiKeys { refreshKeyStatus() }
     }
 
@@ -738,11 +919,25 @@ final class SetupWindowController: NSWindowController {
     @objc private func cameraChanged()          { startCameraPreview() }
     @objc private func screenSelectionChanged() { updateScreenThumbnail() }
     @objc private func intervalChanged()        { intervalLabel.stringValue = "\(Int(intervalSlider.doubleValue))s" }
-    @objc private func aiToggled()              { /* state read on start */ }
+    @objc private func aiToggled()              { persistPromptSettings() }
+    @objc private func savePromptTapped() {
+        persistPromptSettings()
+        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+        promptSaveStatusLabel.stringValue = "Saved at \(ts)"
+        promptSaveStatusLabel.textColor   = .systemGreen
+    }
+
+    @objc private func saveAudioPromptTapped() {
+        persistPromptSettings()
+        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+        audioPromptSaveStatusLabel.stringValue = "Saved at \(ts)"
+        audioPromptSaveStatusLabel.textColor   = .systemGreen
+    }
 
     // MARK: – Start
 
     @objc private func startTapped() {
+        persistPromptSettings()
         let iv      = intervalSlider.doubleValue
         let qmap:   [Double] = [0.75, 0.92, 1.0]
         let quality = qmap[qualityControl.selectedSegment]
@@ -758,13 +953,24 @@ final class SetupWindowController: NSWindowController {
 
         if aiEnabled && !EncryptedKeyStore.fileExists() {
             let alert = NSAlert()
-            alert.messageText = "API Key Required"
-            alert.informativeText = "AI processing is enabled but no API key is saved. Open the \"API Keys\" tab, enter your Anthropic API key, and click \"Save Key\" before starting capture."
+            alert.messageText = "Anthropic API Key Required"
+            alert.informativeText = "AI processing is enabled but no Anthropic API key is saved. Open the \"API Keys\" tab, enter your key, and click \"Save Key\"."
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
             alert.runModal()
             return
         }
+
+        let voiceEnabled = voiceInputCheckbox.state == .on
+        let rawURL    = audioModelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawPrompt = audioAIPromptTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tokenLimit = Int(tokenLimitField.stringValue) ?? 500
+        let voiceConfig = VoiceConfig(
+            enabled:              voiceEnabled,
+            serverURL:            rawURL.isEmpty    ? "ws://aseman:8765" : rawURL,
+            audioAIPrompt:        rawPrompt.isEmpty ? "You are listening to a live conversation or meeting. Based on the transcript, answer questions being asked, summarize key points, or provide helpful context. Be concise." : rawPrompt,
+            transcriptTokenLimit: max(50, tokenLimit)
+        )
 
         if securityScopedOutputURL == nil && selectedOutputDir != Self.defaultOutputDirectory {
             promptForSaveFolder { [weak self] granted in
@@ -783,17 +989,94 @@ final class SetupWindowController: NSWindowController {
             guard !cameras.isEmpty else { return }
             let device = cameras[max(0, cameraPopup.indexOfSelectedItem)]
             previewQueue.async { [weak self] in self?.previewSession?.stopRunning() }
-            onStart?(.camera(device), iv, quality, selectedOutputDir, aiConfig)
+            onStart?(.camera(device), iv, quality, selectedOutputDir, aiConfig, voiceConfig)
 
         case .screen:
             guard let target = screenPopup.selectedItem?.representedObject as? CaptureTarget else { return }
             switch target {
             case .display(let id, let name):
-                onStart?(.display(id: id, name: name), iv, quality, selectedOutputDir, aiConfig)
+                onStart?(.display(id: id, name: name), iv, quality, selectedOutputDir, aiConfig, voiceConfig)
             case .window(let id, let appName, let title, _):
-                onStart?(.window(id: id, name: "\(appName)  —  \(title)"), iv, quality, selectedOutputDir, aiConfig)
+                onStart?(.window(id: id, name: "\(appName)  —  \(title)"), iv, quality, selectedOutputDir, aiConfig, voiceConfig)
             }
         }
+    }
+
+    // MARK: – Prompt settings persistence
+
+    private func restoreSavedPromptSettings() {
+        let defaults = UserDefaults.standard
+
+        if defaults.object(forKey: Self.aiEnabledDefaultsKey) != nil {
+            aiEnabledCheckbox.state = defaults.bool(forKey: Self.aiEnabledDefaultsKey) ? .on : .off
+        }
+        if let model = defaults.string(forKey: Self.aiModelDefaultsKey) {
+            modelField.stringValue = model
+        }
+        if let prompt = defaults.string(forKey: Self.aiPromptDefaultsKey) {
+            promptTextView.string = prompt
+        }
+        if defaults.object(forKey: Self.voiceInputEnabledDefaultsKey) != nil {
+            voiceInputCheckbox.state = defaults.bool(forKey: Self.voiceInputEnabledDefaultsKey) ? .on : .off
+        }
+        if let serverURL = defaults.string(forKey: Self.voiceServerURLDefaultsKey) {
+            audioModelField.stringValue = serverURL
+        }
+        if let audioPrompt = defaults.string(forKey: Self.audioPromptDefaultsKey) {
+            audioAIPromptTextView.string = audioPrompt
+        }
+        if let tokenLimit = defaults.string(forKey: Self.audioTokenLimitDefaultsKey) {
+            tokenLimitField.stringValue = tokenLimit
+        }
+        voiceInputToggled()
+    }
+
+    private func installPromptSettingsObservers() {
+        let nc = NotificationCenter.default
+        nc.addObserver(
+            self,
+            selector: #selector(promptSettingChanged(_:)),
+            name: NSControl.textDidChangeNotification,
+            object: modelField
+        )
+        nc.addObserver(
+            self,
+            selector: #selector(promptSettingChanged(_:)),
+            name: NSControl.textDidChangeNotification,
+            object: audioModelField
+        )
+        nc.addObserver(
+            self,
+            selector: #selector(promptSettingChanged(_:)),
+            name: NSControl.textDidChangeNotification,
+            object: tokenLimitField
+        )
+        nc.addObserver(
+            self,
+            selector: #selector(promptSettingChanged(_:)),
+            name: NSText.didChangeNotification,
+            object: promptTextView
+        )
+        nc.addObserver(
+            self,
+            selector: #selector(promptSettingChanged(_:)),
+            name: NSText.didChangeNotification,
+            object: audioAIPromptTextView
+        )
+    }
+
+    @objc private func promptSettingChanged(_ notification: Notification) {
+        persistPromptSettings()
+    }
+
+    private func persistPromptSettings() {
+        UserDefaults.standard.set(aiEnabledCheckbox.state == .on, forKey: Self.aiEnabledDefaultsKey)
+        UserDefaults.standard.set(modelField.stringValue, forKey: Self.aiModelDefaultsKey)
+        UserDefaults.standard.set(promptTextView.string, forKey: Self.aiPromptDefaultsKey)
+        UserDefaults.standard.set(voiceInputCheckbox.state == .on, forKey: Self.voiceInputEnabledDefaultsKey)
+        UserDefaults.standard.set(audioModelField.stringValue, forKey: Self.voiceServerURLDefaultsKey)
+        UserDefaults.standard.set(audioAIPromptTextView.string, forKey: Self.audioPromptDefaultsKey)
+        UserDefaults.standard.set(tokenLimitField.stringValue, forKey: Self.audioTokenLimitDefaultsKey)
     }
 
     // MARK: – Layout helpers
@@ -824,6 +1107,14 @@ final class SetupWindowController: NSWindowController {
             child.topAnchor.constraint(equalTo:      parent.topAnchor),
             child.bottomAnchor.constraint(equalTo:   parent.bottomAnchor),
         ])
+    }
+}
+
+// MARK: - Collection safe subscript
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
 

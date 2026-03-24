@@ -28,9 +28,49 @@ final class CaptureWindowController: NSWindowController {
     /// Called when the user clicks Stop — stops capture entirely.
     var onStop: (() -> Void)?
 
+    // MARK: – Content tab (Visual / Transcript / Audio AI)
+
+    private weak var contentTabControl: NSSegmentedControl!
+    private var activeContentTab = 0   // 0 = Visual, 1 = Transcript, 2 = Audio AI
+
+    // Visual-tab buttons
+    private weak var zoomOutBtn:    NSButton!
+    private weak var zoomInBtn:     NSButton!
+    private weak var visualClearBtn: NSButton!
+
+    // Transcript-tab buttons
+    private weak var audioClearBtn: NSButton!
+
+    // Audio AI-tab buttons
+    private weak var audioAIAskBtn:    NSButton!
+    private weak var audioAIClearBtn:  NSButton!
+    private weak var audioAIZoomOutBtn: NSButton!
+    private weak var audioAIZoomInBtn:  NSButton!
+
+    // Transcript feed
+    private weak var audioScrollView: NSScrollView!
+    private var audioTextView:        NSTextView!   // strong (inside scrollview)
+    private var transcriptBuffer:     String = ""   // last N chars for Audio AI
+    private var partialRange:         NSRange?      // range of current partial line (nil = none)
+
+    // Audio AI feed
+    private var audioAIWebView:      WKWebView!     // strong
+    private var audioAIPageReady     = false
+    private var audioAINextEntryId   = 0
+    private var audioAICurrentEntry: Int?           // nil = no active streaming entry
+    private var audioAIStreamingText = ""
+
+    // Audio AI callbacks / timer
+    var onAudioAIRequest: ((String) -> Void)?
+    var audioAITokenLimit: Int = 500          // ~4 chars per token
+    private var audioAITimer: Timer?
+    private let captureInterval: TimeInterval
+    private var lastSentTranscript: String = ""
+
     // MARK: – Init
 
     init(name: String, interval: TimeInterval) {
+        self.captureInterval = interval
         let screen = NSScreen.main ?? NSScreen.screens[0]
         let w: CGFloat = 1280, h: CGFloat = 760
         let origin = NSPoint(x: screen.visibleFrame.midX - w / 2,
@@ -46,6 +86,17 @@ final class CaptureWindowController: NSWindowController {
         win.isMovableByWindowBackground = true
         super.init(window: win)
         buildUI(name: name, interval: interval)
+    }
+
+    deinit { audioAITimer?.invalidate() }
+
+    /// Call this once voice input is confirmed enabled to start the auto-trigger timer.
+    func startAudioAITimer() {
+        audioAITimer?.invalidate()
+        audioAITimer = Timer.scheduledTimer(withTimeInterval: captureInterval,
+                                            repeats: true) { [weak self] _ in
+            self?.triggerAudioAI()
+        }
     }
 
     @available(*, unavailable)
@@ -108,6 +159,156 @@ final class CaptureWindowController: NSWindowController {
             let header = "[\(Self.timeString())]  Error"
             appendEntry(header: header, body: message, isError: true)
         }
+    }
+
+    // MARK: – Public — Transcript feed
+
+    /// Shows `text` as a replaceable live-preview line (dim, italic). Replaces any previous partial.
+    func appendPartialTranscript(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let ts = audioTextView.textStorage else { return }
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]
+            let replacement = NSAttributedString(string: text + "\n", attributes: attrs)
+            if let range = partialRange {
+                ts.replaceCharacters(in: range, with: replacement)
+                partialRange = NSRange(location: range.location, length: replacement.length)
+            } else {
+                let insertLoc = ts.length
+                ts.append(replacement)
+                partialRange = NSRange(location: insertLoc, length: replacement.length)
+            }
+            scrollAudioToBottom()
+        }
+    }
+
+    /// Commits `text` as a permanent line and adds it to the AI transcript buffer.
+    func appendFinalTranscript(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let ts = audioTextView.textStorage else { return }
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.labelColor,
+            ]
+            let committed = NSAttributedString(string: text + "\n", attributes: attrs)
+            if let range = partialRange {
+                ts.replaceCharacters(in: range, with: committed)
+                partialRange = nil
+            } else {
+                ts.append(committed)
+            }
+            transcriptBuffer += text + "\n"
+            let cap = audioAITokenLimit * 4
+            if transcriptBuffer.count > cap * 2 {
+                transcriptBuffer = String(transcriptBuffer.suffix(cap))
+            }
+            scrollAudioToBottom()
+        }
+    }
+
+    // MARK: – Public — Audio AI feed
+
+    /// Streams a chunk of Claude's response into the Audio AI WebView.
+    func appendAudioAIChunk(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, audioAIPageReady else { return }
+            // Start a new streaming entry on the first chunk
+            if audioAICurrentEntry == nil {
+                let entryId = audioAINextEntryId
+                audioAINextEntryId += 1
+                audioAICurrentEntry = entryId
+                audioAIStreamingText = ""
+                let preview = String(transcriptBuffer.suffix(100))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let header = "[\(Self.timeString())]\n…\(preview)"
+                if let hJS = jsLiteral(header) {
+                    audioAIWebView.evaluateJavaScript(
+                        "startStreamingEntry(\(hJS), null, \(entryId))",
+                        completionHandler: nil)
+                }
+            }
+            guard let entryId = audioAICurrentEntry, let tJS = jsLiteral(text) else { return }
+            audioAIStreamingText += text
+            audioAIWebView.evaluateJavaScript(
+                "appendStreamingChunk(\(entryId), \(tJS))",
+                completionHandler: nil)
+        }
+    }
+
+    /// Finalizes the current Audio AI streaming entry, rendering full markdown.
+    func finalizeAudioAI() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let entryId = audioAICurrentEntry,
+                  let mdJS = jsLiteral(audioAIStreamingText) else { return }
+            audioAIWebView.evaluateJavaScript(
+                "endStreamingEntry(\(entryId), \(mdJS))",
+                completionHandler: nil)
+            audioAICurrentEntry = nil
+            audioAIStreamingText = ""
+        }
+    }
+
+    /// Appends an error entry to the Audio AI tab.
+    func appendAudioAIError(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, audioAIPageReady else { return }
+            // Close any open entry first
+            if let entryId = audioAICurrentEntry, let mdJS = jsLiteral(audioAIStreamingText) {
+                audioAIWebView.evaluateJavaScript(
+                    "endStreamingEntry(\(entryId), \(mdJS))", completionHandler: nil)
+                audioAICurrentEntry = nil; audioAIStreamingText = ""
+            }
+            let entryId = audioAINextEntryId; audioAINextEntryId += 1
+            let header = "[\(Self.timeString())]"
+            if let hJS = jsLiteral(header) {
+                audioAIWebView.evaluateJavaScript(
+                    "startStreamingEntry(\(hJS), null, \(entryId))", completionHandler: nil)
+            }
+            if let errJS = jsLiteral("⚠ \(message)") {
+                audioAIWebView.evaluateJavaScript(
+                    "endStreamingEntry(\(entryId), \(errJS))", completionHandler: nil)
+            }
+        }
+    }
+
+    @objc private func audioAIZoomIn()  { audioAIWebView.evaluateJavaScript("adjustZoom(1)",  completionHandler: nil) }
+    @objc private func audioAIZoomOut() { audioAIWebView.evaluateJavaScript("adjustZoom(-1)", completionHandler: nil) }
+
+    @objc private func askAITapped() { triggerAudioAI() }
+
+    private func triggerAudioAI() {
+        let full    = transcriptBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !full.isEmpty else { return }
+        // Trim to the configured token limit before sending
+        let current = String(full.suffix(audioAITokenLimit * 4))
+
+        // Skip if fewer than 3% of characters are new since the last send
+        let newChars = current.count - lastSentTranscript.count
+        let base = max(lastSentTranscript.count, 1)
+        guard lastSentTranscript.isEmpty || Double(newChars) / Double(base) >= 0.03 else { return }
+
+        lastSentTranscript = current
+        onAudioAIRequest?(current)
+    }
+
+    /// Appends a red error entry to the audio feed.
+    func appendAudioError(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let attrStr = NSAttributedString(
+                string: "⚠ \(message)\n",
+                attributes: [.font: NSFont.systemFont(ofSize: 12),
+                             .foregroundColor: NSColor.systemRed])
+            audioTextView.textStorage?.append(attrStr)
+            scrollAudioToBottom()
+        }
+    }
+
+    private func scrollAudioToBottom() {
+        guard let ts = audioTextView.textStorage else { return }
+        audioTextView.scrollRangeToVisible(NSRange(location: ts.length, length: 0))
     }
 
     // MARK: – UI construction
@@ -224,6 +425,7 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func buildAIPane() -> NSView {
+        // ── WebView (Visual tab) ─────────────────────────────────
         let config = WKWebViewConfiguration()
         let handler = CopyCodeHandler(pageReady: { [weak self] in
             DispatchQueue.main.async {
@@ -241,9 +443,48 @@ final class CaptureWindowController: NSWindowController {
         wv.navigationDelegate = self
         webView = wv
 
+        // ── Transcript feed ────────────────────────────────────────
+        let tv = NSTextView()
+        tv.isEditable         = false
+        tv.isSelectable       = true
+        tv.drawsBackground    = false
+        tv.textContainerInset = NSSize(width: 16, height: 16)
+        tv.autoresizingMask   = [.width]
+        tv.textContainer?.widthTracksTextView = true
+        audioTextView = tv
+
+        let sv = NSScrollView()
+        sv.documentView          = tv
+        sv.hasVerticalScroller   = true
+        sv.autohidesScrollers    = true
+        sv.hasHorizontalScroller = false
+        sv.drawsBackground       = false
+        sv.translatesAutoresizingMaskIntoConstraints = false
+        sv.isHidden = true   // hidden until Transcript tab is selected
+        audioScrollView = sv
+
+        // ── Audio AI feed (WKWebView — same renderer as Visual) ──────
+        let aiCfg = WKWebViewConfiguration()
+        let aiHandler = CopyCodeHandler(pageReady: { [weak self] in
+            DispatchQueue.main.async {
+                self?.audioAIPageReady = true
+            }
+        })
+        aiCfg.userContentController.add(aiHandler, name: "copyCode")
+        aiCfg.userContentController.add(aiHandler, name: "pageReady")
+
+        let aiWV = WKWebView(frame: .zero, configuration: aiCfg)
+        aiWV.translatesAutoresizingMaskIntoConstraints = false
+        aiWV.wantsLayer = true
+        aiWV.layer?.backgroundColor = NSColor.clear.cgColor
+        aiWV.isHidden = true
+        audioAIWebView = aiWV
+
+        // ── Container ─────────────────────────────────────────────
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
 
+        // ── Inner bar ─────────────────────────────────────────────
         let innerBar = NSView()
         innerBar.wantsLayer = true
         innerBar.layer?.backgroundColor = NSColor(named: "controlBackground")?.cgColor
@@ -258,44 +499,138 @@ final class CaptureWindowController: NSWindowController {
             return b
         }
 
-        let zoomOut = barBtn("−", action: #selector(zoomOut))
-        let zoomIn  = barBtn("+", action: #selector(zoomIn))
-        let clear   = barBtn("Clear", action: #selector(clearAI))
-        clear.font  = .systemFont(ofSize: 11)
+        // Content tab selector (left side of inner bar)
+        let contentTabs = NSSegmentedControl(
+            labels: ["Visual", "Transcript", "Audio AI"],
+            trackingMode: .selectOne, target: self,
+            action: #selector(contentTabChanged))
+        contentTabs.selectedSegment = 0
+        contentTabs.segmentStyle    = .automatic
+        contentTabs.controlSize     = .small
+        contentTabs.translatesAutoresizingMaskIntoConstraints = false
+        innerBar.addSubview(contentTabs)
+        contentTabControl = contentTabs
 
-        [zoomOut, zoomIn, clear].forEach { innerBar.addSubview($0) }
+        // Visual-tab buttons (right side)
+        let zo = barBtn("−", action: #selector(zoomOut)); zoomOutBtn    = zo
+        let zi = barBtn("+", action: #selector(zoomIn));  zoomInBtn     = zi
+        let vc = barBtn("Clear", action: #selector(clearAI))
+        vc.font = .systemFont(ofSize: 11);                visualClearBtn = vc
+
+        // Transcript-tab buttons (hidden initially)
+        let ac = barBtn("Clear", action: #selector(clearAudioFeed))
+        ac.font = .systemFont(ofSize: 11)
+        ac.isHidden = true;                               audioClearBtn = ac
+
+        // Audio AI-tab buttons (hidden initially)
+        let azo = barBtn("−", action: #selector(audioAIZoomOut)); azo.isHidden = true; audioAIZoomOutBtn = azo
+        let azi = barBtn("+", action: #selector(audioAIZoomIn));  azi.isHidden = true; audioAIZoomInBtn  = azi
+        let aac = barBtn("Clear", action: #selector(clearAudioAI))
+        aac.font = .systemFont(ofSize: 11); aac.isHidden = true; audioAIClearBtn = aac
+        let askBtn = barBtn("Ask AI", action: #selector(askAITapped))
+        askBtn.font = .systemFont(ofSize: 11); askBtn.isHidden = true; audioAIAskBtn = askBtn
+
+        [zo, zi, vc, ac, azo, azi, aac, askBtn].forEach { innerBar.addSubview($0) }
 
         let divider = NSBox(); divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(divider)
         container.addSubview(wv)
+        container.addSubview(sv)
+        container.addSubview(aiWV)
 
         NSLayoutConstraint.activate([
+            // Inner bar
             innerBar.topAnchor.constraint(equalTo: container.topAnchor),
             innerBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             innerBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             innerBar.heightAnchor.constraint(equalToConstant: 36),
 
-            zoomOut.trailingAnchor.constraint(equalTo: zoomIn.leadingAnchor, constant: -2),
-            zoomOut.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
-            zoomIn.trailingAnchor.constraint(equalTo: clear.leadingAnchor, constant: -10),
-            zoomIn.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
-            clear.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
-            clear.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            // Content tab selector (left)
+            contentTabs.leadingAnchor.constraint(equalTo: innerBar.leadingAnchor, constant: 10),
+            contentTabs.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
 
+            // Visual buttons (right)
+            zo.trailingAnchor.constraint(equalTo: zi.leadingAnchor, constant: -2),
+            zo.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            zi.trailingAnchor.constraint(equalTo: vc.leadingAnchor, constant: -10),
+            zi.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            vc.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            vc.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+
+            // Transcript buttons (same position – shown/hidden on tab switch)
+            ac.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            ac.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+
+            // Audio AI buttons (shown/hidden on tab switch)
+            azo.trailingAnchor.constraint(equalTo: azi.leadingAnchor, constant: -2),
+            azo.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            azi.trailingAnchor.constraint(equalTo: aac.leadingAnchor, constant: -10),
+            azi.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            aac.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            aac.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            askBtn.trailingAnchor.constraint(equalTo: azo.leadingAnchor, constant: -12),
+            askBtn.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+
+            // Divider
             divider.topAnchor.constraint(equalTo: innerBar.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: container.trailingAnchor),
 
+            // WebView (Visual) — all three content views share the same frame
             wv.topAnchor.constraint(equalTo: divider.bottomAnchor),
             wv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             wv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             wv.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            sv.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            sv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            sv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            sv.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            aiWV.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            aiWV.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            aiWV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            aiWV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
         let baseURL: URL? = Self.resourcesBaseURL()
         wv.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
+        aiWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         return container
+    }
+
+    @objc private func contentTabChanged() {
+        activeContentTab = contentTabControl.selectedSegment
+        let isVisual     = activeContentTab == 0
+        let isTranscript = activeContentTab == 1
+        let isAudioAI    = activeContentTab == 2
+
+        webView.isHidden         = !isVisual
+        audioScrollView.isHidden = !isTranscript
+        audioAIWebView.isHidden  = !isAudioAI
+
+        zoomOutBtn.isHidden       = !isVisual
+        zoomInBtn.isHidden        = !isVisual
+        visualClearBtn.isHidden   = !isVisual
+        audioClearBtn.isHidden    = !isTranscript
+        audioAIZoomOutBtn.isHidden = !isAudioAI
+        audioAIZoomInBtn.isHidden  = !isAudioAI
+        audioAIClearBtn.isHidden   = !isAudioAI
+        audioAIAskBtn.isHidden     = !isAudioAI
+    }
+
+    @objc private func clearAudioFeed() {
+        audioTextView.textStorage?.setAttributedString(NSAttributedString())
+        transcriptBuffer = ""
+        lastSentTranscript = ""
+        partialRange = nil
+    }
+
+    @objc private func clearAudioAI() {
+        audioAIWebView.evaluateJavaScript("clearFeed()", completionHandler: nil)
+        audioAICurrentEntry = nil
+        audioAIStreamingText = ""
     }
 
     // MARK: – AI helpers
@@ -513,6 +848,7 @@ final class CaptureWindowController: NSWindowController {
         font-size: 11px;
         color: var(--fg2);
         margin-bottom: 10px;
+        white-space: pre-line;
       }
 
       .entry-thumbnail {
@@ -596,11 +932,13 @@ final class CaptureWindowController: NSWindowController {
           hdr.className = 'entry-header';
           hdr.textContent = header;
           entry.appendChild(hdr);
-          var img = document.createElement('img');
-          img.className = 'entry-thumbnail';
-          if (imageDataURL) img.src = imageDataURL;
-          img.alt = 'Screenshot';
-          entry.appendChild(img);
+          if (imageDataURL) {
+            var img = document.createElement('img');
+            img.className = 'entry-thumbnail';
+            img.src = imageDataURL;
+            img.alt = 'Screenshot';
+            entry.appendChild(img);
+          }
           var body = document.createElement('div');
           body.className = 'streaming-body';
           body.textContent = '';
@@ -613,10 +951,18 @@ final class CaptureWindowController: NSWindowController {
       }
       function setStreamingEntryThumbnail(entryId, dataURL) {
         var entry = document.querySelector('[data-entry-id="' + entryId + '"]');
-        if (entry) {
-          var img = entry.querySelector('img.entry-thumbnail');
-          if (img && dataURL) img.src = dataURL;
+        if (!entry || !dataURL) return;
+        var img = entry.querySelector('img.entry-thumbnail');
+        if (!img) {
+          img = document.createElement('img');
+          img.className = 'entry-thumbnail';
+          img.alt = 'Screenshot';
+          var hdr = entry.querySelector('.entry-header');
+          if (hdr && hdr.nextSibling) entry.insertBefore(img, hdr.nextSibling);
+          else if (hdr) entry.appendChild(img);
+          else entry.insertBefore(img, entry.firstChild);
         }
+        img.src = dataURL;
       }
       function appendStreamingChunk(entryId, text) {
         var body = streamingBodiesById[String(entryId)];
