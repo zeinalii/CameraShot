@@ -693,7 +693,7 @@ final class SetupWindowController: NSWindowController {
                 DispatchQueue.main.async { self?.livePreview.showImage(img) }
             }
         case .window(let id, _, _, let scWindow):
-            if #available(macOS 14.2, *), let scWindow = scWindow {
+            if #available(macOS 14.0, *), let scWindow = scWindow {
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let config = SCStreamConfiguration()
                 config.width = Int(filter.contentRect.width * CGFloat(filter.pointPixelScale))
@@ -702,7 +702,7 @@ final class SetupWindowController: NSWindowController {
                     guard let img else { return }
                     DispatchQueue.main.async { self?.livePreview.showImage(img) }
                 }
-            } else {
+            } else if #unavailable(macOS 14.0) {
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     let img = CGWindowListCreateImage(
                         .null, .optionIncludingWindow, id,

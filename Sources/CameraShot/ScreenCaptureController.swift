@@ -26,7 +26,13 @@ final class ScreenCaptureController: NSObject {
     // MARK: – Private
 
     private let target:      ScreenTarget
-    private let saveQueue  = DispatchQueue(label: "shot.screen.save", qos: .utility)
+    private let saveQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "shot.screen.save"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 1
+        return queue
+    }()
     private let interval:    TimeInterval
     private let jpegQuality: Double
     private var saveCount  = 0
@@ -116,7 +122,7 @@ final class ScreenCaptureController: NSObject {
                 contentFilter: filter,
                 configuration: config
             )
-            saveQueue.async { [weak self] in self?.persistImage(image) }
+            saveQueue.addOperation(PersistImageOperation(controller: self, image: image))
         } catch {
             fputs("Screenshot failed: \(error.localizedDescription)\n", stderr)
         }
@@ -124,7 +130,7 @@ final class ScreenCaptureController: NSObject {
 
     // MARK: – Persistence
 
-    private func persistImage(_ cgImage: CGImage) {
+    fileprivate func persistImage(_ cgImage: CGImage) {
         guard changeFilter.shouldAccept(cgImage) else {
             print("Skipped: frame difference below 3%")
             return
@@ -180,5 +186,21 @@ final class ScreenCaptureController: NSObject {
         var errorDescription: String? {
             "The selected display or window could not be found. It may have been closed or disconnected."
         }
+    }
+}
+
+private final class PersistImageOperation: Operation, @unchecked Sendable {
+    private weak var controller: ScreenCaptureController?
+    private let image: CGImage
+
+    init(controller: ScreenCaptureController, image: CGImage) {
+        self.controller = controller
+        self.image = image
+        super.init()
+    }
+
+    override func main() {
+        guard !isCancelled else { return }
+        controller?.persistImage(image)
     }
 }
