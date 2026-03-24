@@ -210,11 +210,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Transcription controller
         let vc = TranscriptionController(config: config)
-        vc.onPartialTranscript = { [weak self] text in
-            self?.captureCtrl?.appendPartialTranscript(text)
-        }
-        vc.onFinalTranscript = { [weak self] text in
-            self?.captureCtrl?.appendFinalTranscript(text)
+        vc.onTranscript = { [weak self] text in
+            self?.captureCtrl?.appendTranscript(text)
         }
         vc.onError = { [weak self] msg in
             self?.captureCtrl?.appendAudioError(msg)

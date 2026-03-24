@@ -51,7 +51,6 @@ final class CaptureWindowController: NSWindowController {
     private weak var audioScrollView: NSScrollView!
     private var audioTextView:        NSTextView!   // strong (inside scrollview)
     private var transcriptBuffer:     String = ""   // last N chars for Audio AI
-    private var partialRange:         NSRange?      // range of current partial line (nil = none)
 
     // Audio AI feed
     private var audioAIWebView:      WKWebView!     // strong
@@ -163,42 +162,15 @@ final class CaptureWindowController: NSWindowController {
 
     // MARK: – Public — Transcript feed
 
-    /// Shows `text` as a replaceable live-preview line (dim, italic). Replaces any previous partial.
-    func appendPartialTranscript(_ text: String) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let ts = audioTextView.textStorage else { return }
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 13),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ]
-            let replacement = NSAttributedString(string: text + "\n", attributes: attrs)
-            if let range = partialRange {
-                ts.replaceCharacters(in: range, with: replacement)
-                partialRange = NSRange(location: range.location, length: replacement.length)
-            } else {
-                let insertLoc = ts.length
-                ts.append(replacement)
-                partialRange = NSRange(location: insertLoc, length: replacement.length)
-            }
-            scrollAudioToBottom()
-        }
-    }
-
-    /// Commits `text` as a permanent line and adds it to the AI transcript buffer.
-    func appendFinalTranscript(_ text: String) {
+    /// Appends each server message permanently (no partial vs final distinction).
+    func appendTranscript(_ text: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self, let ts = audioTextView.textStorage else { return }
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 13),
                 .foregroundColor: NSColor.labelColor,
             ]
-            let committed = NSAttributedString(string: text + "\n", attributes: attrs)
-            if let range = partialRange {
-                ts.replaceCharacters(in: range, with: committed)
-                partialRange = nil
-            } else {
-                ts.append(committed)
-            }
+            ts.append(NSAttributedString(string: text + "\n", attributes: attrs))
             transcriptBuffer += text + "\n"
             let cap = audioAITokenLimit * 4
             if transcriptBuffer.count > cap * 2 {
@@ -624,7 +596,6 @@ final class CaptureWindowController: NSWindowController {
         audioTextView.textStorage?.setAttributedString(NSAttributedString())
         transcriptBuffer = ""
         lastSentTranscript = ""
-        partialRange = nil
     }
 
     @objc private func clearAudioAI() {
