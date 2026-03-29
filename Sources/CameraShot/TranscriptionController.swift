@@ -9,8 +9,8 @@ final class TranscriptionController: NSObject {
 
     // MARK: – Callbacks (always called on the main thread)
 
-    /// Fired for every transcript message from the server (partial and final treated the same).
-    var onTranscript: ((String) -> Void)?
+    /// Fired for every transcript message. Second argument is `true` when `is_final` from the server.
+    var onTranscript: ((String, Bool) -> Void)?
     /// Fired on any connection or audio error.
     var onError: ((String) -> Void)?
 
@@ -93,7 +93,8 @@ final class TranscriptionController: NSObject {
               type == "transcript",
               let text = obj["text"] as? String else { return }
 
-        fire { [weak self] in self?.onTranscript?(text) }
+        let isFinal = obj["is_final"] as? Bool ?? true
+        fire { [weak self] in self?.onTranscript?(text, isFinal) }
     }
 
     // MARK: – System audio capture (ScreenCaptureKit)

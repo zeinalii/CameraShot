@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import CryptoKit
+import Darwin
 
 // MARK: - CaptureSource
 
@@ -33,10 +34,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: – Voice / Audio AI controllers
     private var voiceCtrl:    TranscriptionController?
     private var audioAIProc:  AudioAIProcessor?
+    private var windowPrivacyObserversInstalled = false
+    private var documentsScopeURL: URL?
+    private static let documentsAccessBookmarkKey = "documentsAccessBookmark"
 
     func applicationDidFinishLaunching(_ _: Notification) {
+        installGlobalWindowPrivacyProtection()
         buildMenu()
-        requestCameraPermission { [weak self] in self?.autoUnlock() }
+        ensureDocumentsAccess { [weak self] in
+            self?.requestCameraPermission { [weak self] in self?.autoUnlock() }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        documentsScopeURL?.stopAccessingSecurityScopedResource()
+        documentsScopeURL = nil
     }
 
     /// Keep the app running when windows close so Stop can return to setup reliably.
@@ -81,6 +93,138 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: – Menu
+
+    private func ensureDocumentsAccess(completion: @escaping () -> Void) {
+        _ = restoreDocumentsAccessIfAvailable()
+        completion()
+    }
+
+    private func restoreDocumentsAccessIfAvailable() -> Bool {
+        guard let data = UserDefaults.standard.data(forKey: Self.documentsAccessBookmarkKey) else { return false }
+        var stale = false
+        do {
+            let url = try URL(
+                resolvingBookmarkData: data,
+                options: .withSecurityScope,
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            )
+            guard urlCoversDocumentsAccess(url) else {
+                UserDefaults.standard.removeObject(forKey: Self.documentsAccessBookmarkKey)
+                return false
+            }
+            guard url.startAccessingSecurityScopedResource() else {
+                UserDefaults.standard.removeObject(forKey: Self.documentsAccessBookmarkKey)
+                return false
+            }
+            documentsScopeURL?.stopAccessingSecurityScopedResource()
+            documentsScopeURL = url
+            if stale {
+                persistDocumentsBookmark(for: url)
+            }
+            return true
+        } catch {
+            UserDefaults.standard.removeObject(forKey: Self.documentsAccessBookmarkKey)
+            return false
+        }
+    }
+
+    private func persistDocumentsBookmark(for url: URL) {
+        do {
+            let data = try url.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            UserDefaults.standard.set(data, forKey: Self.documentsAccessBookmarkKey)
+        } catch {
+            UserDefaults.standard.removeObject(forKey: Self.documentsAccessBookmarkKey)
+        }
+    }
+
+    private func promptForDocumentsAccess(completion: @escaping (Bool) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles       = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL         = preferredDocumentsDirectory().deletingLastPathComponent()
+        panel.prompt               = "Grant Access"
+        panel.message              = "Allow CameraShot to access your Documents folder. This is requested once and reused on next launches."
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [weak self] response in
+            guard let self else { completion(false); return }
+            guard response == .OK, let url = panel.url else {
+                completion(false)
+                return
+            }
+            guard self.urlCoversDocumentsAccess(url) else {
+                NSLog("Documents access selection does not cover ~/Documents: %@", url.path)
+                completion(false)
+                return
+            }
+            guard url.startAccessingSecurityScopedResource() else {
+                completion(false)
+                return
+            }
+            self.documentsScopeURL?.stopAccessingSecurityScopedResource()
+            self.documentsScopeURL = url
+            self.persistDocumentsBookmark(for: url)
+            completion(true)
+        }
+    }
+
+    private func preferredDocumentsDirectory() -> URL {
+        let homePath: String
+        if let pw = getpwuid(getuid()), let cHome = pw.pointee.pw_dir {
+            homePath = String(cString: cHome)
+        } else if let home = NSHomeDirectoryForUser(NSUserName()) {
+            homePath = home
+        } else {
+            homePath = NSHomeDirectory()
+        }
+        return URL(fileURLWithPath: homePath, isDirectory: true)
+            .appendingPathComponent("Documents", isDirectory: true)
+            .standardizedFileURL
+    }
+
+    private func urlCoversDocumentsAccess(_ selectedURL: URL) -> Bool {
+        let selectedPath = selectedURL.standardizedFileURL.resolvingSymlinksInPath().path
+        let documentsPath = preferredDocumentsDirectory().resolvingSymlinksInPath().path
+        return selectedPath == documentsPath || documentsPath.hasPrefix(selectedPath + "/")
+    }
+
+    private func installGlobalWindowPrivacyProtection() {
+        guard !windowPrivacyObserversInstalled else { return }
+        windowPrivacyObserversInstalled = true
+        protectAllAppWindows()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidAppear(_:)),
+            name: NSWindow.didBecomeKeyNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidAppear(_:)),
+            name: NSWindow.didBecomeMainNotification,
+            object: nil
+        )
+    }
+
+    @objc private func windowDidAppear(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        protectWindowFromCapture(window)
+    }
+
+    private func protectAllAppWindows() {
+        NSApp.windows.forEach(protectWindowFromCapture(_:))
+    }
+
+    private func protectWindowFromCapture(_ window: NSWindow) {
+        window.sharingType = .none
+        (window.childWindows ?? []).forEach { $0.sharingType = .none }
+    }
 
     private func buildMenu() {
         let bar  = NSMenu()
@@ -210,18 +354,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Transcription controller
         let vc = TranscriptionController(config: config)
-        vc.onTranscript = { [weak self] text in
-            self?.captureCtrl?.appendTranscript(text)
+        vc.onTranscript = { text, _ in
+            (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendTranscript(text)
         }
-        vc.onError = { [weak self] msg in
-            self?.captureCtrl?.appendAudioError(msg)
+        vc.onError = { msg in
+            (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendAudioError(msg)
         }
         voiceCtrl = vc
-        Task { [weak vc, weak self] in
+        Task { [weak vc] in
             do { try await vc?.start() }
             catch {
-                await MainActor.run { [weak self] in
-                    self?.captureCtrl?.appendAudioError(
+                await MainActor.run {
+                    (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendAudioError(
                         "Voice setup failed: \(error.localizedDescription)")
                 }
             }
@@ -230,9 +374,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Audio AI processor — requires Anthropic key
         guard let apiKey = sessionAPIKey, !apiKey.isEmpty else { return }
         let proc = AudioAIProcessor(apiKey: apiKey, systemPrompt: config.audioAIPrompt)
-        proc.onChunk = { [weak self] chunk in self?.captureCtrl?.appendAudioAIChunk(chunk) }
-        proc.onDone  = { [weak self] in self?.captureCtrl?.finalizeAudioAI() }
-        proc.onError = { [weak self] msg in self?.captureCtrl?.appendAudioAIError(msg) }
+        proc.onChunk = { chunk in (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendAudioAIChunk(chunk) }
+        proc.onDone  = { (NSApp.delegate as? AppDelegate)?.captureCtrl?.finalizeAudioAI() }
+        proc.onError = { msg in (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendAudioAIError(msg) }
         audioAIProc = proc
 
         // Wire the Ask AI button + interval timer
@@ -357,6 +501,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showCameraDeniedAndQuit() {
         let alert = NSAlert()
+        alert.window.sharingType = .none
         alert.messageText = "Camera Access Required"
         alert.informativeText = "CameraShot needs camera access to capture from your camera. Please enable it in System Settings → Privacy & Security → Camera, then relaunch."
         alert.alertStyle = .warning
@@ -372,6 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showScreenCaptureError(_ error: Error) {
         let alert = NSAlert()
+        alert.window.sharingType = .none
         alert.messageText     = "Screen Capture Failed"
         alert.informativeText = "\(error.localizedDescription)\n\nOpen System Settings → Privacy & Security → Screen Recording and enable CameraShot, then relaunch."
         alert.alertStyle = .critical

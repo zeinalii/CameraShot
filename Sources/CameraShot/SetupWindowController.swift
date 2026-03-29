@@ -47,6 +47,9 @@ final class SetupWindowController: NSWindowController {
     private static let voiceServerURLDefaultsKey = "setup.voiceServerURL"
     private static let audioPromptDefaultsKey = "setup.audioPrompt"
     private static let audioTokenLimitDefaultsKey = "setup.audioTokenLimit"
+    private static let screenCapturePromptedDefaultsKey = "setup.screenCapturePrompted"
+
+    private var didPromptScreenCaptureThisLaunch = false
 
     private var previewSession: AVCaptureSession?
     private let previewQueue = DispatchQueue(label: "setup.preview", qos: .userInteractive)
@@ -107,6 +110,7 @@ final class SetupWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
+        win.sharingType = .none
         win.title  = "CameraShot"
         win.center()
         win.isMovableByWindowBackground = true
@@ -537,7 +541,7 @@ final class SetupWindowController: NSWindowController {
         s.setCustomSpacing(4, after: tokenRow)
 
         let hint = NSTextField(wrappingLabelWithString:
-            "Claude receives this many tokens of transcript + the system prompt below each interval.")
+            "Each Audio AI request sends the system prompt plus the last ~this many tokens of the Transcript tab (including <partial> lines and errors), approximated as 4 characters per token.")
         hint.font      = .systemFont(ofSize: 11)
         hint.textColor = .tertiaryLabelColor
         s.addArrangedSubview(hint)
@@ -762,6 +766,13 @@ final class SetupWindowController: NSWindowController {
         screenPopup.addItem(withTitle: "Loading…")
         startButton.isEnabled = false
 
+        guard ensureScreenCapturePermission(promptIfNeeded: true) else {
+            screenPopup.menu?.removeAllItems()
+            screenPopup.addItem(withTitle: "⚠  Grant access: System Settings → Screen & System Audio Recording")
+            startButton.isEnabled = false
+            return
+        }
+
         Task { @MainActor in
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -869,9 +880,20 @@ final class SetupWindowController: NSWindowController {
         guard let target = screenPopup.selectedItem?.representedObject as? CaptureTarget else { return }
         switch target {
         case .display(let id, _):
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let img = CGDisplayCreateImage(id) else { return }
-                DispatchQueue.main.async { self?.livePreview.showImage(img) }
+            Task { [weak self] in
+                do {
+                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                    guard let display = content.displays.first(where: { $0.displayID == id }) else { return }
+                    let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+                    let config = SCStreamConfiguration()
+                    config.showsCursor = true
+                    config.width = max(1, Int(filter.contentRect.width * CGFloat(filter.pointPixelScale)))
+                    config.height = max(1, Int(filter.contentRect.height * CGFloat(filter.pointPixelScale)))
+                    let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                    await MainActor.run { self?.livePreview.showImage(img) }
+                } catch {
+                    return
+                }
             }
         case .window(let id, _, _, let scWindow):
             if #available(macOS 14.0, *), let scWindow = scWindow {
@@ -953,6 +975,7 @@ final class SetupWindowController: NSWindowController {
 
         if aiEnabled && !EncryptedKeyStore.fileExists() {
             let alert = NSAlert()
+            alert.window.sharingType = .none
             alert.messageText = "Anthropic API Key Required"
             alert.informativeText = "AI processing is enabled but no Anthropic API key is saved. Open the \"API Keys\" tab, enter your key, and click \"Save Key\"."
             alert.alertStyle = .warning
@@ -972,16 +995,15 @@ final class SetupWindowController: NSWindowController {
             transcriptTokenLimit: max(50, tokenLimit)
         )
 
-        if securityScopedOutputURL == nil && selectedOutputDir != Self.defaultOutputDirectory {
-            promptForSaveFolder { [weak self] granted in
-                guard granted else { return }
-                self?.startTapped()
-            }
-            return
-        }
-
-        if selectedOutputDir == Self.defaultOutputDirectory {
-            try? FileManager.default.createDirectory(at: selectedOutputDir, withIntermediateDirectories: true)
+        var outputDir = selectedOutputDir
+        do {
+            try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        } catch {
+            // Avoid permission prompts on Start: fallback to the default output folder.
+            outputDir = Self.defaultOutputDirectory
+            selectedOutputDir = outputDir
+            folderField?.stringValue = abbreviatedPath(outputDir)
+            try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         }
 
         switch sourceType {
@@ -989,17 +1011,37 @@ final class SetupWindowController: NSWindowController {
             guard !cameras.isEmpty else { return }
             let device = cameras[max(0, cameraPopup.indexOfSelectedItem)]
             previewQueue.async { [weak self] in self?.previewSession?.stopRunning() }
-            onStart?(.camera(device), iv, quality, selectedOutputDir, aiConfig, voiceConfig)
+            onStart?(.camera(device), iv, quality, outputDir, aiConfig, voiceConfig)
 
         case .screen:
+            guard ensureScreenCapturePermission(promptIfNeeded: false) else {
+                screenPopup.menu?.removeAllItems()
+                screenPopup.addItem(withTitle: "⚠  Grant access: System Settings → Screen & System Audio Recording")
+                startButton.isEnabled = false
+                return
+            }
             guard let target = screenPopup.selectedItem?.representedObject as? CaptureTarget else { return }
             switch target {
             case .display(let id, let name):
-                onStart?(.display(id: id, name: name), iv, quality, selectedOutputDir, aiConfig, voiceConfig)
+                onStart?(.display(id: id, name: name), iv, quality, outputDir, aiConfig, voiceConfig)
             case .window(let id, let appName, let title, _):
-                onStart?(.window(id: id, name: "\(appName)  —  \(title)"), iv, quality, selectedOutputDir, aiConfig, voiceConfig)
+                onStart?(.window(id: id, name: "\(appName)  —  \(title)"), iv, quality, outputDir, aiConfig, voiceConfig)
             }
         }
+    }
+
+    private func ensureScreenCapturePermission(promptIfNeeded: Bool) -> Bool {
+        if CGPreflightScreenCaptureAccess() { return true }
+        guard promptIfNeeded else { return false }
+
+        let defaults = UserDefaults.standard
+        if didPromptScreenCaptureThisLaunch { return false }
+        if defaults.bool(forKey: Self.screenCapturePromptedDefaultsKey) { return false }
+
+        didPromptScreenCaptureThisLaunch = true
+        defaults.set(true, forKey: Self.screenCapturePromptedDefaultsKey)
+        _ = CGRequestScreenCaptureAccess()
+        return CGPreflightScreenCaptureAccess()
     }
 
     // MARK: – Prompt settings persistence

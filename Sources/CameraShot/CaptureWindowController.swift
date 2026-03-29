@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import WebKit
 
 // MARK: - CaptureWindowController
@@ -28,10 +29,18 @@ final class CaptureWindowController: NSWindowController {
     /// Called when the user clicks Stop — stops capture entirely.
     var onStop: (() -> Void)?
 
-    // MARK: – Content tab (Visual / Transcript / Audio AI)
+    // MARK: – Content tab (Visual / Transcript / Audio AI / Opencode / File Explore)
+
+    private enum ContentTab: Int {
+        case visual = 0
+        case transcript = 1
+        case audioAI = 2
+        case opencode = 3
+    }
 
     private weak var contentTabControl: NSSegmentedControl!
-    private var activeContentTab = 0   // 0 = Visual, 1 = Transcript, 2 = Audio AI
+    private var activeContentTab = ContentTab.visual.rawValue
+    private var fileExploreTabIndex: Int?
 
     // Visual-tab buttons
     private weak var zoomOutBtn:    NSButton!
@@ -46,6 +55,46 @@ final class CaptureWindowController: NSWindowController {
     private weak var audioAIClearBtn:  NSButton!
     private weak var audioAIZoomOutBtn: NSButton!
     private weak var audioAIZoomInBtn:  NSButton!
+
+    // Opencode tab controls
+    private weak var opencodeContainerView: NSView!
+    private weak var opencodeSourceDirField: NSTextField!
+    private weak var opencodeWorkingDirField: NSTextField!
+    private var opencodeInitialPromptTextView: NSTextView!
+    private weak var opencodeStatusLabel: NSTextField!
+    private weak var opencodeStartButton: NSButton!
+    private weak var opencodeSendField: NSTextField!
+    private weak var opencodeSendButton: NSButton!
+    private var opencodeChatTextView: NSTextView!
+    private var opencodeActiveSessionID: String?
+    private var opencodeActiveWorkingURL: URL?
+    private var opencodeCommandToken: Int = 0
+    private var opencodeIsBusy = false
+    private let opencodeDefaultAttachURL = "http://127.0.0.1:4096"
+    private var opencodeEventStreamClient: OpencodeEventStreamClient?
+    private var opencodeStreamingAssistantMessageID: String?
+    private var opencodeStreamingAssistantText: String = ""
+    private var opencodeStreamingAssistantRange: NSRange?
+    private var opencodeToolStatusByPartID: [String: String] = [:]
+    private var opencodeSourceScopeURL: URL?
+    private var opencodeWorkingScopeURL: URL?
+
+    // File Explore tab controls
+    private weak var fileExploreContainerView: NSView!
+    private weak var fileExploreRootLabel: NSTextField!
+    private weak var fileExploreOutlineView: NSOutlineView!
+    private weak var fileExploreSidebarScrollView: NSScrollView!
+    private var fileExplorePreviewWebView: WKWebView!
+    private weak var fileExploreZoomOutButton: NSButton!
+    private weak var fileExploreZoomInButton: NSButton!
+    private var fileExplorePreviewReady = false
+    private var fileExploreRootNode: FileExploreNode?
+    private var fileExploreCurrentRootURL: URL?
+    private var fileExplorePendingRender: (kind: String, content: String)?
+    private var fileExploreRealtimeRefreshTimer: Timer?
+    private var fileExploreTreeSnapshot: [String: FileExploreTreeSnapshotEntry] = [:]
+    private var fileExploreSelectedFileURL: URL?
+    private var fileExploreSelectedFingerprint: String?
 
     // Transcript feed
     private weak var audioScrollView: NSScrollView!
@@ -80,6 +129,7 @@ final class CaptureWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
+        win.sharingType = .none
         win.title           = "CameraShot  ·  \(name)"
         win.minSize         = NSSize(width: 700, height: 440)
         win.isMovableByWindowBackground = true
@@ -87,7 +137,13 @@ final class CaptureWindowController: NSWindowController {
         buildUI(name: name, interval: interval)
     }
 
-    deinit { audioAITimer?.invalidate() }
+    deinit {
+        audioAITimer?.invalidate()
+        stopOpencodeEventStream()
+        stopFileExploreRealtimeRefresh()
+        opencodeSourceScopeURL?.stopAccessingSecurityScopedResource()
+        opencodeWorkingScopeURL?.stopAccessingSecurityScopedResource()
+    }
 
     /// Call this once voice input is confirmed enabled to start the auto-trigger timer.
     func startAudioAITimer() {
@@ -452,6 +508,177 @@ final class CaptureWindowController: NSWindowController {
         aiWV.isHidden = true
         audioAIWebView = aiWV
 
+        // ── Opencode tab content ───────────────────────────────────
+        let opencodeView = NSView()
+        opencodeView.translatesAutoresizingMaskIntoConstraints = false
+        opencodeView.isHidden = true
+        opencodeContainerView = opencodeView
+
+        let sourceLabel = NSTextField(labelWithString: "source dir:")
+        sourceLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        sourceLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let sourceField = NSTextField(string: "~/Documents/toptal-interview")
+        sourceField.placeholderString = "to be entered"
+        sourceField.font = .systemFont(ofSize: 13)
+        sourceField.translatesAutoresizingMaskIntoConstraints = false
+        opencodeSourceDirField = sourceField
+
+        let workingLabel = NSTextField(labelWithString: "working dir:")
+        workingLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        workingLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let workingField = NSTextField(string: "~/Documents/stuff/interview-coding")
+        workingField.placeholderString = "to be entered"
+        workingField.font = .systemFont(ofSize: 13)
+        workingField.translatesAutoresizingMaskIntoConstraints = false
+        opencodeWorkingDirField = workingField
+
+        let initialPromptLabel = NSTextField(labelWithString: "initial prompt:")
+        initialPromptLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        initialPromptLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let initialPromptTextView = NSTextView()
+        initialPromptTextView.isEditable = true
+        initialPromptTextView.isSelectable = true
+        initialPromptTextView.drawsBackground = true
+        initialPromptTextView.backgroundColor = .textBackgroundColor
+        initialPromptTextView.font = .systemFont(ofSize: 13)
+        initialPromptTextView.textContainerInset = NSSize(width: 6, height: 6)
+        initialPromptTextView.string = ""
+        opencodeInitialPromptTextView = initialPromptTextView
+
+        let initialPromptScroll = NSScrollView()
+        initialPromptScroll.documentView = initialPromptTextView
+        initialPromptScroll.hasVerticalScroller = true
+        initialPromptScroll.autohidesScrollers = true
+        initialPromptScroll.hasHorizontalScroller = false
+        initialPromptScroll.borderType = .bezelBorder
+        initialPromptScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let startBtn = NSButton(title: "Start", target: self, action: #selector(startOpencodeTapped))
+        startBtn.bezelStyle = .rounded
+        startBtn.translatesAutoresizingMaskIntoConstraints = false
+        opencodeStartButton = startBtn
+
+        let statusLabel = NSTextField(wrappingLabelWithString: "")
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.isHidden = true
+        opencodeStatusLabel = statusLabel
+
+        let chatTextView = NSTextView()
+        chatTextView.isEditable = false
+        chatTextView.isSelectable = true
+        chatTextView.drawsBackground = false
+        chatTextView.font = .systemFont(ofSize: 12)
+        chatTextView.textContainerInset = NSSize(width: 14, height: 14)
+        chatTextView.textContainer?.widthTracksTextView = true
+        opencodeChatTextView = chatTextView
+
+        let chatScroll = NSScrollView()
+        chatScroll.documentView = chatTextView
+        chatScroll.hasVerticalScroller = true
+        chatScroll.autohidesScrollers = true
+        chatScroll.hasHorizontalScroller = false
+        chatScroll.drawsBackground = false
+        chatScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let sendField = NSTextField(string: "")
+        sendField.placeholderString = "Send follow-up message"
+        sendField.font = .systemFont(ofSize: 13)
+        sendField.translatesAutoresizingMaskIntoConstraints = false
+        sendField.target = self
+        sendField.action = #selector(opencodeSendTapped)
+        opencodeSendField = sendField
+
+        let sendBtn = NSButton(title: "Send", target: self, action: #selector(opencodeSendTapped))
+        sendBtn.bezelStyle = .rounded
+        sendBtn.translatesAutoresizingMaskIntoConstraints = false
+        opencodeSendButton = sendBtn
+
+        [sourceLabel, sourceField, workingLabel, workingField, initialPromptLabel, initialPromptScroll, startBtn, statusLabel,
+         chatScroll, sendField, sendBtn]
+            .forEach { opencodeView.addSubview($0) }
+
+        // ── File Explore tab content ───────────────────────────────
+        let fileExploreView = NSView()
+        fileExploreView.translatesAutoresizingMaskIntoConstraints = false
+        fileExploreView.isHidden = true
+        fileExploreContainerView = fileExploreView
+
+        let fileExploreRoot = NSTextField(labelWithString: "working dir: —")
+        fileExploreRoot.font = .systemFont(ofSize: 12, weight: .medium)
+        fileExploreRoot.textColor = .secondaryLabelColor
+        fileExploreRoot.lineBreakMode = .byTruncatingMiddle
+        fileExploreRoot.translatesAutoresizingMaskIntoConstraints = false
+        fileExploreRootLabel = fileExploreRoot
+
+        let fileExploreZoomOut = NSButton(title: "−", target: self, action: #selector(fileExploreZoomOut))
+        fileExploreZoomOut.bezelStyle = .rounded
+        fileExploreZoomOut.translatesAutoresizingMaskIntoConstraints = false
+        fileExploreZoomOutButton = fileExploreZoomOut
+
+        let fileExploreZoomIn = NSButton(title: "+", target: self, action: #selector(fileExploreZoomIn))
+        fileExploreZoomIn.bezelStyle = .rounded
+        fileExploreZoomIn.translatesAutoresizingMaskIntoConstraints = false
+        fileExploreZoomInButton = fileExploreZoomIn
+
+        let fileExploreSplitView = NSSplitView()
+        fileExploreSplitView.isVertical = true
+        fileExploreSplitView.dividerStyle = .thin
+        fileExploreSplitView.translatesAutoresizingMaskIntoConstraints = false
+        fileExploreSplitView.autosaveName = "CameraShot.FileExploreSplitView"
+
+        let sidebarScroll = NSScrollView()
+        sidebarScroll.translatesAutoresizingMaskIntoConstraints = false
+        sidebarScroll.hasVerticalScroller = true
+        sidebarScroll.hasHorizontalScroller = false
+        sidebarScroll.autohidesScrollers = true
+        sidebarScroll.borderType = .bezelBorder
+        fileExploreSidebarScrollView = sidebarScroll
+
+        let outlineView = NSOutlineView()
+        let outlineColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("FileExploreNameColumn"))
+        outlineColumn.title = "Files"
+        outlineView.addTableColumn(outlineColumn)
+        outlineView.outlineTableColumn = outlineColumn
+        outlineView.headerView = nil
+        outlineView.style = .sourceList
+        outlineView.rowSizeStyle = .default
+        outlineView.focusRingType = .none
+        outlineView.delegate = self
+        outlineView.dataSource = self
+        sidebarScroll.documentView = outlineView
+        fileExploreOutlineView = outlineView
+
+        let previewCfg = WKWebViewConfiguration()
+        let previewHandler = CopyCodeHandler(pageReady: { [weak self] in
+            DispatchQueue.main.async {
+                self?.fileExplorePreviewReady = true
+                self?.flushFileExplorePendingRender()
+            }
+        })
+        previewCfg.userContentController.add(previewHandler, name: "copyCode")
+        previewCfg.userContentController.add(previewHandler, name: "pageReady")
+
+        let filePreviewWebView = WKWebView(frame: .zero, configuration: previewCfg)
+        filePreviewWebView.translatesAutoresizingMaskIntoConstraints = false
+        filePreviewWebView.wantsLayer = true
+        filePreviewWebView.layer?.backgroundColor = NSColor.clear.cgColor
+        fileExplorePreviewWebView = filePreviewWebView
+
+        fileExploreSplitView.addArrangedSubview(sidebarScroll)
+        fileExploreSplitView.addArrangedSubview(filePreviewWebView)
+        sidebarScroll.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        sidebarScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
+
+        fileExploreView.addSubview(fileExploreRoot)
+        fileExploreView.addSubview(fileExploreZoomOut)
+        fileExploreView.addSubview(fileExploreZoomIn)
+        fileExploreView.addSubview(fileExploreSplitView)
+
         // ── Container ─────────────────────────────────────────────
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
@@ -473,7 +700,7 @@ final class CaptureWindowController: NSWindowController {
 
         // Content tab selector (left side of inner bar)
         let contentTabs = NSSegmentedControl(
-            labels: ["Visual", "Transcript", "Audio AI"],
+            labels: ["Visual", "Transcript", "Audio AI", "Opencode"],
             trackingMode: .selectOne, target: self,
             action: #selector(contentTabChanged))
         contentTabs.selectedSegment = 0
@@ -510,6 +737,8 @@ final class CaptureWindowController: NSWindowController {
         container.addSubview(wv)
         container.addSubview(sv)
         container.addSubview(aiWV)
+        container.addSubview(opencodeView)
+        container.addSubview(fileExploreView)
 
         NSLayoutConstraint.activate([
             // Inner bar
@@ -549,7 +778,7 @@ final class CaptureWindowController: NSWindowController {
             divider.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: container.trailingAnchor),
 
-            // WebView (Visual) — all three content views share the same frame
+            // Content views — all tabs share the same frame
             wv.topAnchor.constraint(equalTo: divider.bottomAnchor),
             wv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             wv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
@@ -564,23 +793,103 @@ final class CaptureWindowController: NSWindowController {
             aiWV.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             aiWV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             aiWV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            opencodeView.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            opencodeView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            opencodeView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            opencodeView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            fileExploreView.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            fileExploreView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            fileExploreView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            fileExploreView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            sourceLabel.topAnchor.constraint(equalTo: opencodeView.topAnchor, constant: 16),
+            sourceLabel.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+
+            sourceField.topAnchor.constraint(equalTo: sourceLabel.bottomAnchor, constant: 6),
+            sourceField.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+            sourceField.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
+
+            workingLabel.topAnchor.constraint(equalTo: sourceField.bottomAnchor, constant: 12),
+            workingLabel.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+
+            workingField.topAnchor.constraint(equalTo: workingLabel.bottomAnchor, constant: 6),
+            workingField.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+            workingField.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
+
+            initialPromptLabel.topAnchor.constraint(equalTo: workingField.bottomAnchor, constant: 12),
+            initialPromptLabel.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+
+            initialPromptScroll.topAnchor.constraint(equalTo: initialPromptLabel.bottomAnchor, constant: 6),
+            initialPromptScroll.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+            initialPromptScroll.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
+            initialPromptScroll.heightAnchor.constraint(equalToConstant: 92),
+
+            startBtn.topAnchor.constraint(equalTo: initialPromptScroll.bottomAnchor, constant: 14),
+            startBtn.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+
+            statusLabel.topAnchor.constraint(equalTo: startBtn.bottomAnchor, constant: 10),
+            statusLabel.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+            statusLabel.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
+
+            chatScroll.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
+            chatScroll.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+            chatScroll.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
+            chatScroll.bottomAnchor.constraint(equalTo: sendField.topAnchor, constant: -10),
+            chatScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 140),
+
+            sendField.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+            sendField.bottomAnchor.constraint(equalTo: opencodeView.bottomAnchor, constant: -16),
+            sendField.heightAnchor.constraint(equalToConstant: 28),
+
+            sendBtn.leadingAnchor.constraint(equalTo: sendField.trailingAnchor, constant: 8),
+            sendBtn.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
+            sendBtn.centerYAnchor.constraint(equalTo: sendField.centerYAnchor),
+            sendBtn.widthAnchor.constraint(equalToConstant: 74),
+
+            fileExploreRoot.topAnchor.constraint(equalTo: fileExploreView.topAnchor, constant: 12),
+            fileExploreRoot.leadingAnchor.constraint(equalTo: fileExploreView.leadingAnchor, constant: 16),
+            fileExploreRoot.trailingAnchor.constraint(lessThanOrEqualTo: fileExploreZoomOut.leadingAnchor, constant: -12),
+
+            fileExploreZoomIn.trailingAnchor.constraint(equalTo: fileExploreView.trailingAnchor, constant: -16),
+            fileExploreZoomIn.centerYAnchor.constraint(equalTo: fileExploreRoot.centerYAnchor),
+            fileExploreZoomIn.widthAnchor.constraint(equalToConstant: 28),
+
+            fileExploreZoomOut.trailingAnchor.constraint(equalTo: fileExploreZoomIn.leadingAnchor, constant: -6),
+            fileExploreZoomOut.centerYAnchor.constraint(equalTo: fileExploreRoot.centerYAnchor),
+            fileExploreZoomOut.widthAnchor.constraint(equalToConstant: 28),
+
+            fileExploreSplitView.topAnchor.constraint(equalTo: fileExploreRoot.bottomAnchor, constant: 8),
+            fileExploreSplitView.leadingAnchor.constraint(equalTo: fileExploreView.leadingAnchor, constant: 12),
+            fileExploreSplitView.trailingAnchor.constraint(equalTo: fileExploreView.trailingAnchor, constant: -12),
+            fileExploreSplitView.bottomAnchor.constraint(equalTo: fileExploreView.bottomAnchor, constant: -12),
         ])
+
+        setOpencodeStatus("Session not started.", isError: false)
+        updateOpencodeControls()
 
         let baseURL: URL? = Self.resourcesBaseURL()
         wv.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         aiWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
+        fileExplorePreviewWebView.loadHTMLString(Self.fileExploreHTMLTemplate, baseURL: baseURL)
+        renderFileExploreDocument(kind: "text", content: "Start Opencode to open File Explore.")
         return container
     }
 
     @objc private func contentTabChanged() {
         activeContentTab = contentTabControl.selectedSegment
-        let isVisual     = activeContentTab == 0
-        let isTranscript = activeContentTab == 1
-        let isAudioAI    = activeContentTab == 2
+        let isVisual = activeContentTab == ContentTab.visual.rawValue
+        let isTranscript = activeContentTab == ContentTab.transcript.rawValue
+        let isAudioAI = activeContentTab == ContentTab.audioAI.rawValue
+        let isOpencode = activeContentTab == ContentTab.opencode.rawValue
+        let isFileExplore = fileExploreTabIndex == activeContentTab
 
         webView.isHidden         = !isVisual
         audioScrollView.isHidden = !isTranscript
         audioAIWebView.isHidden  = !isAudioAI
+        opencodeContainerView.isHidden = !isOpencode
+        fileExploreContainerView?.isHidden = !isFileExplore
 
         zoomOutBtn.isHidden       = !isVisual
         zoomInBtn.isHidden        = !isVisual
@@ -590,6 +899,1266 @@ final class CaptureWindowController: NSWindowController {
         audioAIZoomInBtn.isHidden  = !isAudioAI
         audioAIClearBtn.isHidden   = !isAudioAI
         audioAIAskBtn.isHidden     = !isAudioAI
+
+        if isFileExplore, let rootURL = fileExploreCurrentRootURL {
+            rebuildFileExploreRoot(at: rootURL, preserveState: true)
+        }
+        updateFileExploreRealtimeRefreshState()
+    }
+
+    private func ensureFileExploreTabVisible() -> Int {
+        if let existing = fileExploreTabIndex {
+            return existing
+        }
+        let newIndex = contentTabControl.segmentCount
+        contentTabControl.segmentCount = newIndex + 1
+        contentTabControl.setLabel("file explore", forSegment: newIndex)
+        fileExploreTabIndex = newIndex
+        return newIndex
+    }
+
+    private func activateFileExploreTab(with workingURL: URL) {
+        let rootURL = workingURL.standardizedFileURL
+        fileExploreCurrentRootURL = rootURL
+        fileExploreRootLabel?.stringValue = "working dir: \(rootURL.path)"
+        rebuildFileExploreRoot(at: rootURL, preserveState: false)
+        fileExploreTreeSnapshot = captureFileExploreTreeSnapshot(at: rootURL)
+        stopFileExploreRealtimeRefresh()
+        let segment = ensureFileExploreTabVisible()
+        contentTabControl.selectedSegment = segment
+        contentTabChanged()
+    }
+
+    private func rebuildFileExploreRoot(at rootURL: URL, preserveState: Bool) {
+        fileExploreCurrentRootURL = rootURL.standardizedFileURL
+        let expandedURLs = preserveState ? expandedFileExploreDirectoryURLs() : []
+        let previouslySelected = preserveState ? fileExploreSelectedFileURL : nil
+
+        let root = FileExploreNode(url: rootURL, isDirectory: true)
+        fileExploreRootNode = root
+        loadFileExploreChildrenIfNeeded(for: root)
+        fileExploreOutlineView?.reloadData()
+
+        if preserveState {
+            restoreExpandedFileExploreDirectoryURLs(expandedURLs)
+            if let selectedURL = previouslySelected,
+               restoreFileExploreSelection(for: selectedURL) {
+                previewFileExploreFile(at: selectedURL)
+                return
+            }
+        }
+
+        fileExploreSelectedFileURL = nil
+        fileExploreSelectedFingerprint = nil
+        renderFileExploreDocument(kind: "text", content: "Select a file from the sidebar.")
+    }
+
+    private func loadFileExploreChildrenIfNeeded(for node: FileExploreNode) {
+        guard node.isDirectory, !node.isLoaded else { return }
+        node.isLoaded = true
+
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .localizedNameKey]
+        do {
+            let urls = try FileManager.default.contentsOfDirectory(
+                at: node.url,
+                includingPropertiesForKeys: Array(keys),
+                options: [.skipsPackageDescendants]
+            )
+            let children = urls.compactMap { childURL -> FileExploreNode? in
+                let values = try? childURL.resourceValues(forKeys: keys)
+                let isDir = values?.isDirectory ?? false
+                let child = FileExploreNode(url: childURL.standardizedFileURL, isDirectory: isDir)
+                child.parent = node
+                return child
+            }
+            node.children = children.sorted {
+                if $0.isDirectory != $1.isDirectory {
+                    return $0.isDirectory && !$1.isDirectory
+                }
+                return $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending
+            }
+        } catch {
+            node.children = []
+        }
+    }
+
+    private func previewFileExploreFile(at fileURL: URL) {
+        let standardizedURL = fileURL.standardizedFileURL
+        fileExploreSelectedFileURL = standardizedURL
+        do {
+            let data = try Data(contentsOf: standardizedURL)
+            if isLikelyBinaryFileData(data) {
+                fileExploreSelectedFingerprint = nil
+                renderFileExploreDocument(kind: "text", content: "Cannot preview binary file: \(standardizedURL.lastPathComponent)")
+                updateFileExploreRealtimeRefreshState()
+                return
+            }
+            guard let text = parseFileExploreText(from: data) else {
+                fileExploreSelectedFingerprint = nil
+                renderFileExploreDocument(kind: "text", content: "Unable to decode file as UTF-8 text: \(standardizedURL.lastPathComponent)")
+                updateFileExploreRealtimeRefreshState()
+                return
+            }
+            let kind = fileExploreContentKind(for: standardizedURL)
+            fileExploreSelectedFingerprint = fileExploreFingerprint(for: standardizedURL)
+            renderFileExploreDocument(kind: kind, content: text)
+            updateFileExploreRealtimeRefreshState()
+        } catch {
+            fileExploreSelectedFingerprint = nil
+            renderFileExploreDocument(kind: "text", content: "Failed to read file: \(error.localizedDescription)")
+            updateFileExploreRealtimeRefreshState()
+        }
+    }
+
+    private func fileExploreContentKind(for fileURL: URL) -> String {
+        let ext = fileURL.pathExtension.lowercased()
+        if ext == "md" || ext == "markdown" || ext == "mdown" {
+            return "markdown"
+        }
+        if ext == "py" {
+            return "python"
+        }
+        return "text"
+    }
+
+    private func parseFileExploreText(from data: Data) -> String? {
+        if let utf8 = String(data: data, encoding: .utf8) {
+            return utf8
+        }
+        let lossy = String(decoding: data, as: UTF8.self)
+        return lossy.isEmpty ? nil : lossy
+    }
+
+    private func isLikelyBinaryFileData(_ data: Data) -> Bool {
+        if data.isEmpty { return false }
+        let sample = data.prefix(4096)
+        return sample.contains(0)
+    }
+
+    private func renderFileExploreDocument(kind: String, content: String) {
+        guard fileExplorePreviewReady else {
+            fileExplorePendingRender = (kind, content)
+            return
+        }
+        guard let kindJS = jsLiteral(kind), let contentJS = jsLiteral(content) else { return }
+        fileExplorePreviewWebView.evaluateJavaScript("renderDocument(\(kindJS), \(contentJS));", completionHandler: nil)
+    }
+
+    private func flushFileExplorePendingRender() {
+        guard fileExplorePreviewReady, let pending = fileExplorePendingRender else { return }
+        fileExplorePendingRender = nil
+        guard let kindJS = jsLiteral(pending.kind), let contentJS = jsLiteral(pending.content) else { return }
+        fileExplorePreviewWebView.evaluateJavaScript("renderDocument(\(kindJS), \(contentJS));", completionHandler: nil)
+    }
+
+    @objc private func fileExploreZoomIn() {
+        fileExplorePreviewWebView?.evaluateJavaScript("adjustZoom(1);", completionHandler: nil)
+    }
+
+    @objc private func fileExploreZoomOut() {
+        fileExplorePreviewWebView?.evaluateJavaScript("adjustZoom(-1);", completionHandler: nil)
+    }
+
+    private func startFileExploreRealtimeRefresh() {
+        stopFileExploreRealtimeRefresh()
+        fileExploreRealtimeRefreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.refreshFileExploreIfNeeded()
+        }
+        if let timer = fileExploreRealtimeRefreshTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    private func stopFileExploreRealtimeRefresh() {
+        fileExploreRealtimeRefreshTimer?.invalidate()
+        fileExploreRealtimeRefreshTimer = nil
+    }
+
+    private func updateFileExploreRealtimeRefreshState() {
+        let isFileExploreActive = fileExploreTabIndex == activeContentTab
+        let hasRoot = fileExploreCurrentRootURL != nil
+        if isFileExploreActive && hasRoot {
+            if fileExploreRealtimeRefreshTimer == nil {
+                startFileExploreRealtimeRefresh()
+            }
+        } else {
+            stopFileExploreRealtimeRefresh()
+        }
+    }
+
+    private func refreshFileExploreIfNeeded() {
+        guard let rootURL = fileExploreCurrentRootURL else {
+            stopFileExploreRealtimeRefresh()
+            return
+        }
+
+        let newSnapshot = captureFileExploreTreeSnapshot(at: rootURL)
+        if newSnapshot != fileExploreTreeSnapshot {
+            fileExploreTreeSnapshot = newSnapshot
+            rebuildFileExploreRoot(at: rootURL, preserveState: true)
+        }
+
+        guard let selectedURL = fileExploreSelectedFileURL else { return }
+
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: selectedURL.path) else {
+            fileExploreSelectedFileURL = nil
+            fileExploreSelectedFingerprint = nil
+            renderFileExploreDocument(kind: "text", content: "Selected file was removed.")
+            return
+        }
+
+        let newFingerprint = fileExploreFingerprint(for: selectedURL)
+        guard newFingerprint != fileExploreSelectedFingerprint else { return }
+        previewFileExploreFile(at: selectedURL)
+    }
+
+    private func captureFileExploreTreeSnapshot(at rootURL: URL) -> [String: FileExploreTreeSnapshotEntry] {
+        var snapshot: [String: FileExploreTreeSnapshotEntry] = [:]
+        let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]
+
+        let rootValues = try? rootURL.resourceValues(forKeys: keys)
+        let rootEntry = FileExploreTreeSnapshotEntry(
+            isDirectory: rootValues?.isDirectory ?? true,
+            modifiedAt: rootValues?.contentModificationDate?.timeIntervalSince1970 ?? 0,
+            size: Int64(rootValues?.fileSize ?? 0)
+        )
+        snapshot[rootURL.path] = rootEntry
+
+        guard let enumerator = fm.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsPackageDescendants]
+        ) else {
+            return snapshot
+        }
+
+        while let url = enumerator.nextObject() as? URL {
+            let values = try? url.resourceValues(forKeys: keys)
+            let entry = FileExploreTreeSnapshotEntry(
+                isDirectory: values?.isDirectory ?? false,
+                modifiedAt: values?.contentModificationDate?.timeIntervalSince1970 ?? 0,
+                size: Int64(values?.fileSize ?? 0)
+            )
+            snapshot[url.path] = entry
+        }
+        return snapshot
+    }
+
+    private func fileExploreFingerprint(for fileURL: URL) -> String? {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+        guard let values = try? fileURL.resourceValues(forKeys: keys) else { return nil }
+        let modifiedAt = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+        let size = values.fileSize ?? 0
+        return "\(modifiedAt)-\(size)"
+    }
+
+    private func expandedFileExploreDirectoryURLs() -> Set<URL> {
+        guard let outlineView = fileExploreOutlineView else { return [] }
+        var urls = Set<URL>()
+        for row in 0..<outlineView.numberOfRows {
+            guard let node = outlineView.item(atRow: row) as? FileExploreNode else { continue }
+            if node.isDirectory, outlineView.isItemExpanded(node) {
+                urls.insert(node.url.standardizedFileURL)
+            }
+        }
+        return urls
+    }
+
+    private func restoreExpandedFileExploreDirectoryURLs(_ urls: Set<URL>) {
+        guard let outlineView = fileExploreOutlineView else { return }
+        let sorted = urls.sorted { $0.pathComponents.count < $1.pathComponents.count }
+        for url in sorted {
+            if let node = fileExploreNode(for: url) {
+                expandFileExploreAncestors(of: node, in: outlineView)
+                if node.isDirectory {
+                    outlineView.expandItem(node)
+                }
+            }
+        }
+    }
+
+    private func restoreFileExploreSelection(for fileURL: URL) -> Bool {
+        guard let outlineView = fileExploreOutlineView,
+              let node = fileExploreNode(for: fileURL),
+              !node.isDirectory else { return false }
+
+        expandFileExploreAncestors(of: node, in: outlineView)
+        let row = outlineView.row(forItem: node)
+        guard row >= 0 else { return false }
+        outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        fileExploreSelectedFileURL = node.url.standardizedFileURL
+        return true
+    }
+
+    private func fileExploreNode(for url: URL) -> FileExploreNode? {
+        guard let root = fileExploreRootNode else { return nil }
+        let standardized = url.standardizedFileURL
+        if root.url == standardized { return root }
+
+        let rootPath = root.url.path
+        let targetPath = standardized.path
+        guard targetPath.hasPrefix(rootPath + "/") else { return nil }
+
+        let relativePath = String(targetPath.dropFirst(rootPath.count + 1))
+        if relativePath.isEmpty { return root }
+
+        var current = root
+        for component in relativePath.split(separator: "/") {
+            loadFileExploreChildrenIfNeeded(for: current)
+            guard let next = current.children.first(where: { $0.url.lastPathComponent == String(component) }) else {
+                return nil
+            }
+            current = next
+        }
+        return current
+    }
+
+    private func expandFileExploreAncestors(of node: FileExploreNode, in outlineView: NSOutlineView) {
+        var parents: [FileExploreNode] = []
+        var current = node.parent
+        while let dir = current {
+            parents.append(dir)
+            current = dir.parent
+        }
+        for parent in parents.reversed() {
+            outlineView.expandItem(parent)
+        }
+    }
+
+    @objc private func startOpencodeTapped() {
+        let sourceDir = normalizedPathInput(opencodeSourceDirField.stringValue)
+        let workingDir = normalizedPathInput(opencodeWorkingDirField.stringValue)
+        let initialPrompt = opencodeInitialPromptTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sourceDir.isEmpty, !workingDir.isEmpty else {
+            setOpencodeStatus("Please enter both source dir and working dir.", isError: true)
+            return
+        }
+
+        stopActiveOpencodeProcess(resetSession: true)
+        setOpencodeStatus("Preparing input directory…", isError: false)
+
+        runOpencodeStart(
+            sourceDirInput: sourceDir,
+            workingDirInput: workingDir,
+            initialPrompt: initialPrompt,
+            allowPermissionPrompt: true
+        )
+    }
+
+    private func runOpencodeStart(
+        sourceDirInput: String,
+        workingDirInput: String,
+        initialPrompt: String,
+        allowPermissionPrompt: Bool
+    ) {
+        let sourceDir = sourceDirInput
+        let workingDir = workingDirInput
+
+        let fm = FileManager.default
+        let workingURL = resolveUserPath(workingDir)
+        let sourceURL = resolveUserPath(sourceDir, relativeTo: workingURL)
+        let inputURL = workingURL.appendingPathComponent("input", isDirectory: true).standardizedFileURL
+
+        do {
+            var workingExistsIsDir: ObjCBool = false
+            if fm.fileExists(atPath: workingURL.path, isDirectory: &workingExistsIsDir) {
+                guard workingExistsIsDir.boolValue else {
+                    setOpencodeStatus("Invalid working dir: path points to a file.", isError: true)
+                    return
+                }
+            } else {
+                try fm.createDirectory(at: workingURL, withIntermediateDirectories: true)
+            }
+
+            var sourceIsDir: ObjCBool = false
+            guard fm.fileExists(atPath: sourceURL.path, isDirectory: &sourceIsDir) else {
+                setOpencodeStatus("Source path does not exist: \(sourceURL.path)", isError: true)
+                return
+            }
+
+            if sourceIsDir.boolValue && (sourceURL == inputURL || sourceURL.path.hasPrefix(inputURL.path + "/")) {
+                setOpencodeStatus("Unsafe source dir: cannot be input/ itself or inside input/.", isError: true)
+                return
+            }
+
+            let copiedCount = try prepareInputDirectory(from: sourceURL, isDirectory: sourceIsDir.boolValue, in: workingURL)
+            NSLog("Opencode start complete. sourceDir=%@ workingDir=%@ initialPrompt=%@ inputDir=%@",
+                  sourceDir, workingDir, initialPrompt, inputURL.path)
+            setOpencodeStatus("Prepared \(inputURL.path) · Copied \(copiedCount) item(s). Starting session…", isError: false)
+            activateFileExploreTab(with: workingURL)
+            startNewOpencodeSession(workingURL: workingURL, initialPrompt: initialPrompt)
+        } catch {
+            if allowPermissionPrompt, isPermissionError(error),
+               shouldPromptForExplicitFolderAccess(sourceURL: sourceURL, workingURL: workingURL) {
+                let granted = requestOpencodeFolderAccess(sourceURL: sourceURL, workingURL: workingURL)
+                if granted {
+                    runOpencodeStart(
+                        sourceDirInput: sourceDirInput,
+                        workingDirInput: workingDirInput,
+                        initialPrompt: initialPrompt,
+                        allowPermissionPrompt: false
+                    )
+                    return
+                }
+                setOpencodeStatus("Folder permission was not granted.", isError: true)
+                return
+            }
+            setOpencodeStatus("Start failed: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    private func prepareInputDirectory(from source: URL, isDirectory: Bool, in workingDir: URL) throws -> Int {
+        let fm = FileManager.default
+        let inputDir = workingDir.appendingPathComponent("input", isDirectory: true).standardizedFileURL
+
+        if fm.fileExists(atPath: inputDir.path) {
+            try fm.removeItem(at: inputDir)
+        }
+        try fm.createDirectory(at: inputDir, withIntermediateDirectories: true)
+
+        var copiedCount = 0
+        if isDirectory {
+            let items = try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil)
+            for item in items {
+                // Avoid recursively copying input/ into itself when source == workingDir.
+                if item.standardizedFileURL == inputDir { continue }
+                let destination = inputDir.appendingPathComponent(item.lastPathComponent, isDirectory: false)
+                try fm.copyItem(at: item, to: destination)
+                copiedCount += 1
+            }
+        } else {
+            let destination = inputDir.appendingPathComponent(source.lastPathComponent, isDirectory: false)
+            try fm.copyItem(at: source, to: destination)
+            copiedCount = 1
+        }
+        return copiedCount
+    }
+
+    private func resolveUserPath(_ rawPath: String, relativeTo baseDir: URL? = nil) -> URL {
+        if rawPath.hasPrefix("file://"), let url = URL(string: rawPath), url.isFileURL {
+            return url.standardizedFileURL
+        }
+        let expanded = expandTildeToRealHome(rawPath)
+        if expanded.hasPrefix("/") {
+            return URL(fileURLWithPath: expanded).standardizedFileURL
+        }
+        let base = baseDir ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        return base.appendingPathComponent(expanded, isDirectory: false).standardizedFileURL
+    }
+
+    private func expandTildeToRealHome(_ path: String) -> String {
+        guard path.hasPrefix("~") else { return path }
+
+        let homePath: String
+        if let pw = getpwuid(getuid()), let cHome = pw.pointee.pw_dir {
+            homePath = String(cString: cHome)
+        } else if let fallback = NSHomeDirectoryForUser(NSUserName()) {
+            homePath = fallback
+        } else {
+            homePath = NSHomeDirectory()
+        }
+
+        if path == "~" { return homePath }
+        if path.hasPrefix("~/") {
+            return homePath + "/" + path.dropFirst(2)
+        }
+        return NSString(string: path).expandingTildeInPath
+    }
+
+    private func normalizedPathInput(_ value: String) -> String {
+        var trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (trimmed.hasPrefix("\"") && trimmed.hasSuffix("\""))
+            || (trimmed.hasPrefix("'") && trimmed.hasSuffix("'")) {
+            trimmed = String(trimmed.dropFirst().dropLast())
+        }
+        return trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func requestOpencodeFolderAccess(sourceURL: URL, workingURL: URL) -> Bool {
+        let sourceBase = sourceURL.hasDirectoryPath ? sourceURL : sourceURL.deletingLastPathComponent()
+        let sourceGranted = requestSecurityScopedFolder(
+            initialDirectory: sourceBase,
+            prompt: "Grant Source Access",
+            message: "CameraShot needs access to read the source path. Choose that folder (or a parent folder).",
+            currentScope: &opencodeSourceScopeURL
+        )
+        guard sourceGranted else { return false }
+
+        return requestSecurityScopedFolder(
+            initialDirectory: workingURL,
+            prompt: "Grant Working Access",
+            message: "CameraShot needs access to create/remove input/ inside working dir. Choose that folder (or a parent folder).",
+            currentScope: &opencodeWorkingScopeURL
+        )
+    }
+
+    private func requestSecurityScopedFolder(
+        initialDirectory: URL,
+        prompt: String,
+        message: String,
+        currentScope: inout URL?
+    ) -> Bool {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles       = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.directoryURL         = initialDirectory
+        panel.prompt               = prompt
+        panel.message              = message
+
+        guard panel.runModal() == .OK, let url = panel.url else { return false }
+        guard url.startAccessingSecurityScopedResource() else {
+            setOpencodeStatus("Access denied for \(url.path)", isError: true)
+            return false
+        }
+        currentScope?.stopAccessingSecurityScopedResource()
+        currentScope = url
+        return true
+    }
+
+    private func isPermissionError(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain {
+            if ns.code == NSFileReadNoPermissionError || ns.code == NSFileWriteNoPermissionError {
+                return true
+            }
+        }
+        if ns.domain == NSPOSIXErrorDomain {
+            if ns.code == Int(EACCES) || ns.code == Int(EPERM) {
+                return true
+            }
+        }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isPermissionError(underlying)
+        }
+        return false
+    }
+
+    private func shouldPromptForExplicitFolderAccess(sourceURL: URL, workingURL: URL) -> Bool {
+        let sourceBase = sourceURL.hasDirectoryPath ? sourceURL : sourceURL.deletingLastPathComponent()
+        return !isUnderDocuments(sourceBase) || !isUnderDocuments(workingURL)
+    }
+
+    private func isUnderDocuments(_ url: URL) -> Bool {
+        let docsURL = documentsRootURL()
+        let path = url.standardizedFileURL.path
+        let docsPath = docsURL.standardizedFileURL.path
+        return path == docsPath || path.hasPrefix(docsPath + "/")
+    }
+
+    private func documentsRootURL() -> URL {
+        let homePath: String
+        if let pw = getpwuid(getuid()), let cHome = pw.pointee.pw_dir {
+            homePath = String(cString: cHome)
+        } else if let fallback = NSHomeDirectoryForUser(NSUserName()) {
+            homePath = fallback
+        } else {
+            homePath = NSHomeDirectory()
+        }
+        return URL(fileURLWithPath: homePath, isDirectory: true)
+            .appendingPathComponent("Documents", isDirectory: true)
+            .standardizedFileURL
+    }
+
+    @objc private func opencodeSendTapped() {
+        let message = opencodeSendField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        guard let workingURL = opencodeActiveWorkingURL else {
+            setOpencodeStatus("No active session. Press Start first.", isError: true)
+            return
+        }
+        guard !opencodeIsBusy else {
+            setOpencodeStatus("Opencode is currently processing. Please wait.", isError: true)
+            return
+        }
+        guard let sessionID = opencodeActiveSessionID else {
+            setOpencodeStatus("No active session ID. Press Start to create a new session.", isError: true)
+            return
+        }
+
+        opencodeSendField.stringValue = ""
+        appendOpencodeLine("You", message)
+        runOpencodeMessage(message, in: workingURL, sessionID: sessionID, isInitialStart: false)
+    }
+
+    private func startNewOpencodeSession(workingURL: URL, initialPrompt: String) {
+        opencodeActiveWorkingURL = workingURL
+        opencodeActiveSessionID = nil
+        updateOpencodeControls()
+
+        let prompt = initialPrompt.isEmpty
+            ? "Use the working directory and wait for follow-up instructions."
+            : initialPrompt
+        appendOpencodeLine("You", prompt)
+        runOpencodeMessage(prompt, in: workingURL, sessionID: nil, isInitialStart: true)
+    }
+
+    private func runOpencodeMessage(_ message: String, in workingURL: URL, sessionID: String?, isInitialStart: Bool) {
+        setOpencodeBusy(true)
+        setOpencodeStatus(isInitialStart ? "Starting opencode session…" : "Sending message…", isError: false)
+
+        opencodeCommandToken += 1
+        let token = opencodeCommandToken
+
+        if let sessionID {
+            beginStreamingOpencodeMessage(
+                message,
+                sessionID: sessionID,
+                workingURL: workingURL,
+                isInitialStart: isInitialStart,
+                token: token
+            )
+            return
+        }
+
+        guard isInitialStart else {
+            setOpencodeBusy(false)
+            setOpencodeStatus("No active session ID. Press Start to create a new session.", isError: true)
+            return
+        }
+
+        createOpencodeSession(workingURL: workingURL) { [weak self] result in
+            guard let self else { return }
+            guard token == self.opencodeCommandToken else { return }
+            switch result {
+            case .failure(let error):
+                self.setOpencodeBusy(false)
+                self.setOpencodeStatus(error.localizedDescription, isError: true)
+            case .success(let newSessionID):
+                self.opencodeActiveSessionID = newSessionID
+                self.updateOpencodeControls()
+                self.beginStreamingOpencodeMessage(
+                    message,
+                    sessionID: newSessionID,
+                    workingURL: workingURL,
+                    isInitialStart: true,
+                    token: token
+                )
+            }
+        }
+    }
+
+    private func beginStreamingOpencodeMessage(
+        _ message: String,
+        sessionID: String,
+        workingURL: URL,
+        isInitialStart: Bool,
+        token: Int
+    ) {
+        guard let eventURL = opencodeRequestURL(path: "event", workingURL: workingURL) else {
+            setOpencodeBusy(false)
+            setOpencodeStatus("Invalid opencode server URL.", isError: true)
+            return
+        }
+
+        stopOpencodeEventStream()
+        resetOpencodeStreamingState()
+
+        let stream = OpencodeEventStreamClient(
+            onEvent: { [weak self] event in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard token == self.opencodeCommandToken else { return }
+                    self.handleOpencodeStreamEvent(event, sessionID: sessionID, isInitialStart: isInitialStart)
+                }
+            },
+            onFailure: { [weak self] message in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard token == self.opencodeCommandToken else { return }
+                    self.finishOpencodeStreaming(withError: message)
+                }
+            }
+        )
+        opencodeEventStreamClient = stream
+        stream.start(url: eventURL)
+
+        postOpencodePromptAsync(message, sessionID: sessionID, workingURL: workingURL) { [weak self] result in
+            guard let self else { return }
+            guard token == self.opencodeCommandToken else { return }
+            if case .failure(let error) = result {
+                self.finishOpencodeStreaming(withError: error.localizedDescription)
+            }
+        }
+    }
+
+    private func handleOpencodeStreamEvent(_ event: [String: Any], sessionID: String, isInitialStart: Bool) {
+        guard let type = event["type"] as? String else { return }
+        guard let properties = event["properties"] as? [String: Any] else { return }
+
+        switch type {
+        case "message.updated":
+            guard
+                let info = properties["info"] as? [String: Any],
+                (info["sessionID"] as? String) == sessionID,
+                (info["role"] as? String) == "assistant",
+                let messageID = info["id"] as? String
+            else { return }
+            switchStreamingAssistantMessage(to: messageID)
+
+        case "message.part.delta":
+            guard
+                (properties["sessionID"] as? String) == sessionID,
+                let messageID = properties["messageID"] as? String,
+                (properties["field"] as? String) == "text",
+                let delta = properties["delta"] as? String
+            else { return }
+            switchStreamingAssistantMessage(to: messageID)
+            appendStreamingAssistantDelta(delta)
+
+        case "message.part.updated":
+            guard
+                let part = properties["part"] as? [String: Any],
+                (part["sessionID"] as? String) == sessionID,
+                let partType = part["type"] as? String
+            else { return }
+            if partType == "text",
+               let messageID = part["messageID"] as? String,
+               let text = part["text"] as? String {
+                switchStreamingAssistantMessage(to: messageID)
+                updateStreamingAssistantFullText(text)
+            } else if partType == "tool" {
+                handleStreamingToolPartUpdate(part)
+            }
+
+        case "session.error":
+            guard (properties["sessionID"] as? String) == sessionID else { return }
+            let message = parseOpencodeSessionError(properties)
+            finishOpencodeStreaming(withError: message)
+
+        case "session.idle":
+            guard (properties["sessionID"] as? String) == sessionID else { return }
+            finishOpencodeStreamingSuccessfully(isInitialStart: isInitialStart, sessionID: sessionID)
+
+        default:
+            break
+        }
+    }
+
+    private func switchStreamingAssistantMessage(to messageID: String) {
+        if opencodeStreamingAssistantMessageID == messageID {
+            return
+        }
+        opencodeStreamingAssistantMessageID = messageID
+        opencodeStreamingAssistantText = ""
+        opencodeStreamingAssistantRange = nil
+        opencodeToolStatusByPartID.removeAll(keepingCapacity: true)
+    }
+
+    private func appendStreamingAssistantDelta(_ delta: String) {
+        guard !delta.isEmpty else { return }
+        opencodeStreamingAssistantText += delta
+        renderStreamingAssistantBubble()
+    }
+
+    private func updateStreamingAssistantFullText(_ text: String) {
+        let normalized = stripANSI(text)
+        if normalized.count < opencodeStreamingAssistantText.count, !opencodeStreamingAssistantText.isEmpty {
+            return
+        }
+        opencodeStreamingAssistantText = normalized
+        renderStreamingAssistantBubble()
+    }
+
+    private func renderStreamingAssistantBubble() {
+        let display = cleanOpencodeAssistantText(opencodeStreamingAssistantText)
+        guard !display.isEmpty else { return }
+        guard let storage = opencodeChatTextView?.textStorage else { return }
+
+        let headerStyle = NSMutableParagraphStyle()
+        headerStyle.alignment = .left
+        headerStyle.paragraphSpacing = 2
+
+        let bubbleStyle = NSMutableParagraphStyle()
+        bubbleStyle.alignment = .left
+        bubbleStyle.lineSpacing = 1.5
+        bubbleStyle.paragraphSpacing = 12
+
+        let headerAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: headerStyle
+        ]
+        let bodyAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.labelColor,
+            .backgroundColor: NSColor.controlBackgroundColor,
+            .paragraphStyle: bubbleStyle
+        ]
+        let bodyText = "  \(display)  \n\n"
+
+        if let range = opencodeStreamingAssistantRange {
+            let replacement = NSAttributedString(string: bodyText, attributes: bodyAttributes)
+            storage.replaceCharacters(in: range, with: replacement)
+            opencodeStreamingAssistantRange = NSRange(location: range.location, length: replacement.length)
+        } else {
+            storage.append(NSAttributedString(string: "Opencode\n", attributes: headerAttributes))
+            let start = storage.length
+            let body = NSAttributedString(string: bodyText, attributes: bodyAttributes)
+            storage.append(body)
+            opencodeStreamingAssistantRange = NSRange(location: start, length: body.length)
+        }
+        scrollOpencodeChatToBottom()
+    }
+
+    private func finishOpencodeStreamingSuccessfully(isInitialStart: Bool, sessionID: String) {
+        stopOpencodeEventStream()
+        setOpencodeBusy(false)
+        if isInitialStart {
+            setOpencodeStatus("Session started: \(sessionID)", isError: false)
+        } else {
+            setOpencodeStatus("Message sent.", isError: false)
+        }
+        resetOpencodeStreamingState()
+    }
+
+    private func finishOpencodeStreaming(withError message: String) {
+        stopOpencodeEventStream()
+        setOpencodeBusy(false)
+        setOpencodeStatus(message, isError: true)
+        resetOpencodeStreamingState()
+    }
+
+    private func resetOpencodeStreamingState() {
+        opencodeStreamingAssistantMessageID = nil
+        opencodeStreamingAssistantText = ""
+        opencodeStreamingAssistantRange = nil
+        opencodeToolStatusByPartID.removeAll(keepingCapacity: false)
+    }
+
+    private func stopOpencodeEventStream() {
+        opencodeEventStreamClient?.stop()
+        opencodeEventStreamClient = nil
+    }
+
+    private func parseOpencodeSessionError(_ properties: [String: Any]) -> String {
+        if
+            let error = properties["error"] as? [String: Any],
+            let message = error["message"] as? String
+        {
+            return "Opencode failed: \(message)"
+        }
+        return "Opencode failed."
+    }
+
+    private func handleStreamingToolPartUpdate(_ part: [String: Any]) {
+        guard
+            let partID = part["id"] as? String,
+            let state = part["state"] as? [String: Any],
+            let status = state["status"] as? String
+        else { return }
+
+        if opencodeToolStatusByPartID[partID] == status {
+            return
+        }
+        opencodeToolStatusByPartID[partID] = status
+
+        let rawToolName = (part["tool"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let toolName = (rawToolName?.isEmpty == false) ? (rawToolName ?? "tool") : "tool"
+
+        switch status {
+        case "running":
+            appendOpencodeLine("Opencode", "[processing] running \(toolName)…")
+        case "completed":
+            appendOpencodeLine("Opencode", "[processing] finished \(toolName).")
+        case "failed":
+            appendOpencodeLine("Opencode", "[processing] failed \(toolName).")
+        default:
+            break
+        }
+    }
+
+    private func createOpencodeSession(workingURL: URL, completion: @escaping (Result<String, Error>) -> Void) {
+        guard let requestURL = opencodeRequestURL(path: "session", workingURL: workingURL) else {
+            completion(.failure(makeOpencodeError("Invalid opencode server URL.")))
+            return
+        }
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+
+        performOpencodeRequest(request, completion: completion) { data in
+            let decoder = JSONDecoder()
+            let response = try decoder.decode(OpencodeSessionCreateResponse.self, from: data)
+            return response.id
+        }
+    }
+
+    private func postOpencodePromptAsync(
+        _ message: String,
+        sessionID: String,
+        workingURL: URL,
+        completion: @escaping (Result<Bool, Error>) -> Void
+    ) {
+        guard let requestURL = opencodeRequestURL(
+            path: "session/\(sessionID)/prompt_async",
+            workingURL: workingURL
+        ) else {
+            completion(.failure(makeOpencodeError("Invalid opencode server URL.")))
+            return
+        }
+
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let payload = OpencodePromptRequest(parts: [OpencodePromptTextPart(type: "text", text: message)])
+        do {
+            request.httpBody = try JSONEncoder().encode(payload)
+        } catch {
+            completion(.failure(makeOpencodeError("Failed to encode prompt payload: \(error.localizedDescription)")))
+            return
+        }
+
+        performOpencodeRequest(request, completion: completion) { _ in
+            true
+        }
+    }
+
+    private func opencodeAttachURL() -> String? {
+        if let configured = UserDefaults.standard.string(forKey: "opencode.attachURL")?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            return configured
+        }
+        return opencodeDefaultAttachURL
+    }
+
+    private func opencodeRequestURL(path: String, workingURL: URL) -> URL? {
+        guard
+            let attachURL = opencodeAttachURL(),
+            let baseURL = URL(string: attachURL),
+            var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        else {
+            return nil
+        }
+
+        let normalizedPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        let basePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if basePath.isEmpty {
+            components.path = normalizedPath.isEmpty ? "/" : "/\(normalizedPath)"
+        } else {
+            components.path = normalizedPath.isEmpty ? "/\(basePath)" : "/\(basePath)/\(normalizedPath)"
+        }
+
+        var queryItems = components.queryItems ?? []
+        queryItems.removeAll(where: { $0.name == "directory" })
+        queryItems.append(URLQueryItem(name: "directory", value: workingURL.path))
+        components.queryItems = queryItems
+        return components.url
+    }
+
+    private func performOpencodeRequest<T>(
+        _ request: URLRequest,
+        completion: @escaping (Result<T, Error>) -> Void,
+        decode: @escaping (Data) throws -> T
+    ) {
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            if let urlError = error as? URLError {
+                let message = self.opencodeConnectionErrorMessage(urlError)
+                DispatchQueue.main.async { completion(.failure(self.makeOpencodeError(message))) }
+                return
+            }
+            if let error {
+                DispatchQueue.main.async { completion(.failure(error)) }
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                DispatchQueue.main.async {
+                    completion(.failure(self.makeOpencodeError("Opencode server returned an invalid response.")))
+                }
+                return
+            }
+
+            let payload = data ?? Data()
+            guard (200..<300).contains(httpResponse.statusCode) else {
+                let detail = self.parseOpencodeHTTPError(payload)
+                let message = detail.isEmpty
+                    ? "Opencode server error (HTTP \(httpResponse.statusCode))."
+                    : "Opencode server error (HTTP \(httpResponse.statusCode)): \(detail)"
+                DispatchQueue.main.async { completion(.failure(self.makeOpencodeError(message))) }
+                return
+            }
+
+            do {
+                let value = try decode(payload)
+                DispatchQueue.main.async { completion(.success(value)) }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(self.makeOpencodeError("Failed to parse opencode response: \(error.localizedDescription)")))
+                }
+            }
+        }
+        task.resume()
+    }
+
+    private func makeOpencodeError(_ message: String) -> NSError {
+        NSError(domain: "CameraShot.Opencode", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private func opencodeConnectionErrorMessage(_ error: URLError) -> String {
+        switch error.code {
+        case .cannotConnectToHost, .cannotFindHost, .timedOut, .notConnectedToInternet, .networkConnectionLost:
+            let attach = opencodeAttachURL() ?? opencodeDefaultAttachURL
+            return "Cannot reach opencode server at \(attach). Start it with ./run.sh and try again."
+        default:
+            return "Opencode request failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func parseOpencodeHTTPError(_ payload: Data) -> String {
+        guard !payload.isEmpty else { return "" }
+        if
+            let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+            let message = object["message"] as? String ?? object["error"] as? String
+        {
+            return message
+        }
+        return String(data: payload, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private struct FileExploreTreeSnapshotEntry: Equatable {
+        let isDirectory: Bool
+        let modifiedAt: TimeInterval
+        let size: Int64
+    }
+
+    private struct OpencodeSessionCreateResponse: Decodable {
+        let id: String
+    }
+
+    private struct OpencodePromptTextPart: Encodable {
+        let type: String
+        let text: String
+    }
+
+    private struct OpencodePromptRequest: Encodable {
+        let parts: [OpencodePromptTextPart]
+    }
+
+    private final class FileExploreNode: NSObject {
+        let url: URL
+        let isDirectory: Bool
+        weak var parent: FileExploreNode?
+        var children: [FileExploreNode] = []
+        var isLoaded = false
+
+        init(url: URL, isDirectory: Bool) {
+            self.url = url
+            self.isDirectory = isDirectory
+        }
+    }
+
+    private final class OpencodeEventStreamClient: NSObject, URLSessionDataDelegate {
+        private let onEvent: ([String: Any]) -> Void
+        private let onFailure: (String) -> Void
+        private var session: URLSession?
+        private var task: URLSessionDataTask?
+        private var lineBuffer = Data()
+        private var dataLines: [String] = []
+        private var isStopped = false
+
+        init(onEvent: @escaping ([String: Any]) -> Void, onFailure: @escaping (String) -> Void) {
+            self.onEvent = onEvent
+            self.onFailure = onFailure
+            super.init()
+        }
+
+        func start(url: URL) {
+            guard !isStopped else { return }
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = 0
+            configuration.timeoutIntervalForResource = 0
+            let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+            self.session = session
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 0
+            request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+            let task = session.dataTask(with: request)
+            self.task = task
+            task.resume()
+        }
+
+        func stop() {
+            guard !isStopped else { return }
+            isStopped = true
+            task?.cancel()
+            task = nil
+            session?.invalidateAndCancel()
+            session = nil
+            lineBuffer.removeAll(keepingCapacity: false)
+            dataLines.removeAll(keepingCapacity: false)
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            guard let http = response as? HTTPURLResponse else {
+                fail("Opencode stream returned an invalid response.")
+                completionHandler(.cancel)
+                return
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                fail("Opencode stream failed (HTTP \(http.statusCode)).")
+                completionHandler(.cancel)
+                return
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            guard !isStopped else { return }
+            lineBuffer.append(data)
+
+            while let newlineRange = lineBuffer.range(of: Data([0x0A])) {
+                let lineData = lineBuffer.subdata(in: 0..<newlineRange.lowerBound)
+                lineBuffer.removeSubrange(0..<newlineRange.upperBound)
+                guard var line = String(data: lineData, encoding: .utf8) else { continue }
+                if line.hasSuffix("\r") { line.removeLast() }
+                consumeLine(line)
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            guard !isStopped else { return }
+            if let urlError = error as? URLError, urlError.code == .cancelled {
+                return
+            }
+            if let error {
+                fail("Opencode stream disconnected: \(error.localizedDescription)")
+            }
+        }
+
+        private func consumeLine(_ line: String) {
+            if line.isEmpty {
+                emitEventIfReady()
+                return
+            }
+            guard line.hasPrefix("data:") else { return }
+            var data = String(line.dropFirst(5))
+            if data.hasPrefix(" ") { data.removeFirst() }
+            dataLines.append(data)
+        }
+
+        private func emitEventIfReady() {
+            guard !dataLines.isEmpty else { return }
+            let payload = dataLines.joined(separator: "\n")
+            dataLines.removeAll(keepingCapacity: true)
+            guard let raw = payload.data(using: .utf8) else { return }
+            guard let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return }
+            onEvent(object)
+        }
+
+        private func fail(_ message: String) {
+            guard !isStopped else { return }
+            isStopped = true
+            onFailure(message)
+            task?.cancel()
+            task = nil
+            session?.invalidateAndCancel()
+            session = nil
+            lineBuffer.removeAll(keepingCapacity: false)
+            dataLines.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private func stripANSI(_ input: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: #"\u001B\[[0-?]*[ -/]*[@-~]"#) else { return input }
+        let range = NSRange(location: 0, length: input.utf16.count)
+        return regex.stringByReplacingMatches(in: input, options: [], range: range, withTemplate: "")
+    }
+
+    private func cleanOpencodeAssistantText(_ raw: String) -> String {
+        let plain = stripANSI(raw)
+        let filtered = plain
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { line in
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { return true }
+                // Hide status/meta lines like: "> build · claude-sonnet-4-5"
+                return !trimmed.hasPrefix("> ")
+            }
+        return filtered.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func appendOpencodeLine(_ role: String, _ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard role == "You" || role == "Opencode" else { return }
+        guard let storage = opencodeChatTextView?.textStorage else { return }
+
+        let isUser = role == "You"
+
+        let headerStyle = NSMutableParagraphStyle()
+        headerStyle.alignment = isUser ? .right : .left
+        headerStyle.paragraphSpacing = 2
+
+        let bubbleStyle = NSMutableParagraphStyle()
+        bubbleStyle.alignment = isUser ? .right : .left
+        bubbleStyle.lineSpacing = 1.5
+        bubbleStyle.paragraphSpacing = 12
+
+        let headerAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: headerStyle
+        ]
+
+        let bodyAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: isUser ? NSColor.white : NSColor.labelColor,
+            .backgroundColor: isUser ? NSColor.systemBlue : NSColor.controlBackgroundColor,
+            .paragraphStyle: bubbleStyle
+        ]
+
+        storage.append(NSAttributedString(string: "\(role)\n", attributes: headerAttributes))
+        storage.append(NSAttributedString(string: "  \(trimmed)  \n\n", attributes: bodyAttributes))
+        scrollOpencodeChatToBottom()
+    }
+
+    private func scrollOpencodeChatToBottom() {
+        guard let storage = opencodeChatTextView?.textStorage else { return }
+        opencodeChatTextView.scrollRangeToVisible(NSRange(location: storage.length, length: 0))
+    }
+
+    private func setOpencodeBusy(_ busy: Bool) {
+        opencodeIsBusy = busy
+        updateOpencodeControls()
+    }
+
+    private func stopActiveOpencodeProcess(resetSession: Bool) {
+        opencodeCommandToken += 1
+        stopOpencodeEventStream()
+        resetOpencodeStreamingState()
+        opencodeIsBusy = false
+        if resetSession {
+            opencodeActiveSessionID = nil
+            opencodeActiveWorkingURL = nil
+        }
+        updateOpencodeControls()
+    }
+
+    private func updateOpencodeControls() {
+        let hasSession = opencodeActiveWorkingURL != nil
+        opencodeSendField?.isEnabled = hasSession && !opencodeIsBusy
+        opencodeSendButton?.isEnabled = hasSession && !opencodeIsBusy
+        opencodeStartButton?.title = hasSession ? "Restart" : "Start"
+    }
+
+    private func setOpencodeStatus(_ message: String, isError: Bool) {
+        opencodeStatusLabel.stringValue = message
+        opencodeStatusLabel.textColor = isError ? .systemRed : .secondaryLabelColor
+        opencodeStatusLabel.isHidden = message.isEmpty
     }
 
     @objc private func clearAudioFeed() {
@@ -692,6 +2261,188 @@ final class CaptureWindowController: NSWindowController {
     private static func timeString() -> String {
         DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
     }
+
+    private static let fileExploreHTMLTemplate = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="github-dark-dimmed.min.css">
+    <script src="marked.min.js"></script>
+    <script src="highlight.min.js"></script>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      :root {
+        --bg: #ffffff;
+        --fg: #1c1c1e;
+        --border: #d1d1d6;
+        --muted: #6b7280;
+        --code-bg: rgba(0,0,0,0.05);
+        --font-size: 14px;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1c1c1e;
+          --fg: #e5e5ea;
+          --border: #3a3a3c;
+          --muted: #9ca3af;
+          --code-bg: rgba(255,255,255,0.08);
+        }
+      }
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: var(--font-size);
+        line-height: 1.65;
+        word-break: break-word;
+      }
+      #root {
+        padding: 14px 16px;
+      }
+      .placeholder {
+        color: var(--muted);
+      }
+      h1 { font-size: 1.45em; margin: 20px 0 8px; }
+      h2 { font-size: 1.25em; margin: 18px 0 8px; }
+      h3 { font-size: 1.1em; margin: 14px 0 6px; }
+      h4, h5, h6 { font-size: 1em; margin: 12px 0 4px; }
+      p { margin: 8px 0; }
+      ul, ol { padding-left: 24px; margin: 8px 0; }
+      li { margin: 3px 0; }
+      blockquote {
+        border-left: 3px solid var(--border);
+        margin: 10px 0;
+        padding: 4px 14px;
+        color: var(--muted);
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 12px 0;
+      }
+      th, td {
+        border: 1px solid var(--border);
+        padding: 6px 10px;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: var(--code-bg);
+        font-weight: 600;
+      }
+      .table-wrap {
+        overflow-x: auto;
+      }
+      pre {
+        overflow-x: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px;
+        margin: 12px 0;
+        background: var(--code-bg);
+      }
+      code, pre {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Courier New", monospace;
+      }
+      code:not(pre > code) {
+        background: var(--code-bg);
+        border-radius: 4px;
+        padding: 2px 5px;
+        font-size: 0.9em;
+      }
+      pre > code {
+        background: transparent !important;
+        padding: 0 !important;
+      }
+    </style>
+    </head>
+    <body>
+      <div id="root"><div class="placeholder">Select a file from the sidebar.</div></div>
+      <script>
+        var currentFontSize = 14;
+
+        function escapeHtml(input) {
+          return input
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+        }
+
+        function highlightBlocks(root) {
+          if (typeof hljs === 'undefined') return;
+          root.querySelectorAll('pre code').forEach(function(block) {
+            try { hljs.highlightElement(block); } catch (_) {}
+          });
+        }
+
+        function normalizeMarkdownHtml(root) {
+          root.querySelectorAll('table').forEach(function(table) {
+            if (table.parentElement && table.parentElement.classList && table.parentElement.classList.contains('table-wrap')) {
+              return;
+            }
+            var wrap = document.createElement('div');
+            wrap.className = 'table-wrap';
+            table.parentNode.insertBefore(wrap, table);
+            wrap.appendChild(table);
+          });
+        }
+
+        function renderDocument(kind, content) {
+          var root = document.getElementById('root');
+          if (!root) return;
+
+          if (!content || content.length === 0) {
+            root.innerHTML = '<div class="placeholder">Empty file.</div>';
+            return;
+          }
+
+          if (kind === 'markdown' && typeof marked !== 'undefined' && marked.parse) {
+            root.innerHTML = marked.parse(content);
+            normalizeMarkdownHtml(root);
+            highlightBlocks(root);
+            return;
+          }
+
+          if (kind === 'python' && typeof marked !== 'undefined' && marked.parse) {
+            var wrapped = '```python\\n' + content + '\\n```';
+            root.innerHTML = marked.parse(wrapped);
+            normalizeMarkdownHtml(root);
+            highlightBlocks(root);
+            return;
+          }
+
+          root.innerHTML = '<pre><code>' + escapeHtml(content) + '</code></pre>';
+          highlightBlocks(root);
+        }
+
+        function adjustZoom(delta) {
+          currentFontSize = Math.min(Math.max(currentFontSize + delta, 9), 30);
+          document.documentElement.style.setProperty('--font-size', currentFontSize + 'px');
+        }
+
+        if (typeof marked !== 'undefined' && marked.use) {
+          marked.use({
+            gfm: true,
+            breaks: true,
+            highlight: function(code, lang) {
+              if (typeof hljs === 'undefined') return code;
+              if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
+              return hljs.highlightAuto(code).value;
+            }
+          });
+        }
+
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.pageReady) {
+          window.webkit.messageHandlers.pageReady.postMessage('ready');
+        }
+      </script>
+    </body>
+    </html>
+    """
 
     // MARK: – HTML template
 
@@ -1117,6 +2868,104 @@ final class CaptureWindowController: NSWindowController {
     </body>
     </html>
     """
+}
+
+// MARK: - File Explore Outline
+
+extension CaptureWindowController: NSOutlineViewDataSource, NSOutlineViewDelegate {
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        guard outlineView === fileExploreOutlineView else { return 0 }
+        if let node = item as? FileExploreNode {
+            loadFileExploreChildrenIfNeeded(for: node)
+            return node.children.count
+        }
+        guard let root = fileExploreRootNode else { return 0 }
+        loadFileExploreChildrenIfNeeded(for: root)
+        return root.children.count
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        if let node = item as? FileExploreNode {
+            return node.children[index]
+        }
+        guard let root = fileExploreRootNode else { return NSObject() }
+        return root.children[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        guard outlineView === fileExploreOutlineView, let node = item as? FileExploreNode else { return false }
+        return node.isDirectory
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
+        guard outlineView === fileExploreOutlineView, let node = item as? FileExploreNode else { return true }
+        // Refresh this directory when the user opens it.
+        node.isLoaded = false
+        loadFileExploreChildrenIfNeeded(for: node)
+        outlineView.reloadItem(node, reloadChildren: true)
+        return true
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard outlineView === fileExploreOutlineView, let node = item as? FileExploreNode else { return nil }
+        let identifier = NSUserInterfaceItemIdentifier("FileExploreCell")
+
+        let cell: NSTableCellView
+        if let reused = outlineView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
+            cell = reused
+        } else {
+            cell = NSTableCellView()
+            cell.identifier = identifier
+
+            let iconView = NSImageView()
+            iconView.translatesAutoresizingMaskIntoConstraints = false
+            iconView.imageScaling = .scaleProportionallyDown
+            cell.imageView = iconView
+            cell.addSubview(iconView)
+
+            let textField = NSTextField(labelWithString: "")
+            textField.translatesAutoresizingMaskIntoConstraints = false
+            textField.lineBreakMode = .byTruncatingMiddle
+            cell.textField = textField
+            cell.addSubview(textField)
+
+            NSLayoutConstraint.activate([
+                iconView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                iconView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                iconView.widthAnchor.constraint(equalToConstant: 16),
+                iconView.heightAnchor.constraint(equalToConstant: 16),
+
+                textField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
+                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+                textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+
+        cell.textField?.stringValue = node.url.lastPathComponent
+        let icon = NSWorkspace.shared.icon(forFile: node.url.path)
+        icon.size = NSSize(width: 16, height: 16)
+        cell.imageView?.image = icon
+        return cell
+    }
+
+    func outlineViewSelectionDidChange(_ notification: Notification) {
+        guard let outlineView = notification.object as? NSOutlineView, outlineView === fileExploreOutlineView else { return }
+        let row = outlineView.selectedRow
+        guard row >= 0, let node = outlineView.item(atRow: row) as? FileExploreNode else {
+            fileExploreSelectedFileURL = nil
+            fileExploreSelectedFingerprint = nil
+            updateFileExploreRealtimeRefreshState()
+            return
+        }
+        guard !node.isDirectory else {
+            fileExploreSelectedFileURL = nil
+            fileExploreSelectedFingerprint = nil
+            renderFileExploreDocument(kind: "text", content: "Select a file from the sidebar.")
+            updateFileExploreRealtimeRefreshState()
+            return
+        }
+        previewFileExploreFile(at: node.url)
+    }
 }
 
 // MARK: - WKNavigationDelegate

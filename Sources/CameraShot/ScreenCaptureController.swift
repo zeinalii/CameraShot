@@ -13,8 +13,7 @@ enum ScreenTarget {
 
 // MARK: - ScreenCaptureController
 
-/// Takes one-shot screenshots at a fixed interval using SCScreenshotManager.
-/// No persistent SCStream is held, so apps like Chrome do not show a recording indicator.
+/// Takes one-shot screenshots at a fixed interval using ScreenCaptureKit.
 final class ScreenCaptureController: NSObject {
 
     // MARK: – Public
@@ -116,6 +115,9 @@ final class ScreenCaptureController: NSObject {
     private func takeScreenshot(filter: SCContentFilter) async {
         let config = SCStreamConfiguration()
         config.showsCursor = true
+        let scale = CGFloat(filter.pointPixelScale)
+        config.width = max(1, Int(filter.contentRect.width * scale))
+        config.height = max(1, Int(filter.contentRect.height * scale))
 
         do {
             let image = try await SCScreenshotManager.captureImage(
@@ -187,6 +189,7 @@ final class ScreenCaptureController: NSObject {
             "The selected display or window could not be found. It may have been closed or disconnected."
         }
     }
+
 }
 
 private final class PersistImageOperation: Operation, @unchecked Sendable {

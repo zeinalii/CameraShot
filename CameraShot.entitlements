@@ -16,6 +16,7 @@
     <true/>
     <key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
     <array>
+        <string>/Documents</string>
         <string>/Documents/CameraShot</string>
     </array>
 </dict>

@@ -28,3 +28,4 @@ __pycache__/
 # Environment / secrets
 .env
 *.enc
+.claude
