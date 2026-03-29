@@ -29,6 +29,6 @@
     <key>NSApplicationSupportsSecureRestorableState</key>
     <true/>
     <key>LSUIElement</key>
-    <false/>
+    <true/>
 </dict>
 </plist>

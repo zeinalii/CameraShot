@@ -27,12 +27,14 @@ final class AudioAIProcessor: @unchecked Sendable {
     // MARK: – Public
 
     /// Sends `transcript` to Claude and streams the response via `onChunk` / `onDone` / `onError`.
-    /// Ignores the call if a request is already in flight.
-    func query(transcript: String) {
-        guard !inFlight else { return }
-        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    /// Returns `true` when the request is accepted, `false` when dropped (empty/in-flight).
+    @discardableResult
+    func query(transcript: String) -> Bool {
+        guard !inFlight else { return false }
+        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         inFlight = true
         Task { await run(transcript: transcript) }
+        return true
     }
 
     // MARK: – Private

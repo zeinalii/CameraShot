@@ -65,7 +65,10 @@ final class CaptureWindowController: NSWindowController {
     private weak var opencodeStartButton: NSButton!
     private weak var opencodeSendField: NSTextField!
     private weak var opencodeSendButton: NSButton!
-    private var opencodeChatTextView: NSTextView!
+    private var opencodeChatWebView: WKWebView!
+    private var opencodeChatPageReady = false
+    private var opencodePendingChatEntries: [(header: String, body: String, isError: Bool)] = []
+    private var opencodePendingChatScripts: [String] = []
     private var opencodeActiveSessionID: String?
     private var opencodeActiveWorkingURL: URL?
     private var opencodeCommandToken: Int = 0
@@ -74,10 +77,13 @@ final class CaptureWindowController: NSWindowController {
     private var opencodeEventStreamClient: OpencodeEventStreamClient?
     private var opencodeStreamingAssistantMessageID: String?
     private var opencodeStreamingAssistantText: String = ""
-    private var opencodeStreamingAssistantRange: NSRange?
+    private var opencodeStreamingEntryIDByMessageID: [String: Int] = [:]
+    private var opencodeCurrentStreamingEntryID: Int?
+    private var opencodeNextStreamingEntryID = 0
     private var opencodeToolStatusByPartID: [String: String] = [:]
     private var opencodeSourceScopeURL: URL?
     private var opencodeWorkingScopeURL: URL?
+    private let opencodeInitialPromptDefaultsKey = "opencode.initialPrompt"
 
     // File Explore tab controls
     private weak var fileExploreContainerView: NSView!
@@ -109,11 +115,12 @@ final class CaptureWindowController: NSWindowController {
     private var audioAIStreamingText = ""
 
     // Audio AI callbacks / timer
-    var onAudioAIRequest: ((String) -> Void)?
+    var onAudioAIRequest: ((String) -> Bool)?
     var audioAITokenLimit: Int = 500          // ~4 chars per token
     private var audioAITimer: Timer?
     private let captureInterval: TimeInterval
     private var lastSentTranscript: String = ""
+    private var pendingTranscriptCharsSinceLastSend: Int = 0
 
     // MARK: – Init
 
@@ -228,6 +235,7 @@ final class CaptureWindowController: NSWindowController {
             ]
             ts.append(NSAttributedString(string: text + "\n", attributes: attrs))
             transcriptBuffer += text + "\n"
+            pendingTranscriptCharsSinceLastSend += text.count + 1
             let cap = audioAITokenLimit * 4
             if transcriptBuffer.count > cap * 2 {
                 transcriptBuffer = String(transcriptBuffer.suffix(cap))
@@ -304,21 +312,23 @@ final class CaptureWindowController: NSWindowController {
     @objc private func audioAIZoomIn()  { audioAIWebView.evaluateJavaScript("adjustZoom(1)",  completionHandler: nil) }
     @objc private func audioAIZoomOut() { audioAIWebView.evaluateJavaScript("adjustZoom(-1)", completionHandler: nil) }
 
-    @objc private func askAITapped() { triggerAudioAI() }
+    @objc private func askAITapped() { triggerAudioAI(force: true) }
 
-    private func triggerAudioAI() {
+    private func triggerAudioAI(force: Bool = false) {
         let full    = transcriptBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !full.isEmpty else { return }
         // Trim to the configured token limit before sending
         let current = String(full.suffix(audioAITokenLimit * 4))
+        guard force || current != lastSentTranscript else { return }
 
-        // Skip if fewer than 3% of characters are new since the last send
-        let newChars = current.count - lastSentTranscript.count
+        // Skip auto-send if fewer than 3% of transcript chars were appended since the last request.
         let base = max(lastSentTranscript.count, 1)
-        guard lastSentTranscript.isEmpty || Double(newChars) / Double(base) >= 0.03 else { return }
+        let growthRatio = Double(pendingTranscriptCharsSinceLastSend) / Double(base)
+        guard force || lastSentTranscript.isEmpty || growthRatio >= 0.03 else { return }
 
+        guard onAudioAIRequest?(current) == true else { return }
         lastSentTranscript = current
-        onAudioAIRequest?(current)
+        pendingTranscriptCharsSinceLastSend = 0
     }
 
     /// Appends a red error entry to the audio feed.
@@ -545,7 +555,7 @@ final class CaptureWindowController: NSWindowController {
         initialPromptTextView.backgroundColor = .textBackgroundColor
         initialPromptTextView.font = .systemFont(ofSize: 13)
         initialPromptTextView.textContainerInset = NSSize(width: 6, height: 6)
-        initialPromptTextView.string = ""
+        initialPromptTextView.string = UserDefaults.standard.string(forKey: opencodeInitialPromptDefaultsKey) ?? ""
         opencodeInitialPromptTextView = initialPromptTextView
 
         let initialPromptScroll = NSScrollView()
@@ -568,22 +578,22 @@ final class CaptureWindowController: NSWindowController {
         statusLabel.isHidden = true
         opencodeStatusLabel = statusLabel
 
-        let chatTextView = NSTextView()
-        chatTextView.isEditable = false
-        chatTextView.isSelectable = true
-        chatTextView.drawsBackground = false
-        chatTextView.font = .systemFont(ofSize: 12)
-        chatTextView.textContainerInset = NSSize(width: 14, height: 14)
-        chatTextView.textContainer?.widthTracksTextView = true
-        opencodeChatTextView = chatTextView
+        let opencodeChatCfg = WKWebViewConfiguration()
+        let opencodeChatHandler = CopyCodeHandler(pageReady: { [weak self] in
+            DispatchQueue.main.async {
+                self?.opencodeChatPageReady = true
+                self?.flushOpencodePendingChatEntries()
+                self?.flushOpencodePendingChatScripts()
+            }
+        })
+        opencodeChatCfg.userContentController.add(opencodeChatHandler, name: "copyCode")
+        opencodeChatCfg.userContentController.add(opencodeChatHandler, name: "pageReady")
 
-        let chatScroll = NSScrollView()
-        chatScroll.documentView = chatTextView
-        chatScroll.hasVerticalScroller = true
-        chatScroll.autohidesScrollers = true
-        chatScroll.hasHorizontalScroller = false
-        chatScroll.drawsBackground = false
-        chatScroll.translatesAutoresizingMaskIntoConstraints = false
+        let opencodeChatView = WKWebView(frame: .zero, configuration: opencodeChatCfg)
+        opencodeChatView.translatesAutoresizingMaskIntoConstraints = false
+        opencodeChatView.wantsLayer = true
+        opencodeChatView.layer?.backgroundColor = NSColor.clear.cgColor
+        opencodeChatWebView = opencodeChatView
 
         let sendField = NSTextField(string: "")
         sendField.placeholderString = "Send follow-up message"
@@ -599,7 +609,7 @@ final class CaptureWindowController: NSWindowController {
         opencodeSendButton = sendBtn
 
         [sourceLabel, sourceField, workingLabel, workingField, initialPromptLabel, initialPromptScroll, startBtn, statusLabel,
-         chatScroll, sendField, sendBtn]
+         opencodeChatView, sendField, sendBtn]
             .forEach { opencodeView.addSubview($0) }
 
         // ── File Explore tab content ───────────────────────────────
@@ -833,11 +843,11 @@ final class CaptureWindowController: NSWindowController {
             statusLabel.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
             statusLabel.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
 
-            chatScroll.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
-            chatScroll.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
-            chatScroll.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
-            chatScroll.bottomAnchor.constraint(equalTo: sendField.topAnchor, constant: -10),
-            chatScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 140),
+            opencodeChatView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
+            opencodeChatView.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
+            opencodeChatView.trailingAnchor.constraint(equalTo: opencodeView.trailingAnchor, constant: -16),
+            opencodeChatView.bottomAnchor.constraint(equalTo: sendField.topAnchor, constant: -10),
+            opencodeChatView.heightAnchor.constraint(greaterThanOrEqualToConstant: 140),
 
             sendField.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
             sendField.bottomAnchor.constraint(equalTo: opencodeView.bottomAnchor, constant: -16),
@@ -872,6 +882,7 @@ final class CaptureWindowController: NSWindowController {
         let baseURL: URL? = Self.resourcesBaseURL()
         wv.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         aiWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
+        opencodeChatWebView.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         fileExplorePreviewWebView.loadHTMLString(Self.fileExploreHTMLTemplate, baseURL: baseURL)
         renderFileExploreDocument(kind: "text", content: "Start Opencode to open File Explore.")
         return container
@@ -993,13 +1004,26 @@ final class CaptureWindowController: NSWindowController {
                 updateFileExploreRealtimeRefreshState()
                 return
             }
+            let kind = fileExploreContentKind(for: standardizedURL)
+            if kind == "jupyter" {
+                if let notebookMarkdown = parseJupyterNotebookForPreview(from: data) {
+                    fileExploreSelectedFingerprint = fileExploreFingerprint(for: standardizedURL)
+                    renderFileExploreDocument(kind: "jupyter", content: notebookMarkdown)
+                    updateFileExploreRealtimeRefreshState()
+                    return
+                }
+            }
+
             guard let text = parseFileExploreText(from: data) else {
                 fileExploreSelectedFingerprint = nil
-                renderFileExploreDocument(kind: "text", content: "Unable to decode file as UTF-8 text: \(standardizedURL.lastPathComponent)")
+                let message = kind == "jupyter"
+                    ? "Unable to parse notebook JSON: \(standardizedURL.lastPathComponent)"
+                    : "Unable to decode file as UTF-8 text: \(standardizedURL.lastPathComponent)"
+                renderFileExploreDocument(kind: "text", content: message)
                 updateFileExploreRealtimeRefreshState()
                 return
             }
-            let kind = fileExploreContentKind(for: standardizedURL)
+
             fileExploreSelectedFingerprint = fileExploreFingerprint(for: standardizedURL)
             renderFileExploreDocument(kind: kind, content: text)
             updateFileExploreRealtimeRefreshState()
@@ -1012,6 +1036,9 @@ final class CaptureWindowController: NSWindowController {
 
     private func fileExploreContentKind(for fileURL: URL) -> String {
         let ext = fileURL.pathExtension.lowercased()
+        if ext == "ipynb" {
+            return "jupyter"
+        }
         if ext == "md" || ext == "markdown" || ext == "mdown" {
             return "markdown"
         }
@@ -1027,6 +1054,157 @@ final class CaptureWindowController: NSWindowController {
         }
         let lossy = String(decoding: data, as: UTF8.self)
         return lossy.isEmpty ? nil : lossy
+    }
+
+    private func parseJupyterNotebookForPreview(from data: Data) -> String? {
+        guard
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let cells = root["cells"] as? [[String: Any]]
+        else {
+            return nil
+        }
+
+        let metadata = root["metadata"] as? [String: Any]
+        let defaultLanguage = detectNotebookLanguage(from: metadata) ?? "python"
+        var sections: [String] = []
+
+        for (index, cell) in cells.enumerated() {
+            let cellType = ((cell["cell_type"] as? String) ?? "raw").lowercased()
+            sections.append("### Cell \(index + 1) - \(cellType)")
+            sections.append("")
+
+            switch cellType {
+            case "markdown":
+                let markdown = notebookJoinedText(from: cell["source"])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                sections.append(markdown.isEmpty ? "_(empty markdown cell)_" : markdown)
+            case "code":
+                let code = notebookJoinedText(from: cell["source"])
+                let language = detectNotebookCodeLanguage(for: cell, fallback: defaultLanguage)
+                sections.append("```\(language)")
+                sections.append(code)
+                sections.append("```")
+
+                let outputMarkdown = notebookOutputMarkdown(from: cell["outputs"])
+                if !outputMarkdown.isEmpty {
+                    sections.append("")
+                    sections.append("**Output**")
+                    sections.append("")
+                    sections.append(outputMarkdown)
+                }
+            default:
+                let raw = notebookJoinedText(from: cell["source"])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                sections.append(raw.isEmpty ? "_(empty raw cell)_" : "```text\n\(raw)\n```")
+            }
+
+            if index < cells.count - 1 {
+                sections.append("")
+                sections.append("---")
+                sections.append("")
+            }
+        }
+
+        if sections.isEmpty {
+            return "Notebook has no cells."
+        }
+
+        var header: [String] = ["# Jupyter Notebook"]
+        if let language = detectNotebookLanguage(from: metadata), !language.isEmpty {
+            header.append("_Default language: `\(language)`_")
+        }
+        header.append("")
+        return header.joined(separator: "\n") + sections.joined(separator: "\n")
+    }
+
+    private func detectNotebookLanguage(from metadata: [String: Any]?) -> String? {
+        guard let metadata else { return nil }
+        if
+            let kernelspec = metadata["kernelspec"] as? [String: Any],
+            let language = kernelspec["language"] as? String,
+            !language.isEmpty
+        {
+            return language
+        }
+        if
+            let languageInfo = metadata["language_info"] as? [String: Any],
+            let language = languageInfo["name"] as? String,
+            !language.isEmpty
+        {
+            return language
+        }
+        return nil
+    }
+
+    private func detectNotebookCodeLanguage(for cell: [String: Any], fallback: String) -> String {
+        guard let metadata = cell["metadata"] as? [String: Any] else { return fallback }
+        if
+            let vscode = metadata["vscode"] as? [String: Any],
+            let languageID = vscode["languageId"] as? String,
+            !languageID.isEmpty
+        {
+            return languageID
+        }
+        if let language = metadata["language"] as? String, !language.isEmpty {
+            return language
+        }
+        return fallback
+    }
+
+    private func notebookJoinedText(from value: Any?) -> String {
+        if let text = value as? String {
+            return text
+        }
+        if let lines = value as? [String] {
+            return lines.joined()
+        }
+        if let values = value as? [Any] {
+            return values.compactMap { $0 as? String }.joined()
+        }
+        return ""
+    }
+
+    private func notebookOutputMarkdown(from value: Any?) -> String {
+        guard let outputs = value as? [[String: Any]], !outputs.isEmpty else { return "" }
+        var rendered: [String] = []
+
+        for output in outputs {
+            if let data = output["data"] as? [String: Any] {
+                let markdown = truncatedNotebookText(notebookJoinedText(from: data["text/markdown"]))
+                if !markdown.isEmpty {
+                    rendered.append(markdown)
+                    continue
+                }
+            }
+
+            var plain = ""
+            if let traceback = output["traceback"] as? [String], !traceback.isEmpty {
+                plain = traceback.joined(separator: "\n")
+            } else if let errorName = output["ename"] as? String, let errorValue = output["evalue"] as? String {
+                plain = "\(errorName): \(errorValue)"
+            } else if let text = output["text"] {
+                plain = notebookJoinedText(from: text)
+            } else if let data = output["data"] as? [String: Any] {
+                plain = notebookJoinedText(from: data["text/plain"])
+                if plain.isEmpty {
+                    plain = notebookJoinedText(from: data["application/json"])
+                }
+            }
+
+            plain = truncatedNotebookText(plain)
+            if !plain.isEmpty {
+                rendered.append("```text\n\(plain)\n```")
+            }
+        }
+
+        return rendered.joined(separator: "\n\n")
+    }
+
+    private func truncatedNotebookText(_ text: String, limit: Int = 6000) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+        let end = trimmed.index(trimmed.startIndex, offsetBy: limit)
+        return String(trimmed[..<end]) + "\n...(truncated)..."
     }
 
     private func isLikelyBinaryFileData(_ data: Data) -> Bool {
@@ -1230,7 +1408,9 @@ final class CaptureWindowController: NSWindowController {
     @objc private func startOpencodeTapped() {
         let sourceDir = normalizedPathInput(opencodeSourceDirField.stringValue)
         let workingDir = normalizedPathInput(opencodeWorkingDirField.stringValue)
-        let initialPrompt = opencodeInitialPromptTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let initialPromptRaw = opencodeInitialPromptTextView.string
+        let initialPrompt = initialPromptRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(initialPromptRaw, forKey: opencodeInitialPromptDefaultsKey)
         guard !sourceDir.isEmpty, !workingDir.isEmpty else {
             setOpencodeStatus("Please enter both source dir and working dir.", isError: true)
             return
@@ -1638,74 +1818,63 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func switchStreamingAssistantMessage(to messageID: String) {
-        if opencodeStreamingAssistantMessageID == messageID {
+        if opencodeStreamingAssistantMessageID != messageID {
+            opencodeStreamingAssistantMessageID = messageID
+            opencodeStreamingAssistantText = ""
+            opencodeToolStatusByPartID.removeAll(keepingCapacity: true)
+        }
+        if let existingEntryID = opencodeStreamingEntryIDByMessageID[messageID] {
+            opencodeCurrentStreamingEntryID = existingEntryID
             return
         }
-        opencodeStreamingAssistantMessageID = messageID
-        opencodeStreamingAssistantText = ""
-        opencodeStreamingAssistantRange = nil
-        opencodeToolStatusByPartID.removeAll(keepingCapacity: true)
+        let entryID = opencodeNextStreamingEntryID
+        opencodeNextStreamingEntryID += 1
+        opencodeStreamingEntryIDByMessageID[messageID] = entryID
+        opencodeCurrentStreamingEntryID = entryID
+        startOpencodeStreamingEntry(entryID: entryID, header: "Opencode")
     }
 
     private func appendStreamingAssistantDelta(_ delta: String) {
         guard !delta.isEmpty else { return }
         opencodeStreamingAssistantText += delta
-        renderStreamingAssistantBubble()
+        guard let entryID = opencodeCurrentStreamingEntryID else { return }
+        appendOpencodeStreamingChunk(entryID: entryID, text: delta)
     }
 
     private func updateStreamingAssistantFullText(_ text: String) {
+        guard let entryID = opencodeCurrentStreamingEntryID else { return }
         let normalized = stripANSI(text)
         if normalized.count < opencodeStreamingAssistantText.count, !opencodeStreamingAssistantText.isEmpty {
             return
         }
-        opencodeStreamingAssistantText = normalized
-        renderStreamingAssistantBubble()
-    }
-
-    private func renderStreamingAssistantBubble() {
-        let display = cleanOpencodeAssistantText(opencodeStreamingAssistantText)
-        guard !display.isEmpty else { return }
-        guard let storage = opencodeChatTextView?.textStorage else { return }
-
-        let headerStyle = NSMutableParagraphStyle()
-        headerStyle.alignment = .left
-        headerStyle.paragraphSpacing = 2
-
-        let bubbleStyle = NSMutableParagraphStyle()
-        bubbleStyle.alignment = .left
-        bubbleStyle.lineSpacing = 1.5
-        bubbleStyle.paragraphSpacing = 12
-
-        let headerAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: headerStyle
-        ]
-        let bodyAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13),
-            .foregroundColor: NSColor.labelColor,
-            .backgroundColor: NSColor.controlBackgroundColor,
-            .paragraphStyle: bubbleStyle
-        ]
-        let bodyText = "  \(display)  \n\n"
-
-        if let range = opencodeStreamingAssistantRange {
-            let replacement = NSAttributedString(string: bodyText, attributes: bodyAttributes)
-            storage.replaceCharacters(in: range, with: replacement)
-            opencodeStreamingAssistantRange = NSRange(location: range.location, length: replacement.length)
-        } else {
-            storage.append(NSAttributedString(string: "Opencode\n", attributes: headerAttributes))
-            let start = storage.length
-            let body = NSAttributedString(string: bodyText, attributes: bodyAttributes)
-            storage.append(body)
-            opencodeStreamingAssistantRange = NSRange(location: start, length: body.length)
+        if normalized.hasPrefix(opencodeStreamingAssistantText) {
+            let delta = String(normalized.dropFirst(opencodeStreamingAssistantText.count))
+            if !delta.isEmpty {
+                appendOpencodeStreamingChunk(entryID: entryID, text: delta)
+            }
+            opencodeStreamingAssistantText = normalized
+            return
         }
-        scrollOpencodeChatToBottom()
+        if opencodeStreamingAssistantText.isEmpty {
+            opencodeStreamingAssistantText = normalized
+            if !normalized.isEmpty {
+                appendOpencodeStreamingChunk(entryID: entryID, text: normalized)
+            }
+            return
+        }
+        opencodeStreamingAssistantText = normalized
+        finalizeOpencodeStreamingEntry(entryID: entryID, markdown: cleanOpencodeAssistantText(normalized))
     }
 
     private func finishOpencodeStreamingSuccessfully(isInitialStart: Bool, sessionID: String) {
         stopOpencodeEventStream()
         setOpencodeBusy(false)
+        if let entryID = opencodeCurrentStreamingEntryID {
+            let finalMarkdown = cleanOpencodeAssistantText(opencodeStreamingAssistantText)
+            if !finalMarkdown.isEmpty {
+                finalizeOpencodeStreamingEntry(entryID: entryID, markdown: finalMarkdown)
+            }
+        }
         if isInitialStart {
             setOpencodeStatus("Session started: \(sessionID)", isError: false)
         } else {
@@ -1724,7 +1893,8 @@ final class CaptureWindowController: NSWindowController {
     private func resetOpencodeStreamingState() {
         opencodeStreamingAssistantMessageID = nil
         opencodeStreamingAssistantText = ""
-        opencodeStreamingAssistantRange = nil
+        opencodeStreamingEntryIDByMessageID.removeAll(keepingCapacity: false)
+        opencodeCurrentStreamingEntryID = nil
         opencodeToolStatusByPartID.removeAll(keepingCapacity: false)
     }
 
@@ -2095,40 +2265,58 @@ final class CaptureWindowController: NSWindowController {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard role == "You" || role == "Opencode" else { return }
-        guard let storage = opencodeChatTextView?.textStorage else { return }
-
-        let isUser = role == "You"
-
-        let headerStyle = NSMutableParagraphStyle()
-        headerStyle.alignment = isUser ? .right : .left
-        headerStyle.paragraphSpacing = 2
-
-        let bubbleStyle = NSMutableParagraphStyle()
-        bubbleStyle.alignment = isUser ? .right : .left
-        bubbleStyle.lineSpacing = 1.5
-        bubbleStyle.paragraphSpacing = 12
-
-        let headerAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: headerStyle
-        ]
-
-        let bodyAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13),
-            .foregroundColor: isUser ? NSColor.white : NSColor.labelColor,
-            .backgroundColor: isUser ? NSColor.systemBlue : NSColor.controlBackgroundColor,
-            .paragraphStyle: bubbleStyle
-        ]
-
-        storage.append(NSAttributedString(string: "\(role)\n", attributes: headerAttributes))
-        storage.append(NSAttributedString(string: "  \(trimmed)  \n\n", attributes: bodyAttributes))
-        scrollOpencodeChatToBottom()
+        appendOpencodeChatEntry(header: role, markdown: trimmed, isError: false)
     }
 
-    private func scrollOpencodeChatToBottom() {
-        guard let storage = opencodeChatTextView?.textStorage else { return }
-        opencodeChatTextView.scrollRangeToVisible(NSRange(location: storage.length, length: 0))
+    private func appendOpencodeChatEntry(header: String, markdown: String, isError: Bool) {
+        opencodePendingChatEntries.append((header, markdown, isError))
+        flushOpencodePendingChatEntries()
+    }
+
+    private func flushOpencodePendingChatEntries() {
+        guard opencodeChatPageReady, !opencodePendingChatEntries.isEmpty else { return }
+        for item in opencodePendingChatEntries {
+            guard let hJS = jsLiteral(item.header), let bJS = jsLiteral(item.body) else { continue }
+            let js = "appendEntry(\(hJS), \(bJS), \(item.isError ? "true" : "false"))"
+            runOpencodeChatJavaScript(js)
+        }
+        opencodePendingChatEntries.removeAll()
+        flushOpencodePendingChatScripts()
+    }
+
+    private func startOpencodeStreamingEntry(entryID: Int, header: String) {
+        guard let hJS = jsLiteral(header) else { return }
+        let js = "startStreamingEntry(\(hJS), null, \(entryID))"
+        runOpencodeChatJavaScript(js)
+    }
+
+    private func appendOpencodeStreamingChunk(entryID: Int, text: String) {
+        guard !text.isEmpty, let tJS = jsLiteral(text) else { return }
+        let js = "appendStreamingChunk(\(entryID), \(tJS))"
+        runOpencodeChatJavaScript(js)
+    }
+
+    private func finalizeOpencodeStreamingEntry(entryID: Int, markdown: String) {
+        guard let mdJS = jsLiteral(markdown) else { return }
+        let js = "endStreamingEntry(\(entryID), \(mdJS))"
+        runOpencodeChatJavaScript(js)
+    }
+
+    private func runOpencodeChatJavaScript(_ js: String) {
+        guard opencodeChatPageReady else {
+            opencodePendingChatScripts.append(js)
+            return
+        }
+        opencodeChatWebView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    private func flushOpencodePendingChatScripts() {
+        guard opencodeChatPageReady, !opencodePendingChatScripts.isEmpty else { return }
+        let scripts = opencodePendingChatScripts
+        opencodePendingChatScripts.removeAll()
+        for js in scripts {
+            opencodeChatWebView.evaluateJavaScript(js, completionHandler: nil)
+        }
     }
 
     private func setOpencodeBusy(_ busy: Bool) {
@@ -2165,6 +2353,7 @@ final class CaptureWindowController: NSWindowController {
         audioTextView.textStorage?.setAttributedString(NSAttributedString())
         transcriptBuffer = ""
         lastSentTranscript = ""
+        pendingTranscriptCharsSinceLastSend = 0
     }
 
     @objc private func clearAudioAI() {
@@ -2400,7 +2589,7 @@ final class CaptureWindowController: NSWindowController {
             return;
           }
 
-          if (kind === 'markdown' && typeof marked !== 'undefined' && marked.parse) {
+          if ((kind === 'markdown' || kind === 'jupyter') && typeof marked !== 'undefined' && marked.parse) {
             root.innerHTML = marked.parse(content);
             normalizeMarkdownHtml(root);
             highlightBlocks(root);
@@ -2573,6 +2762,19 @@ final class CaptureWindowController: NSWindowController {
         white-space: pre-line;
       }
 
+      .entry-card {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin: 10px 0;
+      }
+      .entry-user {
+        background: rgba(10,132,255,0.10);
+      }
+      .entry-opencode {
+        background: rgba(142,142,147,0.10);
+      }
+
       .entry-thumbnail {
         max-width: 280px;
         max-height: 160px;
@@ -2639,6 +2841,15 @@ final class CaptureWindowController: NSWindowController {
         div.textContent = s;
         return div.innerHTML;
       }
+
+      function applyRoleStyle(entry, header) {
+        var normalized = (header || '').trim().toLowerCase();
+        if (normalized === 'you') {
+          entry.classList.add('entry-card', 'entry-user');
+        } else if (normalized === 'opencode') {
+          entry.classList.add('entry-card', 'entry-opencode');
+        }
+      }
       function startStreamingEntry(header, imageDataURL, entryId) {
         try {
           var feed = document.getElementById('feed');
@@ -2649,6 +2860,7 @@ final class CaptureWindowController: NSWindowController {
             feed.appendChild(hr);
           }
           var entry = document.createElement('div');
+          applyRoleStyle(entry, header);
           entry.dataset.entryId = String(entryId);
           var hdr = document.createElement('div');
           hdr.className = 'entry-header';
@@ -2769,6 +2981,7 @@ final class CaptureWindowController: NSWindowController {
             feed.appendChild(hr);
           }
           var entry = document.createElement('div');
+          applyRoleStyle(entry, header);
           var hdr = document.createElement('div');
           hdr.className = 'entry-header';
           hdr.textContent = header;

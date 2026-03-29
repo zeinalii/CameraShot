@@ -382,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Wire the Ask AI button + interval timer
         captureCtrl?.audioAITokenLimit = config.transcriptTokenLimit
         captureCtrl?.onAudioAIRequest = { [weak proc] transcript in
-            proc?.query(transcript: transcript)
+            proc?.query(transcript: transcript) ?? false
         }
         captureCtrl?.startAudioAITimer()
     }
