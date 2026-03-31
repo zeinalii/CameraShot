@@ -327,6 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.aiPaused = false
                 self?.voiceCtrl?.stop(); self?.voiceCtrl = nil
                 self?.audioAIProc = nil
+                self?.captureCtrl = nil
                 self?.configureResponseFlow(enabled: false)
                 self?.showSetup()
                 NSApp.activate(ignoringOtherApps: true)
@@ -354,18 +355,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Transcription controller
         let vc = TranscriptionController(config: config)
-        vc.onTranscript = { text, _ in
-            (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendTranscript(text)
+        let captureWindow = captureCtrl
+        vc.onTranscript = { [weak captureWindow] text, _ in
+            captureWindow?.appendTranscript(text)
         }
-        vc.onError = { msg in
-            (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendAudioError(msg)
+        vc.onError = { [weak captureWindow] msg in
+            captureWindow?.appendAudioError(msg)
         }
         voiceCtrl = vc
         Task { [weak vc] in
             do { try await vc?.start() }
             catch {
                 await MainActor.run {
-                    (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendAudioError(
+                    captureWindow?.appendAudioError(
                         "Voice setup failed: \(error.localizedDescription)")
                 }
             }
@@ -374,9 +376,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Audio AI processor — requires Anthropic key
         guard let apiKey = sessionAPIKey, !apiKey.isEmpty else { return }
         let proc = AudioAIProcessor(apiKey: apiKey, systemPrompt: config.audioAIPrompt)
-        proc.onChunk = { chunk in (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendAudioAIChunk(chunk) }
-        proc.onDone  = { (NSApp.delegate as? AppDelegate)?.captureCtrl?.finalizeAudioAI() }
-        proc.onError = { msg in (NSApp.delegate as? AppDelegate)?.captureCtrl?.appendAudioAIError(msg) }
+        proc.onChunk = { [weak captureWindow] chunk in captureWindow?.appendAudioAIChunk(chunk) }
+        proc.onDone  = { [weak captureWindow] in captureWindow?.finalizeAudioAI() }
+        proc.onError = { [weak captureWindow] msg in captureWindow?.appendAudioAIError(msg) }
         audioAIProc = proc
 
         // Wire the Ask AI button + interval timer
@@ -409,6 +411,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.aiProcessor = nil
             self?.aiPaused = false
             self?.voiceCtrl?.stop(); self?.voiceCtrl = nil
+            self?.audioAIProc = nil
+            self?.captureCtrl = nil
             self?.configureResponseFlow(enabled: false)
             self?.showSetup()
             NSApp.activate(ignoringOtherApps: true)

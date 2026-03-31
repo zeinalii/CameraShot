@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import ImageIO
 import WebKit
 
 // MARK: - CaptureWindowController
@@ -9,8 +10,11 @@ final class CaptureWindowController: NSWindowController {
     // MARK: – AI
 
     private var webView: WKWebView!
+    private let visualBridge = WebViewBatchBridge(label: "visual")
     private var aiPageReady = false
     private var pendingEntries: [(header: String, body: String, isError: Bool)] = []
+    private var visualPendingChunksByEntryID: [Int: String] = [:]
+    private var visualChunkFlushWorkItem: DispatchWorkItem?
     private weak var spinner:  NSProgressIndicator!
     private weak var aiStatus: NSTextField!
     private weak var countLabel: NSTextField!
@@ -66,6 +70,7 @@ final class CaptureWindowController: NSWindowController {
     private weak var opencodeSendField: NSTextField!
     private weak var opencodeSendButton: NSButton!
     private var opencodeChatWebView: WKWebView!
+    private let opencodeBridge = WebViewBatchBridge(label: "opencode")
     private var opencodeChatPageReady = false
     private var opencodePendingChatEntries: [(header: String, body: String, isError: Bool)] = []
     private var opencodePendingChatScripts: [String] = []
@@ -81,6 +86,11 @@ final class CaptureWindowController: NSWindowController {
     private var opencodeCurrentStreamingEntryID: Int?
     private var opencodeNextStreamingEntryID = 0
     private var opencodeToolStatusByPartID: [String: String] = [:]
+    private var opencodePendingStreamingChunksByEntryID: [Int: String] = [:]
+    private var opencodeChunkFlushWorkItem: DispatchWorkItem?
+    private var opencodeStreamTimeoutWorkItem: DispatchWorkItem?
+    private var opencodePerfEventCount = 0
+    private var opencodePerfLastLogAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
     private var opencodeSourceScopeURL: URL?
     private var opencodeWorkingScopeURL: URL?
     private let opencodeInitialPromptDefaultsKey = "opencode.initialPrompt"
@@ -91,28 +101,40 @@ final class CaptureWindowController: NSWindowController {
     private weak var fileExploreOutlineView: NSOutlineView!
     private weak var fileExploreSidebarScrollView: NSScrollView!
     private var fileExplorePreviewWebView: WKWebView!
+    private let fileExploreBridge = WebViewBatchBridge(label: "fileExplore")
     private weak var fileExploreZoomOutButton: NSButton!
     private weak var fileExploreZoomInButton: NSButton!
     private var fileExplorePreviewReady = false
     private var fileExploreRootNode: FileExploreNode?
+    private var fileExploreNodeByPath: [String: FileExploreNode] = [:]
     private var fileExploreCurrentRootURL: URL?
     private var fileExplorePendingRender: (kind: String, content: String)?
+    private var fileExploreWatcher = FileExploreWatcher()
+    private var fileExploreChangeDebounceWorkItem: DispatchWorkItem?
     private var fileExploreRealtimeRefreshTimer: Timer?
-    private var fileExploreTreeSnapshot: [String: FileExploreTreeSnapshotEntry] = [:]
+    private var fileExploreWatcherActive = false
+    private var fileExploreIconCache: [String: NSImage] = [:]
+    private let fileExplorePreviewQueue = DispatchQueue(label: "camerashot.file-explore-preview", qos: .userInitiated)
+    private var fileExplorePreviewToken = 0
     private var fileExploreSelectedFileURL: URL?
     private var fileExploreSelectedFingerprint: String?
+    private let fileExplorePreviewMaxBytes = 1_500_000
 
     // Transcript feed
     private weak var audioScrollView: NSScrollView!
     private var audioTextView:        NSTextView!   // strong (inside scrollview)
     private var transcriptBuffer:     String = ""   // last N chars for Audio AI
+    private let transcriptDisplayCharLimit = 200_000
 
     // Audio AI feed
     private var audioAIWebView:      WKWebView!     // strong
+    private let audioAIBridge = WebViewBatchBridge(label: "audioAI")
     private var audioAIPageReady     = false
     private var audioAINextEntryId   = 0
     private var audioAICurrentEntry: Int?           // nil = no active streaming entry
     private var audioAIStreamingText = ""
+    private var audioAIPendingChunksByEntryID: [Int: String] = [:]
+    private var audioAIChunkFlushWorkItem: DispatchWorkItem?
 
     // Audio AI callbacks / timer
     var onAudioAIRequest: ((String) -> Bool)?
@@ -146,6 +168,14 @@ final class CaptureWindowController: NSWindowController {
 
     deinit {
         audioAITimer?.invalidate()
+        visualChunkFlushWorkItem?.cancel()
+        audioAIChunkFlushWorkItem?.cancel()
+        opencodeChunkFlushWorkItem?.cancel()
+        fileExploreChangeDebounceWorkItem?.cancel()
+        visualBridge.clear()
+        audioAIBridge.clear()
+        opencodeBridge.clear()
+        fileExploreBridge.clear()
         stopOpencodeEventStream()
         stopFileExploreRealtimeRefresh()
         opencodeSourceScopeURL?.stopAccessingSecurityScopedResource()
@@ -155,10 +185,13 @@ final class CaptureWindowController: NSWindowController {
     /// Call this once voice input is confirmed enabled to start the auto-trigger timer.
     func startAudioAITimer() {
         audioAITimer?.invalidate()
-        audioAITimer = Timer.scheduledTimer(withTimeInterval: captureInterval,
-                                            repeats: true) { [weak self] _ in
+        let interval = max(0.5, captureInterval)
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             self?.triggerAudioAI()
         }
+        timer.tolerance = min(0.4, interval * 0.25)
+        RunLoop.main.add(timer, forMode: .common)
+        audioAITimer = timer
     }
 
     @available(*, unavailable)
@@ -188,9 +221,9 @@ final class CaptureWindowController: NSWindowController {
     func appendStreamingChunk(_ chunk: String, imageURL: URL) {
         DispatchQueue.main.async { [weak self] in
             guard let self,
-                  let entryId = entryIdByImageURL[imageURL],
-                  let js = jsLiteral(chunk) else { return }
-            webView.evaluateJavaScript("appendStreamingChunk(\(entryId), \(js))", completionHandler: nil)
+                  let entryId = entryIdByImageURL[imageURL] else { return }
+            visualPendingChunksByEntryID[entryId, default: ""] += chunk
+            scheduleVisualChunkFlush()
         }
     }
 
@@ -199,8 +232,9 @@ final class CaptureWindowController: NSWindowController {
             guard let self else { return }
             pendingCount = max(0, pendingCount - 1)
             guard let entryId = entryIdByImageURL.removeValue(forKey: imageURL) else { return }
+            flushVisualStreamingChunks(for: entryId)
             guard let js = jsLiteral(fullMarkdown) else { return }
-            webView.evaluateJavaScript("endStreamingEntry(\(entryId), \(js))", completionHandler: nil)
+            visualBridge.enqueue("endStreamingEntry(\(entryId), \(js))", immediate: true)
         }
     }
 
@@ -215,7 +249,8 @@ final class CaptureWindowController: NSWindowController {
             if let imageURL,
                let entryId = entryIdByImageURL.removeValue(forKey: imageURL),
                let js = jsLiteral(message) {
-                webView.evaluateJavaScript("endStreamingEntryAsError(\(entryId), \(js))", completionHandler: nil)
+                flushVisualStreamingChunks(for: entryId)
+                visualBridge.enqueue("endStreamingEntryAsError(\(entryId), \(js))", immediate: true)
                 return
             }
             let header = "[\(Self.timeString())]  Error"
@@ -229,18 +264,29 @@ final class CaptureWindowController: NSWindowController {
     func appendTranscript(_ text: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self, let ts = audioTextView.textStorage else { return }
+            let started = CapturePerf.begin()
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 13),
                 .foregroundColor: NSColor.labelColor,
             ]
             ts.append(NSAttributedString(string: text + "\n", attributes: attrs))
+            if ts.length > transcriptDisplayCharLimit * 2 {
+                let target = transcriptDisplayCharLimit
+                let removeCount = max(0, ts.length - target)
+                if removeCount > 0 {
+                    ts.deleteCharacters(in: NSRange(location: 0, length: removeCount))
+                }
+            }
             transcriptBuffer += text + "\n"
             pendingTranscriptCharsSinceLastSend += text.count + 1
             let cap = audioAITokenLimit * 4
             if transcriptBuffer.count > cap * 2 {
                 transcriptBuffer = String(transcriptBuffer.suffix(cap))
             }
-            scrollAudioToBottom()
+            if activeContentTab == ContentTab.transcript.rawValue {
+                scrollAudioToBottom()
+            }
+            CapturePerf.end(started, "transcript.append", details: "chars=\(text.count)")
         }
     }
 
@@ -260,16 +306,13 @@ final class CaptureWindowController: NSWindowController {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let header = "[\(Self.timeString())]\n…\(preview)"
                 if let hJS = jsLiteral(header) {
-                    audioAIWebView.evaluateJavaScript(
-                        "startStreamingEntry(\(hJS), null, \(entryId))",
-                        completionHandler: nil)
+                    audioAIBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
                 }
             }
-            guard let entryId = audioAICurrentEntry, let tJS = jsLiteral(text) else { return }
+            guard let entryId = audioAICurrentEntry else { return }
             audioAIStreamingText += text
-            audioAIWebView.evaluateJavaScript(
-                "appendStreamingChunk(\(entryId), \(tJS))",
-                completionHandler: nil)
+            audioAIPendingChunksByEntryID[entryId, default: ""] += text
+            scheduleAudioAIChunkFlush()
         }
     }
 
@@ -278,9 +321,8 @@ final class CaptureWindowController: NSWindowController {
         DispatchQueue.main.async { [weak self] in
             guard let self, let entryId = audioAICurrentEntry,
                   let mdJS = jsLiteral(audioAIStreamingText) else { return }
-            audioAIWebView.evaluateJavaScript(
-                "endStreamingEntry(\(entryId), \(mdJS))",
-                completionHandler: nil)
+            flushAudioAIStreamingChunks(for: entryId)
+            audioAIBridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))", immediate: true)
             audioAICurrentEntry = nil
             audioAIStreamingText = ""
         }
@@ -292,25 +334,23 @@ final class CaptureWindowController: NSWindowController {
             guard let self, audioAIPageReady else { return }
             // Close any open entry first
             if let entryId = audioAICurrentEntry, let mdJS = jsLiteral(audioAIStreamingText) {
-                audioAIWebView.evaluateJavaScript(
-                    "endStreamingEntry(\(entryId), \(mdJS))", completionHandler: nil)
+                flushAudioAIStreamingChunks(for: entryId)
+                audioAIBridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))")
                 audioAICurrentEntry = nil; audioAIStreamingText = ""
             }
             let entryId = audioAINextEntryId; audioAINextEntryId += 1
             let header = "[\(Self.timeString())]"
             if let hJS = jsLiteral(header) {
-                audioAIWebView.evaluateJavaScript(
-                    "startStreamingEntry(\(hJS), null, \(entryId))", completionHandler: nil)
+                audioAIBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
             }
             if let errJS = jsLiteral("⚠ \(message)") {
-                audioAIWebView.evaluateJavaScript(
-                    "endStreamingEntry(\(entryId), \(errJS))", completionHandler: nil)
+                audioAIBridge.enqueue("endStreamingEntry(\(entryId), \(errJS))", immediate: true)
             }
         }
     }
 
-    @objc private func audioAIZoomIn()  { audioAIWebView.evaluateJavaScript("adjustZoom(1)",  completionHandler: nil) }
-    @objc private func audioAIZoomOut() { audioAIWebView.evaluateJavaScript("adjustZoom(-1)", completionHandler: nil) }
+    @objc private func audioAIZoomIn()  { audioAIBridge.enqueue("adjustZoom(1)", immediate: true) }
+    @objc private func audioAIZoomOut() { audioAIBridge.enqueue("adjustZoom(-1)", immediate: true) }
 
     @objc private func askAITapped() { triggerAudioAI(force: true) }
 
@@ -327,6 +367,7 @@ final class CaptureWindowController: NSWindowController {
         guard force || lastSentTranscript.isEmpty || growthRatio >= 0.03 else { return }
 
         guard onAudioAIRequest?(current) == true else { return }
+        CapturePerf.log("audioAI.request sent chars=\(current.count) growthRatio=\(String(format: "%.3f", growthRatio)) force=\(force ? 1 : 0)")
         lastSentTranscript = current
         pendingTranscriptCharsSinceLastSend = 0
     }
@@ -340,7 +381,9 @@ final class CaptureWindowController: NSWindowController {
                 attributes: [.font: NSFont.systemFont(ofSize: 12),
                              .foregroundColor: NSColor.systemRed])
             audioTextView.textStorage?.append(attrStr)
-            scrollAudioToBottom()
+            if activeContentTab == ContentTab.transcript.rawValue {
+                scrollAudioToBottom()
+            }
         }
     }
 
@@ -480,6 +523,7 @@ final class CaptureWindowController: NSWindowController {
         wv.layer?.backgroundColor = NSColor.clear.cgColor
         wv.navigationDelegate = self
         webView = wv
+        visualBridge.attach(webView: wv)
 
         // ── Transcript feed ────────────────────────────────────────
         let tv = NSTextView()
@@ -517,6 +561,7 @@ final class CaptureWindowController: NSWindowController {
         aiWV.layer?.backgroundColor = NSColor.clear.cgColor
         aiWV.isHidden = true
         audioAIWebView = aiWV
+        audioAIBridge.attach(webView: aiWV)
 
         // ── Opencode tab content ───────────────────────────────────
         let opencodeView = NSView()
@@ -594,6 +639,7 @@ final class CaptureWindowController: NSWindowController {
         opencodeChatView.wantsLayer = true
         opencodeChatView.layer?.backgroundColor = NSColor.clear.cgColor
         opencodeChatWebView = opencodeChatView
+        opencodeBridge.attach(webView: opencodeChatView)
 
         let sendField = NSTextField(string: "")
         sendField.placeholderString = "Send follow-up message"
@@ -678,6 +724,7 @@ final class CaptureWindowController: NSWindowController {
         filePreviewWebView.wantsLayer = true
         filePreviewWebView.layer?.backgroundColor = NSColor.clear.cgColor
         fileExplorePreviewWebView = filePreviewWebView
+        fileExploreBridge.attach(webView: filePreviewWebView)
 
         fileExploreSplitView.addArrangedSubview(sidebarScroll)
         fileExploreSplitView.addArrangedSubview(filePreviewWebView)
@@ -912,7 +959,14 @@ final class CaptureWindowController: NSWindowController {
         audioAIAskBtn.isHidden     = !isAudioAI
 
         if isFileExplore, let rootURL = fileExploreCurrentRootURL {
-            rebuildFileExploreRoot(at: rootURL, preserveState: true)
+            if fileExploreRootNode?.url != rootURL {
+                rebuildFileExploreRoot(at: rootURL, preserveState: true)
+            } else {
+                scheduleFileExploreDebouncedRefresh(reason: "tab-switch")
+            }
+        }
+        if isTranscript {
+            scrollAudioToBottom()
         }
         updateFileExploreRealtimeRefreshState()
     }
@@ -933,20 +987,21 @@ final class CaptureWindowController: NSWindowController {
         fileExploreCurrentRootURL = rootURL
         fileExploreRootLabel?.stringValue = "working dir: \(rootURL.path)"
         rebuildFileExploreRoot(at: rootURL, preserveState: false)
-        fileExploreTreeSnapshot = captureFileExploreTreeSnapshot(at: rootURL)
-        stopFileExploreRealtimeRefresh()
         let segment = ensureFileExploreTabVisible()
         contentTabControl.selectedSegment = segment
         contentTabChanged()
     }
 
     private func rebuildFileExploreRoot(at rootURL: URL, preserveState: Bool) {
+        let started = CapturePerf.begin()
         fileExploreCurrentRootURL = rootURL.standardizedFileURL
         let expandedURLs = preserveState ? expandedFileExploreDirectoryURLs() : []
         let previouslySelected = preserveState ? fileExploreSelectedFileURL : nil
 
         let root = FileExploreNode(url: rootURL, isDirectory: true)
         fileExploreRootNode = root
+        fileExploreNodeByPath.removeAll(keepingCapacity: false)
+        fileExploreNodeByPath[rootURL.path] = root
         loadFileExploreChildrenIfNeeded(for: root)
         fileExploreOutlineView?.reloadData()
 
@@ -962,75 +1017,41 @@ final class CaptureWindowController: NSWindowController {
         fileExploreSelectedFileURL = nil
         fileExploreSelectedFingerprint = nil
         renderFileExploreDocument(kind: "text", content: "Select a file from the sidebar.")
+        CapturePerf.end(started, "fileExplore.rebuildRoot", details: "preserve=\(preserveState ? 1 : 0)")
     }
 
     private func loadFileExploreChildrenIfNeeded(for node: FileExploreNode) {
         guard node.isDirectory, !node.isLoaded else { return }
-        node.isLoaded = true
-
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .localizedNameKey]
-        do {
-            let urls = try FileManager.default.contentsOfDirectory(
-                at: node.url,
-                includingPropertiesForKeys: Array(keys),
-                options: [.skipsPackageDescendants]
-            )
-            let children = urls.compactMap { childURL -> FileExploreNode? in
-                let values = try? childURL.resourceValues(forKeys: keys)
-                let isDir = values?.isDirectory ?? false
-                let child = FileExploreNode(url: childURL.standardizedFileURL, isDirectory: isDir)
-                child.parent = node
-                return child
-            }
-            node.children = children.sorted {
-                if $0.isDirectory != $1.isDirectory {
-                    return $0.isDirectory && !$1.isDirectory
-                }
-                return $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending
-            }
-        } catch {
-            node.children = []
-        }
+        refreshFileExploreDirectory(node, reloadIfNeeded: true)
     }
 
     private func previewFileExploreFile(at fileURL: URL) {
         let standardizedURL = fileURL.standardizedFileURL
         fileExploreSelectedFileURL = standardizedURL
-        do {
-            let data = try Data(contentsOf: standardizedURL)
-            if isLikelyBinaryFileData(data) {
-                fileExploreSelectedFingerprint = nil
-                renderFileExploreDocument(kind: "text", content: "Cannot preview binary file: \(standardizedURL.lastPathComponent)")
-                updateFileExploreRealtimeRefreshState()
-                return
-            }
-            let kind = fileExploreContentKind(for: standardizedURL)
-            if kind == "jupyter" {
-                if let notebookMarkdown = parseJupyterNotebookForPreview(from: data) {
-                    fileExploreSelectedFingerprint = fileExploreFingerprint(for: standardizedURL)
-                    renderFileExploreDocument(kind: "jupyter", content: notebookMarkdown)
-                    updateFileExploreRealtimeRefreshState()
-                    return
+        fileExplorePreviewToken += 1
+        let token = fileExplorePreviewToken
+        let kind = fileExploreContentKind(for: standardizedURL)
+        let started = CapturePerf.begin()
+
+        fileExplorePreviewQueue.async { [weak self] in
+            guard let self else { return }
+            let result = self.buildFileExplorePreview(for: standardizedURL, kind: kind)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard token == fileExplorePreviewToken else { return }
+                guard fileExploreSelectedFileURL == standardizedURL else { return }
+
+                switch result {
+                case .success(let payload):
+                    fileExploreSelectedFingerprint = payload.fingerprint
+                    renderFileExploreDocument(kind: payload.kind, content: payload.content)
+                case .failure(let error):
+                    fileExploreSelectedFingerprint = nil
+                    renderFileExploreDocument(kind: "text", content: error.localizedDescription)
                 }
-            }
-
-            guard let text = parseFileExploreText(from: data) else {
-                fileExploreSelectedFingerprint = nil
-                let message = kind == "jupyter"
-                    ? "Unable to parse notebook JSON: \(standardizedURL.lastPathComponent)"
-                    : "Unable to decode file as UTF-8 text: \(standardizedURL.lastPathComponent)"
-                renderFileExploreDocument(kind: "text", content: message)
                 updateFileExploreRealtimeRefreshState()
-                return
+                CapturePerf.end(started, "fileExplore.preview", details: "kind=\(kind)")
             }
-
-            fileExploreSelectedFingerprint = fileExploreFingerprint(for: standardizedURL)
-            renderFileExploreDocument(kind: kind, content: text)
-            updateFileExploreRealtimeRefreshState()
-        } catch {
-            fileExploreSelectedFingerprint = nil
-            renderFileExploreDocument(kind: "text", content: "Failed to read file: \(error.localizedDescription)")
-            updateFileExploreRealtimeRefreshState()
         }
     }
 
@@ -1219,37 +1240,50 @@ final class CaptureWindowController: NSWindowController {
             return
         }
         guard let kindJS = jsLiteral(kind), let contentJS = jsLiteral(content) else { return }
-        fileExplorePreviewWebView.evaluateJavaScript("renderDocument(\(kindJS), \(contentJS));", completionHandler: nil)
+        fileExploreBridge.enqueue("renderDocument(\(kindJS), \(contentJS))", immediate: true)
     }
 
     private func flushFileExplorePendingRender() {
         guard fileExplorePreviewReady, let pending = fileExplorePendingRender else { return }
         fileExplorePendingRender = nil
         guard let kindJS = jsLiteral(pending.kind), let contentJS = jsLiteral(pending.content) else { return }
-        fileExplorePreviewWebView.evaluateJavaScript("renderDocument(\(kindJS), \(contentJS));", completionHandler: nil)
+        fileExploreBridge.enqueue("renderDocument(\(kindJS), \(contentJS))", immediate: true)
     }
 
     @objc private func fileExploreZoomIn() {
-        fileExplorePreviewWebView?.evaluateJavaScript("adjustZoom(1);", completionHandler: nil)
+        fileExploreBridge.enqueue("adjustZoom(1)", immediate: true)
     }
 
     @objc private func fileExploreZoomOut() {
-        fileExplorePreviewWebView?.evaluateJavaScript("adjustZoom(-1);", completionHandler: nil)
+        fileExploreBridge.enqueue("adjustZoom(-1)", immediate: true)
     }
 
     private func startFileExploreRealtimeRefresh() {
         stopFileExploreRealtimeRefresh()
-        fileExploreRealtimeRefreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.refreshFileExploreIfNeeded()
+        guard let rootURL = fileExploreCurrentRootURL else { return }
+
+        fileExploreWatcherActive = fileExploreWatcher.start(url: rootURL) { [weak self] in
+            self?.scheduleFileExploreDebouncedRefresh(reason: "watcher")
         }
-        if let timer = fileExploreRealtimeRefreshTimer {
-            RunLoop.main.add(timer, forMode: .common)
+
+        // Fallback refresh timer remains enabled as a safety net.
+        let interval = fileExploreWatcherActive ? 4.0 : 1.2
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.refreshFileExploreIfNeeded(reason: "timer")
         }
+        timer.tolerance = min(0.8, interval * 0.25)
+        RunLoop.main.add(timer, forMode: .common)
+        fileExploreRealtimeRefreshTimer = timer
+        scheduleFileExploreDebouncedRefresh(reason: "start")
     }
 
     private func stopFileExploreRealtimeRefresh() {
         fileExploreRealtimeRefreshTimer?.invalidate()
         fileExploreRealtimeRefreshTimer = nil
+        fileExploreWatcher.stop()
+        fileExploreWatcherActive = false
+        fileExploreChangeDebounceWorkItem?.cancel()
+        fileExploreChangeDebounceWorkItem = nil
     }
 
     private func updateFileExploreRealtimeRefreshState() {
@@ -1264,64 +1298,59 @@ final class CaptureWindowController: NSWindowController {
         }
     }
 
-    private func refreshFileExploreIfNeeded() {
+    private func refreshFileExploreIfNeeded(reason: String = "manual") {
         guard let rootURL = fileExploreCurrentRootURL else {
             stopFileExploreRealtimeRefresh()
             return
         }
+        let started = CapturePerf.begin()
+        refreshVisibleFileExploreDirectories(rootURL: rootURL)
 
-        let newSnapshot = captureFileExploreTreeSnapshot(at: rootURL)
-        if newSnapshot != fileExploreTreeSnapshot {
-            fileExploreTreeSnapshot = newSnapshot
-            rebuildFileExploreRoot(at: rootURL, preserveState: true)
+        guard let selectedURL = fileExploreSelectedFileURL else {
+            CapturePerf.end(started, "fileExplore.refresh", details: "reason=\(reason),selected=0")
+            return
         }
-
-        guard let selectedURL = fileExploreSelectedFileURL else { return }
 
         let fm = FileManager.default
         guard fm.fileExists(atPath: selectedURL.path) else {
             fileExploreSelectedFileURL = nil
             fileExploreSelectedFingerprint = nil
             renderFileExploreDocument(kind: "text", content: "Selected file was removed.")
+            CapturePerf.end(started, "fileExplore.refresh", details: "reason=\(reason),removed=1")
             return
         }
 
         let newFingerprint = fileExploreFingerprint(for: selectedURL)
-        guard newFingerprint != fileExploreSelectedFingerprint else { return }
+        guard newFingerprint != fileExploreSelectedFingerprint else {
+            CapturePerf.end(started, "fileExplore.refresh", details: "reason=\(reason),changed=0")
+            return
+        }
         previewFileExploreFile(at: selectedURL)
+        CapturePerf.end(started, "fileExplore.refresh", details: "reason=\(reason)")
     }
 
-    private func captureFileExploreTreeSnapshot(at rootURL: URL) -> [String: FileExploreTreeSnapshotEntry] {
-        var snapshot: [String: FileExploreTreeSnapshotEntry] = [:]
-        let fm = FileManager.default
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]
-
-        let rootValues = try? rootURL.resourceValues(forKeys: keys)
-        let rootEntry = FileExploreTreeSnapshotEntry(
-            isDirectory: rootValues?.isDirectory ?? true,
-            modifiedAt: rootValues?.contentModificationDate?.timeIntervalSince1970 ?? 0,
-            size: Int64(rootValues?.fileSize ?? 0)
-        )
-        snapshot[rootURL.path] = rootEntry
-
-        guard let enumerator = fm.enumerator(
-            at: rootURL,
-            includingPropertiesForKeys: Array(keys),
-            options: [.skipsPackageDescendants]
-        ) else {
-            return snapshot
+    private func scheduleFileExploreDebouncedRefresh(reason: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            fileExploreChangeDebounceWorkItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                self?.refreshFileExploreIfNeeded(reason: reason)
+            }
+            fileExploreChangeDebounceWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: item)
         }
+    }
 
-        while let url = enumerator.nextObject() as? URL {
-            let values = try? url.resourceValues(forKeys: keys)
-            let entry = FileExploreTreeSnapshotEntry(
-                isDirectory: values?.isDirectory ?? false,
-                modifiedAt: values?.contentModificationDate?.timeIntervalSince1970 ?? 0,
-                size: Int64(values?.fileSize ?? 0)
-            )
-            snapshot[url.path] = entry
+    private func refreshVisibleFileExploreDirectories(rootURL: URL) {
+        guard let root = fileExploreRootNode else { return }
+        refreshFileExploreDirectory(root, reloadIfNeeded: true)
+
+        let expanded = expandedFileExploreDirectoryURLs()
+        let sorted = expanded.sorted { $0.pathComponents.count < $1.pathComponents.count }
+        for url in sorted where url != rootURL {
+            guard let node = fileExploreNodeByPath[url.path] else { continue }
+            refreshFileExploreDirectory(node, reloadIfNeeded: true)
         }
-        return snapshot
     }
 
     private func fileExploreFingerprint(for fileURL: URL) -> String? {
@@ -1330,6 +1359,157 @@ final class CaptureWindowController: NSWindowController {
         let modifiedAt = values.contentModificationDate?.timeIntervalSince1970 ?? 0
         let size = values.fileSize ?? 0
         return "\(modifiedAt)-\(size)"
+    }
+
+    private func refreshFileExploreDirectory(_ node: FileExploreNode, reloadIfNeeded: Bool) {
+        guard node.isDirectory else { return }
+        let started = CapturePerf.begin()
+        let keys: Set<URLResourceKey> = [.isDirectoryKey]
+
+        let urls: [URL]
+        do {
+            urls = try FileManager.default.contentsOfDirectory(
+                at: node.url,
+                includingPropertiesForKeys: Array(keys),
+                options: [.skipsPackageDescendants]
+            )
+        } catch {
+            for child in node.children {
+                removeFileExploreNodeSubtreeFromIndex(child)
+            }
+            node.children = []
+            node.isLoaded = true
+            CapturePerf.end(started, "fileExplore.refreshDirectory", details: "error=\(error.localizedDescription)")
+            return
+        }
+
+        var existingByPath: [String: FileExploreNode] = [:]
+        for child in node.children {
+            existingByPath[child.url.path] = child
+        }
+
+        var nextChildren: [FileExploreNode] = []
+        nextChildren.reserveCapacity(urls.count)
+        var changed = false
+
+        for childURL in urls {
+            let stdURL = childURL.standardizedFileURL
+            let isDir = (try? stdURL.resourceValues(forKeys: keys).isDirectory) ?? false
+            if let existing = existingByPath.removeValue(forKey: stdURL.path), existing.isDirectory == isDir {
+                nextChildren.append(existing)
+                continue
+            }
+
+            let child = FileExploreNode(url: stdURL, isDirectory: isDir)
+            child.parent = node
+            nextChildren.append(child)
+            fileExploreNodeByPath[stdURL.path] = child
+            changed = true
+        }
+
+        if !existingByPath.isEmpty {
+            changed = true
+            for removed in existingByPath.values {
+                removeFileExploreNodeSubtreeFromIndex(removed)
+            }
+        }
+
+        nextChildren.sort {
+            if $0.isDirectory != $1.isDirectory {
+                return $0.isDirectory && !$1.isDirectory
+            }
+            return $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending
+        }
+
+        if !changed {
+            let oldPaths = node.children.map { $0.url.path }
+            let newPaths = nextChildren.map { $0.url.path }
+            changed = oldPaths != newPaths
+        }
+
+        node.children = nextChildren
+        node.isLoaded = true
+
+        guard changed, reloadIfNeeded, let outlineView = fileExploreOutlineView else {
+            CapturePerf.end(started, "fileExplore.refreshDirectory", details: "changed=\(changed ? 1 : 0)")
+            return
+        }
+        if node.parent == nil {
+            outlineView.reloadData()
+        } else {
+            outlineView.reloadItem(node, reloadChildren: true)
+        }
+        CapturePerf.end(started, "fileExplore.refreshDirectory", details: "changed=1")
+    }
+
+    private func removeFileExploreNodeSubtreeFromIndex(_ node: FileExploreNode) {
+        fileExploreNodeByPath.removeValue(forKey: node.url.path)
+        for child in node.children {
+            removeFileExploreNodeSubtreeFromIndex(child)
+        }
+    }
+
+    private struct FileExplorePreviewPayload {
+        let kind: String
+        let content: String
+        let fingerprint: String?
+    }
+
+    private struct FileExplorePreviewFailure: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
+    private func buildFileExplorePreview(for fileURL: URL, kind: String) -> Result<FileExplorePreviewPayload, Error> {
+        do {
+            let (data, truncated) = try readFileExplorePreviewData(at: fileURL, limit: fileExplorePreviewMaxBytes)
+            if isLikelyBinaryFileData(data) {
+                return .failure(FileExplorePreviewFailure(message: "Cannot preview binary file: \(fileURL.lastPathComponent)"))
+            }
+
+            if kind == "jupyter" {
+                if truncated {
+                    return .failure(FileExplorePreviewFailure(
+                        message: "Notebook is too large for live preview. Open a smaller notebook or reduce file size."))
+                }
+                guard let notebookMarkdown = parseJupyterNotebookForPreview(from: data) else {
+                    return .failure(FileExplorePreviewFailure(
+                        message: "Unable to parse notebook JSON: \(fileURL.lastPathComponent)"))
+                }
+                return .success(FileExplorePreviewPayload(
+                    kind: "jupyter",
+                    content: notebookMarkdown,
+                    fingerprint: fileExploreFingerprint(for: fileURL)
+                ))
+            }
+
+            guard var text = parseFileExploreText(from: data) else {
+                return .failure(FileExplorePreviewFailure(
+                    message: "Unable to decode file as UTF-8 text: \(fileURL.lastPathComponent)"))
+            }
+            if truncated {
+                text += "\n\n...(preview truncated at \(fileExplorePreviewMaxBytes) bytes)..."
+            }
+
+            return .success(FileExplorePreviewPayload(
+                kind: kind,
+                content: text,
+                fingerprint: fileExploreFingerprint(for: fileURL)
+            ))
+        } catch {
+            return .failure(FileExplorePreviewFailure(message: "Failed to read file: \(error.localizedDescription)"))
+        }
+    }
+
+    private func readFileExplorePreviewData(at fileURL: URL, limit: Int) throws -> (Data, Bool) {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        let maxRead = max(1, limit + 1)
+        let data = try handle.read(upToCount: maxRead) ?? Data()
+        if data.count > limit {
+            return (data.prefix(limit), true)
+        }
+        return (data, false)
     }
 
     private func expandedFileExploreDirectoryURLs() -> Set<URL> {
@@ -1371,18 +1551,20 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func fileExploreNode(for url: URL) -> FileExploreNode? {
-        guard let root = fileExploreRootNode else { return nil }
         let standardized = url.standardizedFileURL
-        if root.url == standardized { return root }
-
+        if let node = fileExploreNodeByPath[standardized.path] {
+            return node
+        }
+        guard let root = fileExploreRootNode else { return nil }
+        if standardized == root.url {
+            return root
+        }
         let rootPath = root.url.path
         let targetPath = standardized.path
         guard targetPath.hasPrefix(rootPath + "/") else { return nil }
 
-        let relativePath = String(targetPath.dropFirst(rootPath.count + 1))
-        if relativePath.isEmpty { return root }
-
         var current = root
+        let relativePath = String(targetPath.dropFirst(rootPath.count + 1))
         for component in relativePath.split(separator: "/") {
             loadFileExploreChildrenIfNeeded(for: current)
             guard let next = current.children.first(where: { $0.url.lastPathComponent == String(component) }) else {
@@ -1463,12 +1645,45 @@ final class CaptureWindowController: NSWindowController {
                 return
             }
 
-            let copiedCount = try prepareInputDirectory(from: sourceURL, isDirectory: sourceIsDir.boolValue, in: workingURL)
-            NSLog("Opencode start complete. sourceDir=%@ workingDir=%@ initialPrompt=%@ inputDir=%@",
-                  sourceDir, workingDir, initialPrompt, inputURL.path)
-            setOpencodeStatus("Prepared \(inputURL.path) · Copied \(copiedCount) item(s). Starting session…", isError: false)
+            // Show File Explore immediately so startup feels responsive even while input sync runs.
             activateFileExploreTab(with: workingURL)
-            startNewOpencodeSession(workingURL: workingURL, initialPrompt: initialPrompt)
+
+            let isDir = sourceIsDir.boolValue
+            let prepStart = CapturePerf.begin()
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else { return }
+                do {
+                    let copiedCount = try self.prepareInputDirectory(from: sourceURL, isDirectory: isDir, in: workingURL)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        NSLog("Opencode start complete. sourceDir=%@ workingDir=%@ initialPrompt=%@ inputDir=%@",
+                              sourceDir, workingDir, initialPrompt, inputURL.path)
+                        CapturePerf.end(prepStart, "opencode.prepareInputDirectory", details: "items=\(copiedCount)")
+                        setOpencodeStatus("Prepared \(inputURL.path) · Copied \(copiedCount) item(s). Starting session…", isError: false)
+                        startNewOpencodeSession(workingURL: workingURL, initialPrompt: initialPrompt)
+                    }
+                } catch {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        if allowPermissionPrompt, isPermissionError(error),
+                           shouldPromptForExplicitFolderAccess(sourceURL: sourceURL, workingURL: workingURL) {
+                            let granted = requestOpencodeFolderAccess(sourceURL: sourceURL, workingURL: workingURL)
+                            if granted {
+                                runOpencodeStart(
+                                    sourceDirInput: sourceDirInput,
+                                    workingDirInput: workingDirInput,
+                                    initialPrompt: initialPrompt,
+                                    allowPermissionPrompt: false
+                                )
+                                return
+                            }
+                            setOpencodeStatus("Folder permission was not granted.", isError: true)
+                            return
+                        }
+                        setOpencodeStatus("Start failed: \(error.localizedDescription)", isError: true)
+                    }
+                }
+            }
         } catch {
             if allowPermissionPrompt, isPermissionError(error),
                shouldPromptForExplicitFolderAccess(sourceURL: sourceURL, workingURL: workingURL) {
@@ -1493,14 +1708,22 @@ final class CaptureWindowController: NSWindowController {
         let fm = FileManager.default
         let inputDir = workingDir.appendingPathComponent("input", isDirectory: true).standardizedFileURL
 
-        if fm.fileExists(atPath: inputDir.path) {
-            try fm.removeItem(at: inputDir)
-        }
-        try fm.createDirectory(at: inputDir, withIntermediateDirectories: true)
-
-        var copiedCount = 0
         if isDirectory {
+            if !fm.fileExists(atPath: inputDir.path) {
+                try fm.createDirectory(at: inputDir, withIntermediateDirectories: true)
+            }
+
+            if let changed = try syncInputDirectoryIncremental(source: source, inputDir: inputDir, workingDir: workingDir) {
+                return changed
+            }
+
+            // Fallback path when rsync is unavailable/fails.
+            if fm.fileExists(atPath: inputDir.path) {
+                try fm.removeItem(at: inputDir)
+            }
+            try fm.createDirectory(at: inputDir, withIntermediateDirectories: true)
             let items = try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil)
+            var copiedCount = 0
             for item in items {
                 // Avoid recursively copying input/ into itself when source == workingDir.
                 if item.standardizedFileURL == inputDir { continue }
@@ -1508,12 +1731,59 @@ final class CaptureWindowController: NSWindowController {
                 try fm.copyItem(at: item, to: destination)
                 copiedCount += 1
             }
+            return copiedCount
         } else {
+            if fm.fileExists(atPath: inputDir.path) {
+                try fm.removeItem(at: inputDir)
+            }
+            try fm.createDirectory(at: inputDir, withIntermediateDirectories: true)
             let destination = inputDir.appendingPathComponent(source.lastPathComponent, isDirectory: false)
             try fm.copyItem(at: source, to: destination)
-            copiedCount = 1
+            return 1
         }
-        return copiedCount
+    }
+
+    private func syncInputDirectoryIncremental(source: URL, inputDir: URL, workingDir: URL) throws -> Int? {
+        let rsyncPath = "/usr/bin/rsync"
+        guard FileManager.default.isReadableFile(atPath: rsyncPath) else { return nil }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: rsyncPath)
+
+        var args = ["-a", "--delete", "--itemize-changes"]
+        if source.standardizedFileURL == workingDir.standardizedFileURL {
+            args.append(contentsOf: ["--exclude", "input/"])
+        }
+        args.append(source.path.hasSuffix("/") ? source.path : source.path + "/")
+        args.append(inputDir.path.hasSuffix("/") ? inputDir.path : inputDir.path + "/")
+        process.arguments = args
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            CapturePerf.log("opencode.rsync unavailable, falling back to full copy: \(error.localizedDescription)")
+            return nil
+        }
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: outputData, encoding: .utf8) ?? ""
+        if process.terminationStatus != 0 {
+            let snippet = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let msg = snippet.isEmpty ? "Unknown rsync error." : String(snippet.prefix(300))
+            throw makeOpencodeError("Failed to sync input directory: \(msg)")
+        }
+
+        let changedCount = output
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .count
+        return changedCount
     }
 
     private func resolveUserPath(_ rawPath: String, relativeTo baseDir: URL? = nil) -> URL {
@@ -1754,6 +2024,7 @@ final class CaptureWindowController: NSWindowController {
         )
         opencodeEventStreamClient = stream
         stream.start(url: eventURL)
+        scheduleOpencodeStreamTimeout(token: token)
 
         postOpencodePromptAsync(message, sessionID: sessionID, workingURL: workingURL) { [weak self] result in
             guard let self else { return }
@@ -1765,6 +2036,13 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func handleOpencodeStreamEvent(_ event: [String: Any], sessionID: String, isInitialStart: Bool) {
+        opencodePerfEventCount += 1
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - opencodePerfLastLogAt >= 5 {
+            CapturePerf.log("opencode.events per 5s = \(opencodePerfEventCount)")
+            opencodePerfEventCount = 0
+            opencodePerfLastLogAt = now
+        }
         guard let type = event["type"] as? String else { return }
         guard let properties = event["properties"] as? [String: Any] else { return }
 
@@ -1867,6 +2145,7 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func finishOpencodeStreamingSuccessfully(isInitialStart: Bool, sessionID: String) {
+        cancelOpencodeStreamTimeout()
         stopOpencodeEventStream()
         setOpencodeBusy(false)
         if let entryID = opencodeCurrentStreamingEntryID {
@@ -1884,6 +2163,7 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func finishOpencodeStreaming(withError message: String) {
+        cancelOpencodeStreamTimeout()
         stopOpencodeEventStream()
         setOpencodeBusy(false)
         setOpencodeStatus(message, isError: true)
@@ -1896,11 +2176,31 @@ final class CaptureWindowController: NSWindowController {
         opencodeStreamingEntryIDByMessageID.removeAll(keepingCapacity: false)
         opencodeCurrentStreamingEntryID = nil
         opencodeToolStatusByPartID.removeAll(keepingCapacity: false)
+        opencodePendingStreamingChunksByEntryID.removeAll(keepingCapacity: false)
+        opencodeChunkFlushWorkItem?.cancel()
+        opencodeChunkFlushWorkItem = nil
     }
 
     private func stopOpencodeEventStream() {
+        cancelOpencodeStreamTimeout()
         opencodeEventStreamClient?.stop()
         opencodeEventStreamClient = nil
+    }
+
+    private func scheduleOpencodeStreamTimeout(token: Int) {
+        cancelOpencodeStreamTimeout()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard token == opencodeCommandToken else { return }
+            finishOpencodeStreaming(withError: "Opencode response timed out. You can send a follow-up message to retry.")
+        }
+        opencodeStreamTimeoutWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120, execute: item)
+    }
+
+    private func cancelOpencodeStreamTimeout() {
+        opencodeStreamTimeoutWorkItem?.cancel()
+        opencodeStreamTimeoutWorkItem = nil
     }
 
     private func parseOpencodeSessionError(_ properties: [String: Any]) -> String {
@@ -2091,12 +2391,6 @@ final class CaptureWindowController: NSWindowController {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    private struct FileExploreTreeSnapshotEntry: Equatable {
-        let isDirectory: Bool
-        let modifiedAt: TimeInterval
-        let size: Int64
-    }
-
     private struct OpencodeSessionCreateResponse: Decodable {
         let id: String
     }
@@ -2205,7 +2499,9 @@ final class CaptureWindowController: NSWindowController {
             }
             if let error {
                 fail("Opencode stream disconnected: \(error.localizedDescription)")
+                return
             }
+            fail("Opencode stream ended unexpectedly before completion.")
         }
 
         private func consumeLine(_ line: String) {
@@ -2242,7 +2538,7 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func stripANSI(_ input: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: #"\u001B\[[0-?]*[ -/]*[@-~]"#) else { return input }
+        guard let regex = Self.ansiRegex else { return input }
         let range = NSRange(location: 0, length: input.utf16.count)
         return regex.stringByReplacingMatches(in: input, options: [], range: range, withTemplate: "")
     }
@@ -2291,12 +2587,13 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func appendOpencodeStreamingChunk(entryID: Int, text: String) {
-        guard !text.isEmpty, let tJS = jsLiteral(text) else { return }
-        let js = "appendStreamingChunk(\(entryID), \(tJS))"
-        runOpencodeChatJavaScript(js)
+        guard !text.isEmpty else { return }
+        opencodePendingStreamingChunksByEntryID[entryID, default: ""] += text
+        scheduleOpencodeChunkFlush()
     }
 
     private func finalizeOpencodeStreamingEntry(entryID: Int, markdown: String) {
+        flushOpencodeStreamingChunks(for: entryID)
         guard let mdJS = jsLiteral(markdown) else { return }
         let js = "endStreamingEntry(\(entryID), \(mdJS))"
         runOpencodeChatJavaScript(js)
@@ -2307,16 +2604,15 @@ final class CaptureWindowController: NSWindowController {
             opencodePendingChatScripts.append(js)
             return
         }
-        opencodeChatWebView.evaluateJavaScript(js, completionHandler: nil)
+        opencodeBridge.enqueue(js)
     }
 
     private func flushOpencodePendingChatScripts() {
         guard opencodeChatPageReady, !opencodePendingChatScripts.isEmpty else { return }
         let scripts = opencodePendingChatScripts
         opencodePendingChatScripts.removeAll()
-        for js in scripts {
-            opencodeChatWebView.evaluateJavaScript(js, completionHandler: nil)
-        }
+        for js in scripts { opencodeBridge.enqueue(js) }
+        opencodeBridge.flushNow()
     }
 
     private func setOpencodeBusy(_ busy: Bool) {
@@ -2357,7 +2653,10 @@ final class CaptureWindowController: NSWindowController {
     }
 
     @objc private func clearAudioAI() {
-        audioAIWebView.evaluateJavaScript("clearFeed()", completionHandler: nil)
+        audioAIBridge.enqueue("clearFeed()", immediate: true)
+        audioAIPendingChunksByEntryID.removeAll(keepingCapacity: false)
+        audioAIChunkFlushWorkItem?.cancel()
+        audioAIChunkFlushWorkItem = nil
         audioAICurrentEntry = nil
         audioAIStreamingText = ""
     }
@@ -2367,37 +2666,110 @@ final class CaptureWindowController: NSWindowController {
     private func startStreamingEntry(imageURL: URL, entryId: Int) {
         let header = "[\(Self.timeString())]  \(imageURL.lastPathComponent)"
         guard let hJS = jsLiteral(header) else { return }
-        webView.evaluateJavaScript("startStreamingEntry(\(hJS), null, \(entryId))", completionHandler: nil)
+        visualBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let dataURL = Self.thumbnailDataURL(for: imageURL, maxWidth: 280)
             DispatchQueue.main.async {
                 guard let self else { return }
                 if let url = dataURL, let urlJS = self.jsLiteral(url) {
-                    self.webView.evaluateJavaScript("setStreamingEntryThumbnail(\(entryId), \(urlJS))", completionHandler: nil)
+                    self.visualBridge.enqueue("setStreamingEntryThumbnail(\(entryId), \(urlJS))")
                 }
             }
         }
     }
 
     private static func thumbnailDataURL(for url: URL, maxWidth: CGFloat) -> String? {
-        guard let img = NSImage(contentsOf: url) else { return nil }
-        let size = img.size
-        guard size.width > 0, size.height > 0 else { return nil }
-        let scale = min(1, maxWidth / size.width)
-        let w = Int(size.width * scale)
-        let h = Int(size.height * scale)
-        guard w > 0, h > 0 else { return nil }
-        let small = NSImage(size: NSSize(width: w, height: h))
-        small.lockFocus()
-        NSGraphicsContext.current?.imageInterpolation = .medium
-        img.draw(in: NSRect(x: 0, y: 0, width: w, height: h),
-                 from: NSRect(x: 0, y: 0, width: size.width, height: size.height),
-                 operation: .copy, fraction: 1)
-        small.unlockFocus()
-        guard let tiff = small.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else { return nil }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int(maxWidth),
+        ]
+        guard let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else { return nil }
+        let rep = NSBitmapImageRep(cgImage: thumb)
+        guard let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7]) else { return nil }
         return "data:image/jpeg;base64,\(jpeg.base64EncodedString())"
+    }
+
+    private func scheduleVisualChunkFlush() {
+        guard visualChunkFlushWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            self?.visualChunkFlushWorkItem = nil
+            self?.flushVisualStreamingChunks()
+        }
+        visualChunkFlushWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: item)
+    }
+
+    private func flushVisualStreamingChunks(for entryID: Int? = nil) {
+        guard !visualPendingChunksByEntryID.isEmpty else { return }
+        let targets: [(Int, String)]
+        if let entryID {
+            guard let text = visualPendingChunksByEntryID.removeValue(forKey: entryID), !text.isEmpty else { return }
+            targets = [(entryID, text)]
+        } else {
+            targets = visualPendingChunksByEntryID.map { ($0.key, $0.value) }
+            visualPendingChunksByEntryID.removeAll(keepingCapacity: true)
+        }
+        for (id, text) in targets.sorted(by: { $0.0 < $1.0 }) {
+            guard let js = jsLiteral(text) else { continue }
+            visualBridge.enqueue("appendStreamingChunk(\(id), \(js))")
+        }
+        visualBridge.flushNow()
+    }
+
+    private func scheduleAudioAIChunkFlush() {
+        guard audioAIChunkFlushWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            self?.audioAIChunkFlushWorkItem = nil
+            self?.flushAudioAIStreamingChunks()
+        }
+        audioAIChunkFlushWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: item)
+    }
+
+    private func flushAudioAIStreamingChunks(for entryID: Int? = nil) {
+        guard !audioAIPendingChunksByEntryID.isEmpty else { return }
+        let targets: [(Int, String)]
+        if let entryID {
+            guard let text = audioAIPendingChunksByEntryID.removeValue(forKey: entryID), !text.isEmpty else { return }
+            targets = [(entryID, text)]
+        } else {
+            targets = audioAIPendingChunksByEntryID.map { ($0.key, $0.value) }
+            audioAIPendingChunksByEntryID.removeAll(keepingCapacity: true)
+        }
+        for (id, text) in targets.sorted(by: { $0.0 < $1.0 }) {
+            guard let js = jsLiteral(text) else { continue }
+            audioAIBridge.enqueue("appendStreamingChunk(\(id), \(js))")
+        }
+        audioAIBridge.flushNow()
+    }
+
+    private func scheduleOpencodeChunkFlush() {
+        guard opencodeChunkFlushWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            self?.opencodeChunkFlushWorkItem = nil
+            self?.flushOpencodeStreamingChunks()
+        }
+        opencodeChunkFlushWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: item)
+    }
+
+    private func flushOpencodeStreamingChunks(for entryID: Int? = nil) {
+        guard !opencodePendingStreamingChunksByEntryID.isEmpty else { return }
+        let targets: [(Int, String)]
+        if let entryID {
+            guard let text = opencodePendingStreamingChunksByEntryID.removeValue(forKey: entryID), !text.isEmpty else { return }
+            targets = [(entryID, text)]
+        } else {
+            targets = opencodePendingStreamingChunksByEntryID.map { ($0.key, $0.value) }
+            opencodePendingStreamingChunksByEntryID.removeAll(keepingCapacity: true)
+        }
+        for (id, text) in targets.sorted(by: { $0.0 < $1.0 }) {
+            guard let js = jsLiteral(text) else { continue }
+            runOpencodeChatJavaScript("appendStreamingChunk(\(id), \(js))")
+        }
+        opencodeBridge.flushNow()
     }
 
     private func appendEntry(header: String, body: String, isError: Bool) {
@@ -2410,14 +2782,20 @@ final class CaptureWindowController: NSWindowController {
         for item in pendingEntries {
             guard let hJS = jsLiteral(item.header), let bJS = jsLiteral(item.body) else { continue }
             let js = "appendEntry(\(hJS), \(bJS), \(item.isError ? "true" : "false"))"
-            webView.evaluateJavaScript(js, completionHandler: nil)
+            visualBridge.enqueue(js)
         }
         pendingEntries.removeAll()
+        visualBridge.flushNow()
     }
 
-    @objc private func zoomIn()  { webView.evaluateJavaScript("adjustZoom(1)",  completionHandler: nil) }
-    @objc private func zoomOut() { webView.evaluateJavaScript("adjustZoom(-1)", completionHandler: nil) }
-    @objc private func clearAI() { webView.evaluateJavaScript("clearFeed()",    completionHandler: nil) }
+    @objc private func zoomIn()  { visualBridge.enqueue("adjustZoom(1)", immediate: true) }
+    @objc private func zoomOut() { visualBridge.enqueue("adjustZoom(-1)", immediate: true) }
+    @objc private func clearAI() {
+        visualPendingChunksByEntryID.removeAll(keepingCapacity: false)
+        visualChunkFlushWorkItem?.cancel()
+        visualChunkFlushWorkItem = nil
+        visualBridge.enqueue("clearFeed()", immediate: true)
+    }
 
     private func jsLiteral(_ s: String) -> String? {
         guard let data = try? JSONSerialization.data(withJSONObject: [s]),
@@ -2450,6 +2828,8 @@ final class CaptureWindowController: NSWindowController {
     private static func timeString() -> String {
         DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
     }
+
+    private static let ansiRegex = try? NSRegularExpression(pattern: #"\u001B\[[0-?]*[ -/]*[@-~]"#)
 
     private static let fileExploreHTMLTemplate = """
     <!DOCTYPE html>
@@ -2561,10 +2941,23 @@ final class CaptureWindowController: NSWindowController {
             .replace(/>/g, '&gt;');
         }
 
-        function highlightBlocks(root) {
+        function highlightBlocks(root, allowAutoDetect) {
           if (typeof hljs === 'undefined') return;
           root.querySelectorAll('pre code').forEach(function(block) {
-            try { hljs.highlightElement(block); } catch (_) {}
+            if (block.dataset.hlDone === '1') return;
+            try {
+              var classes = (block.className || '').split(/\\s+/);
+              var hasLanguage = classes.some(function(c) { return c.indexOf('language-') === 0; });
+              if (hasLanguage) {
+                hljs.highlightElement(block);
+                block.dataset.hlDone = '1';
+                return;
+              }
+              if (allowAutoDetect && block.textContent && block.textContent.length <= 6000) {
+                block.innerHTML = hljs.highlightAuto(block.textContent).value;
+                block.dataset.hlDone = '1';
+              }
+            } catch (_) {}
           });
         }
 
@@ -2592,7 +2985,7 @@ final class CaptureWindowController: NSWindowController {
           if ((kind === 'markdown' || kind === 'jupyter') && typeof marked !== 'undefined' && marked.parse) {
             root.innerHTML = marked.parse(content);
             normalizeMarkdownHtml(root);
-            highlightBlocks(root);
+            highlightBlocks(root, false);
             return;
           }
 
@@ -2600,12 +2993,11 @@ final class CaptureWindowController: NSWindowController {
             var wrapped = '```python\\n' + content + '\\n```';
             root.innerHTML = marked.parse(wrapped);
             normalizeMarkdownHtml(root);
-            highlightBlocks(root);
+            highlightBlocks(root, false);
             return;
           }
 
           root.innerHTML = '<pre><code>' + escapeHtml(content) + '</code></pre>';
-          highlightBlocks(root);
         }
 
         function adjustZoom(delta) {
@@ -2616,12 +3008,7 @@ final class CaptureWindowController: NSWindowController {
         if (typeof marked !== 'undefined' && marked.use) {
           marked.use({
             gfm: true,
-            breaks: true,
-            highlight: function(code, lang) {
-              if (typeof hljs === 'undefined') return code;
-              if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
-              return hljs.highlightAuto(code).value;
-            }
+            breaks: true
           });
         }
 
@@ -2831,10 +3218,49 @@ final class CaptureWindowController: NSWindowController {
       var currentFontSize = 14;
       var userScrolledUp = false;
       var streamingBodiesById = Object.create(null);
+      var pendingAutoScroll = false;
+      var maxRenderedEntries = 220;
       window.addEventListener('scroll', function() {
         var sv = document.scrollingElement || document.documentElement;
         userScrolledUp = sv.scrollTop + sv.clientHeight < sv.scrollHeight - 60;
       }, { passive: true });
+
+      function scheduleAutoScroll() {
+        if (userScrolledUp || pendingAutoScroll) return;
+        pendingAutoScroll = true;
+        requestAnimationFrame(function() {
+          pendingAutoScroll = false;
+          var sv = document.scrollingElement || document.documentElement;
+          if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+        });
+      }
+
+      function destroyEntryNode(entryNode) {
+        if (!entryNode) return;
+        var entryId = entryNode.dataset ? entryNode.dataset.entryId : null;
+        if (entryId) delete streamingBodiesById[String(entryId)];
+        entryNode.querySelectorAll('img').forEach(function(img) { img.src = ''; });
+      }
+
+      function pruneFeedIfNeeded() {
+        var feed = document.getElementById('feed');
+        if (!feed) return;
+        var entries = Array.from(feed.children).filter(function(node) {
+          return node && node.dataset && node.dataset.entryKind === 'entry';
+        });
+        while (entries.length > maxRenderedEntries) {
+          var oldest = entries.shift();
+          destroyEntryNode(oldest);
+          var prev = oldest.previousElementSibling;
+          var next = oldest.nextElementSibling;
+          feed.removeChild(oldest);
+          if (next && next.classList && next.classList.contains('entry-divider')) {
+            feed.removeChild(next);
+          } else if (prev && prev.classList && prev.classList.contains('entry-divider')) {
+            feed.removeChild(prev);
+          }
+        }
+      }
 
       function escapeHtml(s) {
         var div = document.createElement('div');
@@ -2862,6 +3288,7 @@ final class CaptureWindowController: NSWindowController {
           var entry = document.createElement('div');
           applyRoleStyle(entry, header);
           entry.dataset.entryId = String(entryId);
+          entry.dataset.entryKind = 'entry';
           var hdr = document.createElement('div');
           hdr.className = 'entry-header';
           hdr.textContent = header;
@@ -2878,9 +3305,9 @@ final class CaptureWindowController: NSWindowController {
           body.textContent = '';
           entry.appendChild(body);
           feed.appendChild(entry);
+          pruneFeedIfNeeded();
           streamingBodiesById[String(entryId)] = body;
-          var sv = document.scrollingElement || document.documentElement;
-          if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+          scheduleAutoScroll();
         } catch (e) { console.error('startStreamingEntry', e); }
       }
       function setStreamingEntryThumbnail(entryId, dataURL) {
@@ -2902,8 +3329,7 @@ final class CaptureWindowController: NSWindowController {
         var body = streamingBodiesById[String(entryId)];
         if (body) {
           body.textContent += text;
-          var sv = document.scrollingElement || document.documentElement;
-          if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+          scheduleAutoScroll();
         }
       }
       function endStreamingEntry(entryId, markdown) {
@@ -2932,7 +3358,7 @@ final class CaptureWindowController: NSWindowController {
             mermaidNodes.push(inner);
             return;
           }
-          if (codeEl && typeof hljs !== 'undefined') {
+          if (codeEl && typeof hljs !== 'undefined' && lang && lang !== 'mermaid') {
             if (lang && hljs.getLanguage(lang)) codeEl.innerHTML = hljs.highlight(codeEl.textContent, { language: lang }).value;
             else hljs.highlightElement(codeEl);
           }
@@ -2957,8 +3383,7 @@ final class CaptureWindowController: NSWindowController {
             mermaidNodes.forEach(function(n) { n.innerHTML = '<span class="mermaid-error">Mermaid error: ' + err.message + '</span>'; });
           });
         }
-        var sv = document.scrollingElement || document.documentElement;
-        if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+        scheduleAutoScroll();
       }
       function endStreamingEntryAsError(entryId, message) {
         var key = String(entryId);
@@ -2972,7 +3397,6 @@ final class CaptureWindowController: NSWindowController {
 
       function appendEntry(header, markdown, isError) {
         try {
-          var sv = document.scrollingElement || document.documentElement;
           var feed = document.getElementById('feed');
           if (!feed) return;
           if (feed.children.length > 0) {
@@ -2982,6 +3406,7 @@ final class CaptureWindowController: NSWindowController {
           }
           var entry = document.createElement('div');
           applyRoleStyle(entry, header);
+          entry.dataset.entryKind = 'entry';
           var hdr = document.createElement('div');
           hdr.className = 'entry-header';
           hdr.textContent = header;
@@ -3013,7 +3438,7 @@ final class CaptureWindowController: NSWindowController {
                 mermaidNodes.push(inner);
                 return;
               }
-              if (codeEl && typeof hljs !== 'undefined') {
+              if (codeEl && typeof hljs !== 'undefined' && lang && lang !== 'mermaid') {
                 if (lang && hljs.getLanguage(lang)) codeEl.innerHTML = hljs.highlight(codeEl.textContent, { language: lang }).value;
                 else hljs.highlightElement(codeEl);
               }
@@ -3041,7 +3466,8 @@ final class CaptureWindowController: NSWindowController {
           }
           entry.appendChild(body);
           feed.appendChild(entry);
-          if (!userScrolledUp) sv.scrollTop = sv.scrollHeight;
+          pruneFeedIfNeeded();
+          scheduleAutoScroll();
         } catch (e) {
           var feed = document.getElementById('feed');
           if (feed) {
@@ -3053,7 +3479,11 @@ final class CaptureWindowController: NSWindowController {
         }
       }
 
-      function clearFeed() { document.getElementById('feed').innerHTML = ''; }
+      function clearFeed() {
+        var feed = document.getElementById('feed');
+        if (feed) feed.innerHTML = '';
+        streamingBodiesById = Object.create(null);
+      }
 
       function adjustZoom(delta) {
         currentFontSize = Math.min(Math.max(currentFontSize + delta, 9), 30);
@@ -3066,12 +3496,7 @@ final class CaptureWindowController: NSWindowController {
       if (typeof marked !== 'undefined' && marked.use) {
         marked.use({
           gfm: true,
-          breaks: true,
-          highlight: function(code, lang) {
-            if (typeof hljs === 'undefined') return code;
-            if (lang && lang !== 'mermaid' && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
-            return lang === 'mermaid' ? code : hljs.highlightAuto(code).value;
-          }
+          breaks: true
         });
       }
       if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.pageReady) {
@@ -3112,10 +3537,7 @@ extension CaptureWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
 
     func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
         guard outlineView === fileExploreOutlineView, let node = item as? FileExploreNode else { return true }
-        // Refresh this directory when the user opens it.
-        node.isLoaded = false
-        loadFileExploreChildrenIfNeeded(for: node)
-        outlineView.reloadItem(node, reloadChildren: true)
+        refreshFileExploreDirectory(node, reloadIfNeeded: true)
         return true
     }
 
@@ -3155,9 +3577,19 @@ extension CaptureWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
         }
 
         cell.textField?.stringValue = node.url.lastPathComponent
-        let icon = NSWorkspace.shared.icon(forFile: node.url.path)
-        icon.size = NSSize(width: 16, height: 16)
-        cell.imageView?.image = icon
+        let iconKey: String = {
+            if node.isDirectory { return "dir" }
+            let ext = node.url.pathExtension.lowercased()
+            return ext.isEmpty ? "file" : "ext:\(ext)"
+        }()
+        if let cached = fileExploreIconCache[iconKey] {
+            cell.imageView?.image = cached
+        } else {
+            let icon = NSWorkspace.shared.icon(forFile: node.url.path)
+            icon.size = NSSize(width: 16, height: 16)
+            fileExploreIconCache[iconKey] = icon
+            cell.imageView?.image = icon
+        }
         return cell
     }
 
