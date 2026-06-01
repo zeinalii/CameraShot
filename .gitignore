@@ -2,6 +2,9 @@
 .build/
 *.o
 *.d
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
 
 # Xcode / SPM
 .swiftpm/
@@ -9,9 +12,16 @@ xcuserdata/
 *.xcworkspace
 *.xcodeproj
 DerivedData/
+*.xcresult
+*.xcarchive
 
-# macOS app bundle (built output, not source)
+# macOS app bundles / packaged releases (built output, not source)
 CameraShot.app/
+*.app/
+*.dmg
+*.pkg
+*.zip
+*.tar.gz
 
 # macOS system files
 .DS_Store
@@ -25,7 +35,16 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Editor / local logs
+.vscode/
+.idea/
+*.log
+*.tmp
+*.swp
+*.swo
+
 # Environment / secrets
 .env
+.env.*
 *.enc
-.claude
+.claude/
