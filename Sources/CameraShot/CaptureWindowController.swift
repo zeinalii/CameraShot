@@ -159,6 +159,7 @@ final class CaptureWindowController: NSWindowController {
             defer: false
         )
         win.sharingType = .none
+        win.tabbingMode = .disallowed
         win.title           = "CameraShot  ·  \(name)"
         win.minSize         = NSSize(width: 700, height: 440)
         win.isMovableByWindowBackground = true
@@ -192,6 +193,13 @@ final class CaptureWindowController: NSWindowController {
         timer.tolerance = min(0.4, interval * 0.25)
         RunLoop.main.add(timer, forMode: .common)
         audioAITimer = timer
+    }
+
+    func closeCurrentSession() {
+        audioAITimer?.invalidate()
+        audioAITimer = nil
+        stopActiveOpencodeProcess(resetSession: true, closeRemoteSession: true)
+        stopFileExploreRealtimeRefresh()
     }
 
     @available(*, unavailable)
@@ -292,7 +300,7 @@ final class CaptureWindowController: NSWindowController {
 
     // MARK: – Public — Audio AI feed
 
-    /// Streams a chunk of Claude's response into the Audio AI WebView.
+    /// Streams a chunk of Gemini's response into the Audio AI WebView.
     func appendAudioAIChunk(_ text: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self, audioAIPageReady else { return }
@@ -502,6 +510,7 @@ final class CaptureWindowController: NSWindowController {
     @objc private func stopTapped() {
         stopButton.isEnabled  = false
         pauseButton.isEnabled = false
+        closeCurrentSession()
         onStop?()
     }
 
@@ -1598,14 +1607,16 @@ final class CaptureWindowController: NSWindowController {
             return
         }
 
-        stopActiveOpencodeProcess(resetSession: true)
+        stopActiveOpencodeProcess(resetSession: true, closeRemoteSession: true)
+        let startToken = opencodeCommandToken
         setOpencodeStatus("Preparing input directory…", isError: false)
 
         runOpencodeStart(
             sourceDirInput: sourceDir,
             workingDirInput: workingDir,
             initialPrompt: initialPrompt,
-            allowPermissionPrompt: true
+            allowPermissionPrompt: true,
+            token: startToken
         )
     }
 
@@ -1613,7 +1624,8 @@ final class CaptureWindowController: NSWindowController {
         sourceDirInput: String,
         workingDirInput: String,
         initialPrompt: String,
-        allowPermissionPrompt: Bool
+        allowPermissionPrompt: Bool,
+        token: Int
     ) {
         let sourceDir = sourceDirInput
         let workingDir = workingDirInput
@@ -1656,6 +1668,7 @@ final class CaptureWindowController: NSWindowController {
                     let copiedCount = try self.prepareInputDirectory(from: sourceURL, isDirectory: isDir, in: workingURL)
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
+                        guard token == opencodeCommandToken else { return }
                         NSLog("Opencode start complete. sourceDir=%@ workingDir=%@ initialPrompt=%@ inputDir=%@",
                               sourceDir, workingDir, initialPrompt, inputURL.path)
                         CapturePerf.end(prepStart, "opencode.prepareInputDirectory", details: "items=\(copiedCount)")
@@ -1665,6 +1678,7 @@ final class CaptureWindowController: NSWindowController {
                 } catch {
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
+                        guard token == opencodeCommandToken else { return }
                         if allowPermissionPrompt, isPermissionError(error),
                            shouldPromptForExplicitFolderAccess(sourceURL: sourceURL, workingURL: workingURL) {
                             let granted = requestOpencodeFolderAccess(sourceURL: sourceURL, workingURL: workingURL)
@@ -1673,7 +1687,8 @@ final class CaptureWindowController: NSWindowController {
                                     sourceDirInput: sourceDirInput,
                                     workingDirInput: workingDirInput,
                                     initialPrompt: initialPrompt,
-                                    allowPermissionPrompt: false
+                                    allowPermissionPrompt: false,
+                                    token: token
                                 )
                                 return
                             }
@@ -1685,6 +1700,7 @@ final class CaptureWindowController: NSWindowController {
                 }
             }
         } catch {
+            guard token == opencodeCommandToken else { return }
             if allowPermissionPrompt, isPermissionError(error),
                shouldPromptForExplicitFolderAccess(sourceURL: sourceURL, workingURL: workingURL) {
                 let granted = requestOpencodeFolderAccess(sourceURL: sourceURL, workingURL: workingURL)
@@ -1693,7 +1709,8 @@ final class CaptureWindowController: NSWindowController {
                         sourceDirInput: sourceDirInput,
                         workingDirInput: workingDirInput,
                         initialPrompt: initialPrompt,
-                        allowPermissionPrompt: false
+                        allowPermissionPrompt: false,
+                        token: token
                     )
                     return
                 }
@@ -1971,7 +1988,12 @@ final class CaptureWindowController: NSWindowController {
 
         createOpencodeSession(workingURL: workingURL) { [weak self] result in
             guard let self else { return }
-            guard token == self.opencodeCommandToken else { return }
+            guard token == self.opencodeCommandToken else {
+                if case .success(let newSessionID) = result {
+                    self.closeOpencodeSession(sessionID: newSessionID, workingURL: workingURL)
+                }
+                return
+            }
             switch result {
             case .failure(let error):
                 self.setOpencodeBusy(false)
@@ -2287,6 +2309,58 @@ final class CaptureWindowController: NSWindowController {
         }
     }
 
+    private func closeOpencodeSession(sessionID: String, workingURL: URL) {
+        abortOpencodeSession(sessionID: sessionID, workingURL: workingURL) { [weak self] in
+            self?.deleteOpencodeSession(sessionID: sessionID, workingURL: workingURL)
+        }
+    }
+
+    private func abortOpencodeSession(
+        sessionID: String,
+        workingURL: URL,
+        completion: @escaping () -> Void
+    ) {
+        guard let requestURL = opencodeRequestURL(
+            path: "session/\(sessionID)/abort",
+            workingURL: workingURL
+        ) else {
+            completion()
+            return
+        }
+
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+
+        performOpencodeRequest(request, completion: { (result: Result<Bool, Error>) in
+            if case .failure(let error) = result {
+                NSLog("Failed to abort opencode session %@: %@", sessionID, error.localizedDescription)
+            }
+            completion()
+        }) { _ in
+            true
+        }
+    }
+
+    private func deleteOpencodeSession(sessionID: String, workingURL: URL) {
+        guard let requestURL = opencodeRequestURL(
+            path: "session/\(sessionID)",
+            workingURL: workingURL
+        ) else { return }
+
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "DELETE"
+
+        performOpencodeRequest(request, completion: { (result: Result<Bool, Error>) in
+            if case .failure(let error) = result {
+                NSLog("Failed to delete opencode session %@: %@", sessionID, error.localizedDescription)
+            }
+        }) { _ in
+            true
+        }
+    }
+
     private func opencodeAttachURL() -> String? {
         if let configured = UserDefaults.standard.string(forKey: "opencode.attachURL")?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -2551,7 +2625,7 @@ final class CaptureWindowController: NSWindowController {
             .filter { line in
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 if trimmed.isEmpty { return true }
-                // Hide status/meta lines like: "> build · claude-sonnet-4-5"
+                // Hide status/meta lines like: "> build · gemini-3.5-flash"
                 return !trimmed.hasPrefix("> ")
             }
         return filtered.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2620,7 +2694,9 @@ final class CaptureWindowController: NSWindowController {
         updateOpencodeControls()
     }
 
-    private func stopActiveOpencodeProcess(resetSession: Bool) {
+    private func stopActiveOpencodeProcess(resetSession: Bool, closeRemoteSession: Bool = false) {
+        let sessionToClose = closeRemoteSession ? opencodeActiveSessionID : nil
+        let workingURLToClose = closeRemoteSession ? opencodeActiveWorkingURL : nil
         opencodeCommandToken += 1
         stopOpencodeEventStream()
         resetOpencodeStreamingState()
@@ -2630,6 +2706,10 @@ final class CaptureWindowController: NSWindowController {
             opencodeActiveWorkingURL = nil
         }
         updateOpencodeControls()
+
+        if let sessionID = sessionToClose, let workingURL = workingURLToClose {
+            closeOpencodeSession(sessionID: sessionID, workingURL: workingURL)
+        }
     }
 
     private func updateOpencodeControls() {
@@ -3001,7 +3081,7 @@ final class CaptureWindowController: NSWindowController {
         }
 
         function adjustZoom(delta) {
-          currentFontSize = Math.min(Math.max(currentFontSize + delta, 9), 30);
+          currentFontSize = Math.min(Math.max(currentFontSize + delta, 9), 60);
           document.documentElement.style.setProperty('--font-size', currentFontSize + 'px');
         }
 
@@ -3486,7 +3566,7 @@ final class CaptureWindowController: NSWindowController {
       }
 
       function adjustZoom(delta) {
-        currentFontSize = Math.min(Math.max(currentFontSize + delta, 9), 30);
+        currentFontSize = Math.min(Math.max(currentFontSize + delta, 9), 60);
         document.documentElement.style.setProperty('--font-size', currentFontSize + 'px');
       }
 

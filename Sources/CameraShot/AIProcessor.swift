@@ -1,16 +1,81 @@
 import Foundation
 
+// MARK: - GeminiAPI
+
+enum GeminiAPI {
+    static let defaultModel = "gemini-3.5-flash"
+
+    static func compatibleModel(_ model: String) -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return defaultModel }
+
+        let lowercased = trimmed.lowercased()
+        if lowercased == "gemini-3-5-flash" ||
+            lowercased.hasPrefix("claude") ||
+            lowercased.contains("sonnet") ||
+            lowercased.contains("opus") ||
+            lowercased.contains("haiku") {
+            return defaultModel
+        }
+
+        return trimmed
+    }
+
+    static func streamURL(model: String, apiKey: String) -> URL? {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "generativelanguage.googleapis.com"
+        components.path = "/v1beta/models/\(normalizedModel(model)):streamGenerateContent"
+        components.queryItems = [
+            URLQueryItem(name: "alt", value: "sse"),
+        ]
+        return components.url
+    }
+
+    static func textDelta(from object: [String: Any]) -> String? {
+        guard let candidates = object["candidates"] as? [[String: Any]] else { return nil }
+        let text = candidates.compactMap { candidate -> String? in
+            guard let content = candidate["content"] as? [String: Any],
+                  let parts = content["parts"] as? [[String: Any]] else { return nil }
+            let joined = parts.compactMap { $0["text"] as? String }.joined()
+            return joined.isEmpty ? nil : joined
+        }.joined()
+        return text.isEmpty ? nil : text
+    }
+
+    static func googleSearchTools() -> [[String: Any]] {
+        [["google_search": [String: Any]()] as [String: Any]]
+    }
+
+    static func errorMessage(from object: [String: Any]) -> String? {
+        guard let error = object["error"] as? [String: Any] else { return nil }
+        return error["message"] as? String
+    }
+
+    static func errorMessage(from data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return errorMessage(from: object)
+    }
+
+    private static func normalizedModel(_ model: String) -> String {
+        let name = compatibleModel(model)
+        return name.hasPrefix("models/") ? String(name.dropFirst("models/".count)) : name
+    }
+}
+
 // MARK: - AIConfig
 
 struct AIConfig {
     var enabled: Bool   = true
     var prompt:  String = "try to solve this question that you see on the screen."
-    var model:   String = "claude-sonnet-4-5"
+    var model:   String = GeminiAPI.defaultModel
 }
 
 // MARK: - AIProcessor
 
-/// Calls the Anthropic Messages API directly over HTTPS using URLSession.
+/// Calls the Gemini Generate Content API directly over HTTPS using URLSession.
 /// No Python, no subprocesses, no external dependencies.
 /// Limits concurrent requests to avoid pile-up at fast capture intervals.
 final class AIProcessor {
@@ -43,7 +108,7 @@ final class AIProcessor {
 
     private func run(imageURL: URL) async {
         guard let key = apiKey, !key.isEmpty else {
-            finish(.error("No API key — add your Anthropic key in the API Keys tab.", imageURL))
+            finish(.error("No API key — add your Google Gemini key in the API Keys tab.", imageURL))
             return
         }
         guard let imageData = try? Data(contentsOf: imageURL) else {
@@ -55,29 +120,39 @@ final class AIProcessor {
         let mimeType = ext == "png" ? "image/png" : "image/jpeg"
         let b64      = imageData.base64EncodedString()
 
+        let userParts: [[String: Any]] = [
+            ["inline_data": ["mime_type": mimeType, "data": b64]],
+            ["text": config.prompt],
+        ]
         let body: [String: Any] = [
-            "model":      config.model,
-            "max_tokens": 2048,
-            "stream":     true,
-            "system":     "Format your entire response in Markdown. Use ## headers, **bold**, `inline code`, fenced code blocks, and - bullet lists where appropriate. Never respond with plain paragraphs only.",
-            "messages": [[
+            "systemInstruction": [
+                "parts": [[
+                    "text": "Format your entire response in Markdown. Use ## headers, **bold**, `inline code`, fenced code blocks, and - bullet lists where appropriate. Never respond with plain paragraphs only. If the question depends on current facts, recent events, prices, schedules, rules, or other information that may have changed, use Google Search grounding silently before answering. Do not mention search, search queries, sources, citations, or tool use unless the user explicitly asks for them. Show only the final answer.",
+                ]],
+            ],
+            "contents": [[
                 "role": "user",
-                "content": [
-                    ["type": "image",
-                     "source": ["type": "base64", "media_type": mimeType, "data": b64]],
-                    ["type": "text", "text": config.prompt],
-                ],
+                "parts": userParts,
             ]],
+            "tools": GeminiAPI.googleSearchTools(),
+            "generationConfig": [
+                "maxOutputTokens": 2048,
+                "thinkingConfig": [
+                    "thinkingLevel": "high",
+                ],
+            ],
         ]
 
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else {
             finish(.error("Failed to serialize request body.", imageURL)); return
         }
+        guard let url = GeminiAPI.streamURL(model: config.model, apiKey: key) else {
+            finish(.error("Failed to build Gemini request URL.", imageURL)); return
+        }
 
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue(key,              forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01",     forHTTPHeaderField: "anthropic-version")
+        request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = payload
 
@@ -87,10 +162,8 @@ final class AIProcessor {
             if status != 200 {
                 var errData = Data()
                 for try await b in bytes { errData.append(b) }
-                let msg = (try? JSONSerialization.jsonObject(with: errData) as? [String: Any])
-                    .flatMap { ($0["error"] as? [String: Any])?["message"] as? String }
-                    ?? "HTTP \(status)"
-                finish(.error("Anthropic error: \(msg)", imageURL)); return
+                let msg = GeminiAPI.errorMessage(from: errData) ?? "HTTP \(status)"
+                finish(.error("Gemini error: \(msg)", imageURL)); return
             }
             var buffer = [UInt8]()
             var fullText = ""
@@ -102,24 +175,19 @@ final class AIProcessor {
                     buffer = []
                     if line.hasPrefix("data: ") {
                         let jsonStr = String(line.dropFirst(6))
+                        guard jsonStr != "[DONE]" else { break }
                         guard !jsonStr.isEmpty,
                               let data = jsonStr.data(using: .utf8),
-                              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                              let type = obj["type"] as? String else { continue }
-                        if type == "content_block_delta",
-                           let delta = obj["delta"] as? [String: Any],
-                           (delta["type"] as? String) == "text_delta",
-                           let text = delta["text"] as? String {
+                              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                        if let msg = GeminiAPI.errorMessage(from: obj) {
+                            finish(.error("Gemini error: \(msg)", imageURL)); return
+                        }
+                        if let text = GeminiAPI.textDelta(from: obj) {
                             fullText += text
                             let streamHandler = onStreamChunk
                             DispatchQueue.main.async {
                                 streamHandler?(text, imageURL)
                             }
-                        } else if type == "message_stop" {
-                            break
-                        } else if type == "error", let err = obj["error"] as? [String: Any] {
-                            let msg = err["message"] as? String ?? "Stream error"
-                            finish(.error(msg, imageURL)); return
                         }
                     }
                 }

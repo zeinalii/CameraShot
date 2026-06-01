@@ -54,7 +54,7 @@ final class ScreenCaptureController: NSObject {
 
     // MARK: – Init
 
-    init(target: ScreenTarget, interval: TimeInterval, jpegQuality: Double = 0.92, outputDir: URL) {
+    init(target: ScreenTarget, interval: TimeInterval, jpegQuality: Double = 1.0, outputDir: URL) {
         self.target      = target
         self.interval    = interval
         self.jpegQuality = jpegQuality

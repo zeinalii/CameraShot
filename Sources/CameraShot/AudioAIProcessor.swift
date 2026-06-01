@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - AudioAIProcessor
 
-/// Sends the last chunk of live transcript text to Claude and streams the response back.
+/// Sends the last chunk of live transcript text to Gemini and streams the response back.
 /// Mirrors AIProcessor but takes plain text instead of an image.
 final class AudioAIProcessor: @unchecked Sendable {
 
@@ -15,18 +15,20 @@ final class AudioAIProcessor: @unchecked Sendable {
     // MARK: – Init
 
     private let apiKey:       String
+    private let model:        String
     private let systemPrompt: String
     private let session = URLSession(configuration: .ephemeral)
     private var inFlight = false
 
-    init(apiKey: String, systemPrompt: String) {
+    init(apiKey: String, model: String = GeminiAPI.defaultModel, systemPrompt: String) {
         self.apiKey       = apiKey
+        self.model        = model
         self.systemPrompt = systemPrompt
     }
 
     // MARK: – Public
 
-    /// Sends `transcript` to Claude and streams the response via `onChunk` / `onDone` / `onError`.
+    /// Sends `transcript` to Gemini and streams the response via `onChunk` / `onDone` / `onError`.
     /// Returns `true` when the request is accepted, `false` when dropped (empty/in-flight).
     @discardableResult
     func query(transcript: String) -> Bool {
@@ -42,25 +44,38 @@ final class AudioAIProcessor: @unchecked Sendable {
     private func run(transcript: String) async {
         defer { DispatchQueue.main.async { self.inFlight = false } }
 
+        let userParts: [[String: Any]] = [[
+            "text": "Here is the recent transcript:\n\n\(transcript)\n\nPlease respond.",
+        ]]
         let body: [String: Any] = [
-            "model":      "claude-sonnet-4-5",
-            "max_tokens": 1024,
-            "stream":     true,
-            "system":     systemPrompt,
-            "messages": [[
+            "systemInstruction": [
+                "parts": [[
+                    "text": "\(systemPrompt)\n\nIf the user question depends on current facts, recent events, prices, schedules, rules, or other information that may have changed, use Google Search grounding silently before answering. Do not mention search, search queries, sources, citations, or tool use unless the user explicitly asks for them. Show only the final answer.",
+                ]],
+            ],
+            "contents": [[
                 "role": "user",
-                "content": "Here is the recent transcript:\n\n\(transcript)\n\nPlease respond."
+                "parts": userParts,
             ]],
+            "tools": GeminiAPI.googleSearchTools(),
+            "generationConfig": [
+                "maxOutputTokens": 1024,
+                "thinkingConfig": [
+                    "thinkingLevel": "high",
+                ],
+            ],
         ]
 
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else {
             fire { self.onError?("Failed to build request.") }; return
         }
+        guard let url = GeminiAPI.streamURL(model: model, apiKey: apiKey) else {
+            fire { self.onError?("Failed to build Gemini request URL.") }; return
+        }
 
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue(apiKey,             forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01",       forHTTPHeaderField: "anthropic-version")
+        req.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
         req.httpBody = payload
 
@@ -70,10 +85,8 @@ final class AudioAIProcessor: @unchecked Sendable {
             if status != 200 {
                 var errData = Data()
                 for try await b in bytes { errData.append(b) }
-                let msg = (try? JSONSerialization.jsonObject(with: errData) as? [String: Any])
-                    .flatMap { ($0["error"] as? [String: Any])?["message"] as? String }
-                    ?? "HTTP \(status)"
-                fire { self.onError?("Claude error: \(msg)") }; return
+                let msg = GeminiAPI.errorMessage(from: errData) ?? "HTTP \(status)"
+                fire { self.onError?("Gemini error: \(msg)") }; return
             }
 
             var buffer = [UInt8]()
@@ -85,23 +98,16 @@ final class AudioAIProcessor: @unchecked Sendable {
                     buffer = []
                     guard line.hasPrefix("data: ") else { continue }
                     let jsonStr = String(line.dropFirst(6))
+                    guard jsonStr != "[DONE]" else { break }
                     guard !jsonStr.isEmpty,
                           let data = jsonStr.data(using: .utf8),
-                          let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let type = obj["type"] as? String else { continue }
+                          let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
 
-                    if type == "content_block_delta",
-                       let delta = obj["delta"] as? [String: Any],
-                       (delta["type"] as? String) == "text_delta",
-                       let text = delta["text"] as? String {
+                    if let msg = GeminiAPI.errorMessage(from: obj) {
+                        fire { self.onError?("Gemini error: \(msg)") }; return
+                    }
+                    if let text = GeminiAPI.textDelta(from: obj) {
                         fire { self.onChunk?(text) }
-                    } else if type == "message_stop" {
-                        fire { self.onDone?() }
-                        return
-                    } else if type == "error",
-                              let err = obj["error"] as? [String: Any] {
-                        let msg = err["message"] as? String ?? "Stream error"
-                        fire { self.onError?(msg) }; return
                     }
                 }
             }

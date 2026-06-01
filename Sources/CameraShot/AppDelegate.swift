@@ -47,6 +47,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        captureCtrl?.closeCurrentSession()
+        cameraCtrl?.stop()
+        screenCtrl?.stop()
+        voiceCtrl?.stop()
         documentsScopeURL?.stopAccessingSecurityScopedResource()
         documentsScopeURL = nil
     }
@@ -241,6 +245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         cameraCtrl?.stop(); screenCtrl?.stop()
+        captureCtrl?.closeCurrentSession()
         captureCtrl?.close()
         cameraCtrl = nil; screenCtrl = nil; captureCtrl = nil
         aiProcessor = nil
@@ -322,16 +327,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             wc.onPauseAI = { [weak self] paused in self?.aiPaused = paused }
             wc.onStop = { [weak self, weak ctrl, weak wc] in
+                let stoppedWindow = wc
                 ctrl?.stop()
-                self?.aiProcessor = nil
-                self?.aiPaused = false
-                self?.voiceCtrl?.stop(); self?.voiceCtrl = nil
-                self?.audioAIProc = nil
-                self?.captureCtrl = nil
-                self?.configureResponseFlow(enabled: false)
-                self?.showSetup()
+                stoppedWindow?.closeCurrentSession()
+                stoppedWindow?.close()
+                guard let self else { return }
+                self.aiProcessor = nil
+                self.aiPaused = false
+                self.voiceCtrl?.stop(); self.voiceCtrl = nil
+                self.audioAIProc = nil
+                self.captureCtrl = nil
+                self.configureResponseFlow(enabled: false)
+                self.showSetup()
                 NSApp.activate(ignoringOtherApps: true)
-                DispatchQueue.main.async { wc?.close() }
             }
             cameraCtrl = ctrl; screenCtrl = nil; captureCtrl = wc
             setupCtrl?.close(); wc.showWindow(nil); ctrl.start()
@@ -373,7 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Audio AI processor — requires Anthropic key
+        // Audio AI processor — requires Google Gemini key
         guard let apiKey = sessionAPIKey, !apiKey.isEmpty else { return }
         let proc = AudioAIProcessor(apiKey: apiKey, systemPrompt: config.audioAIPrompt)
         proc.onChunk = { [weak captureWindow] chunk in captureWindow?.appendAudioAIChunk(chunk) }
@@ -407,16 +415,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         wc.onPauseAI = { [weak self] paused in self?.aiPaused = paused }
         wc.onStop = { [weak self, weak ctrl, weak wc] in
+            let stoppedWindow = wc
             ctrl?.stop()
-            self?.aiProcessor = nil
-            self?.aiPaused = false
-            self?.voiceCtrl?.stop(); self?.voiceCtrl = nil
-            self?.audioAIProc = nil
-            self?.captureCtrl = nil
-            self?.configureResponseFlow(enabled: false)
-            self?.showSetup()
+            stoppedWindow?.closeCurrentSession()
+            stoppedWindow?.close()
+            guard let self else { return }
+            self.aiProcessor = nil
+            self.aiPaused = false
+            self.voiceCtrl?.stop(); self.voiceCtrl = nil
+            self.audioAIProc = nil
+            self.captureCtrl = nil
+            self.configureResponseFlow(enabled: false)
+            self.showSetup()
             NSApp.activate(ignoringOtherApps: true)
-            DispatchQueue.main.async { wc?.close() }
         }
         screenCtrl = ctrl; cameraCtrl = nil; captureCtrl = wc
         setupCtrl?.close(); wc.showWindow(nil)

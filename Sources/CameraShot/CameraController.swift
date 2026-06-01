@@ -42,7 +42,7 @@ final class CameraController: NSObject {
 
     // MARK: - Init
 
-    init(device: AVCaptureDevice, interval: TimeInterval, jpegQuality: Double = 0.92, outputDir: URL) {
+    init(device: AVCaptureDevice, interval: TimeInterval, jpegQuality: Double = 1.0, outputDir: URL) {
         self.interval    = interval
         self.jpegQuality = jpegQuality
         self.outputDir   = outputDir

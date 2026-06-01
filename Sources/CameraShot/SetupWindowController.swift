@@ -7,7 +7,7 @@ import ScreenCaptureKit
 final class SetupWindowController: NSWindowController {
 
     var onStart:       ((CaptureSource, TimeInterval, Double, URL, AIConfig, VoiceConfig) -> Void)?
-    /// Encrypt and persist the Anthropic API key using the current session.
+    /// Encrypt and persist the Google Gemini API key using the current session.
     var saveAPIKey:    ((String) throws -> Void)?
 
     // MARK: – Types
@@ -111,6 +111,7 @@ final class SetupWindowController: NSWindowController {
             defer: false
         )
         win.sharingType = .none
+        win.tabbingMode = .disallowed
         win.title  = "CameraShot"
         win.center()
         win.isMovableByWindowBackground = true
@@ -282,7 +283,7 @@ final class SetupWindowController: NSWindowController {
         s.setCustomSpacing(5, after: s.arrangedSubviews.last!)
         let qs = NSSegmentedControl(labels: ["Good  75%", "High  92%", "Max 100%"],
                                     trackingMode: .selectOne, target: nil, action: nil)
-        qs.selectedSegment = 1; qualityControl = qs
+        qs.selectedSegment = 2; qualityControl = qs
         s.addArrangedSubview(qs)
         qs.widthAnchor.constraint(equalToConstant: 376).isActive = true
         s.setCustomSpacing(18, after: qs)
@@ -385,9 +386,9 @@ final class SetupWindowController: NSWindowController {
         s.addArrangedSubview(sectionLabel("Model"))
         s.setCustomSpacing(5, after: s.arrangedSubviews.last!)
 
-        let mf = NSTextField(string: "claude-sonnet-4-5")
+        let mf = NSTextField(string: GeminiAPI.defaultModel)
         mf.font = .systemFont(ofSize: 13)
-        mf.placeholderString = "e.g. claude-sonnet-4-5, claude-3-5-sonnet-20241022"
+        mf.placeholderString = "e.g. gemini-3.5-flash"
         modelField = mf
         s.addArrangedSubview(mf)
         mf.widthAnchor.constraint(equalToConstant: 376).isActive = true
@@ -455,7 +456,7 @@ final class SetupWindowController: NSWindowController {
             iv.contentTintColor = .controlAccentColor
             titleRow.addArrangedSubview(iv)
         }
-        titleRow.addArrangedSubview(plainLabel("Anthropic API Key", size: 15, weight: .semibold))
+        titleRow.addArrangedSubview(plainLabel("Google Gemini API Key", size: 15, weight: .semibold))
         s.addArrangedSubview(titleRow)
         s.setCustomSpacing(6, after: titleRow)
 
@@ -474,7 +475,7 @@ final class SetupWindowController: NSWindowController {
         s.setCustomSpacing(5, after: s.arrangedSubviews.last!)
 
         let field = NSTextField(frame: .zero)
-        field.placeholderString  = "sk-ant-api03-..."
+        field.placeholderString  = "AIza..."
         field.font               = .monospacedSystemFont(ofSize: 12, weight: .regular)
         field.isEditable         = true
         field.isSelectable       = true
@@ -524,7 +525,7 @@ final class SetupWindowController: NSWindowController {
 
         // Token limit row
         let tokenRow = hstack(spacing: 8); tokenRow.alignment = .centerY
-        tokenRow.addArrangedSubview(sectionLabel("Transcript Tokens Sent to Claude"))
+        tokenRow.addArrangedSubview(sectionLabel("Transcript Tokens Sent to Gemini"))
         tokenRow.addArrangedSubview(hFlex())
         let tf = NSTextField(string: "500")
         tf.font              = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -895,22 +896,13 @@ final class SetupWindowController: NSWindowController {
                     return
                 }
             }
-        case .window(let id, _, _, let scWindow):
+        case .window(_, _, _, let scWindow):
             if #available(macOS 14.0, *), let scWindow = scWindow {
                 let filter = SCContentFilter(desktopIndependentWindow: scWindow)
                 let config = SCStreamConfiguration()
                 config.width = Int(filter.contentRect.width * CGFloat(filter.pointPixelScale))
                 config.height = Int(filter.contentRect.height * CGFloat(filter.pointPixelScale))
                 SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { [weak self] img, _ in
-                    guard let img else { return }
-                    DispatchQueue.main.async { self?.livePreview.showImage(img) }
-                }
-            } else if #unavailable(macOS 14.0) {
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    let img = CGWindowListCreateImage(
-                        .null, .optionIncludingWindow, id,
-                        [.boundsIgnoreFraming, .bestResolution]
-                    )
                     guard let img else { return }
                     DispatchQueue.main.async { self?.livePreview.showImage(img) }
                 }
@@ -970,14 +962,14 @@ final class SetupWindowController: NSWindowController {
             prompt:  promptTextView.string.isEmpty
                          ? "try to solve this question that you see on the screen."
                          : promptTextView.string,
-            model:   modelField.stringValue.isEmpty ? "claude-sonnet-4-5" : modelField.stringValue
+            model:   GeminiAPI.compatibleModel(modelField.stringValue)
         )
 
         if aiEnabled && !EncryptedKeyStore.fileExists() {
             let alert = NSAlert()
             alert.window.sharingType = .none
-            alert.messageText = "Anthropic API Key Required"
-            alert.informativeText = "AI processing is enabled but no Anthropic API key is saved. Open the \"API Keys\" tab, enter your key, and click \"Save Key\"."
+            alert.messageText = "Google Gemini API Key Required"
+            alert.informativeText = "AI processing is enabled but no Google Gemini API key is saved. Open the \"API Keys\" tab, enter your key, and click \"Save Key\"."
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
             alert.runModal()
@@ -1053,7 +1045,11 @@ final class SetupWindowController: NSWindowController {
             aiEnabledCheckbox.state = defaults.bool(forKey: Self.aiEnabledDefaultsKey) ? .on : .off
         }
         if let model = defaults.string(forKey: Self.aiModelDefaultsKey) {
-            modelField.stringValue = model
+            let compatibleModel = GeminiAPI.compatibleModel(model)
+            modelField.stringValue = compatibleModel
+            if compatibleModel != model {
+                defaults.set(compatibleModel, forKey: Self.aiModelDefaultsKey)
+            }
         }
         if let prompt = defaults.string(forKey: Self.aiPromptDefaultsKey) {
             promptTextView.string = prompt
@@ -1113,7 +1109,7 @@ final class SetupWindowController: NSWindowController {
 
     private func persistPromptSettings() {
         UserDefaults.standard.set(aiEnabledCheckbox.state == .on, forKey: Self.aiEnabledDefaultsKey)
-        UserDefaults.standard.set(modelField.stringValue, forKey: Self.aiModelDefaultsKey)
+        UserDefaults.standard.set(GeminiAPI.compatibleModel(modelField.stringValue), forKey: Self.aiModelDefaultsKey)
         UserDefaults.standard.set(promptTextView.string, forKey: Self.aiPromptDefaultsKey)
         UserDefaults.standard.set(voiceInputCheckbox.state == .on, forKey: Self.voiceInputEnabledDefaultsKey)
         UserDefaults.standard.set(audioModelField.stringValue, forKey: Self.voiceServerURLDefaultsKey)

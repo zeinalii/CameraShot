@@ -52,7 +52,7 @@ make run ARGS="10 1"
 
 ## Output
 
-Frames are saved by default to `~/Documents/CameraShot/frame_YYYYMMDD_HHMMSS.jpg` at 92 % JPEG quality. You can choose a different folder in the setup window (Browse…) if you prefer.
+Frames are saved by default to `~/Documents/CameraShot/frame_YYYYMMDD_HHMMSS.png` at 100% quality. You can choose a different folder in the setup window (Browse…) if you prefer.
 
 ## Notes
 

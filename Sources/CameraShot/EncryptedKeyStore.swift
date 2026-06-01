@@ -2,9 +2,9 @@ import CryptoKit
 import CommonCrypto
 import Foundation
 
-/// On-disk encrypted store for the Anthropic API key.
+/// On-disk encrypted store for the Google Gemini API key.
 ///
-/// File format  (~/.camerashot/api_key.enc):
+/// File format  (~/.camerashot/gemini_api_key.enc):
 ///   salt (16 bytes) | AES-GCM combined blob (nonce 12 + ciphertext + tag 16)
 ///
 /// Key derivation:
@@ -22,7 +22,7 @@ enum EncryptedKeyStore {
             at: dir, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        return dir.appendingPathComponent("api_key.enc")
+        return dir.appendingPathComponent("gemini_api_key.enc")
     }
 
     static var displayPath: String {
