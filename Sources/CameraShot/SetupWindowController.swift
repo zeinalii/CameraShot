@@ -7,8 +7,10 @@ import ScreenCaptureKit
 final class SetupWindowController: NSWindowController {
 
     var onStart:       ((CaptureSource, TimeInterval, Double, URL, AIConfig, VoiceConfig) -> Void)?
-    /// Encrypt and persist the Google Gemini API key using the current session.
-    var saveAPIKey:    ((String) throws -> Void)?
+    /// Encrypt and persist provider API keys using the current session.
+    var saveAPIKey:    ((AIProviderID, String) throws -> Void)?
+    var removeAPIKey:  ((AIProviderID) throws -> Void)?
+    var credentialStatus: (() -> AICredentialStatus)?
 
     // MARK: – Types
 
@@ -83,8 +85,10 @@ final class SetupWindowController: NSWindowController {
     // MARK: – Outlets — API Keys tab
 
     private weak var apiKeysStack:        NSStackView!
-    private weak var apiKeyField:         NSTextField!
-    private weak var keyStatusLabel:      NSTextField!
+    private weak var geminiAPIKeyField:   NSTextField!
+    private weak var geminiKeyStatusLabel: NSTextField!
+    private weak var openAIAPIKeyField:   NSTextField!
+    private weak var openAIKeyStatusLabel: NSTextField!
 
     // MARK: – Outlets — Voice Input URL (in Capture tab)
 
@@ -105,7 +109,7 @@ final class SetupWindowController: NSWindowController {
 
     init() {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 440, height: 650),
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 760),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -456,64 +460,95 @@ final class SetupWindowController: NSWindowController {
             iv.contentTintColor = .controlAccentColor
             titleRow.addArrangedSubview(iv)
         }
-        titleRow.addArrangedSubview(plainLabel("Google Gemini API Key", size: 15, weight: .semibold))
+        titleRow.addArrangedSubview(plainLabel("AI Provider API Keys", size: 15, weight: .semibold))
         s.addArrangedSubview(titleRow)
         s.setCustomSpacing(6, after: titleRow)
 
         let desc = NSTextField(wrappingLabelWithString:
             "Your key is encrypted with AES-256-GCM using your machine passphrase (UUID). " +
-            "It is never stored as plain text — only decrypted in memory while the app is running.")
+            "Keys are never stored as plain text — only decrypted in memory while the app is running.")
         desc.font      = .systemFont(ofSize: 12)
         desc.textColor = .secondaryLabelColor
         s.addArrangedSubview(desc)
         desc.widthAnchor.constraint(equalToConstant: 376).isActive = true
-        s.setCustomSpacing(20, after: desc)
+        s.setCustomSpacing(18, after: desc)
 
-        // Plain editable text field — typing, Cmd+V, and right-click Paste all work normally.
-        // The value is cleared from the field immediately after saving.
-        s.addArrangedSubview(sectionLabel("API Key"))
-        s.setCustomSpacing(5, after: s.arrangedSubviews.last!)
+        addAPIKeySection(
+            to: s,
+            title: "Google Gemini API Key",
+            placeholder: "AIza...",
+            provider: .gemini,
+            saveAction: #selector(saveGeminiKeyTapped),
+            removeAction: #selector(removeGeminiKeyTapped)
+        )
+        s.setCustomSpacing(18, after: s.arrangedSubviews.last!)
+
+        addAPIKeySection(
+            to: s,
+            title: "OpenAI API Key",
+            placeholder: "sk-...",
+            provider: .openAI,
+            saveAction: #selector(saveOpenAIKeyTapped),
+            removeAction: #selector(removeOpenAIKeyTapped)
+        )
+        s.setCustomSpacing(22, after: s.arrangedSubviews.last!)
+
+        apiKeysStack = s
+        refreshKeyStatus()
+        return s
+    }
+
+    private func addAPIKeySection(
+        to stack: NSStackView,
+        title: String,
+        placeholder: String,
+        provider: AIProviderID,
+        saveAction: Selector,
+        removeAction: Selector
+    ) {
+        stack.addArrangedSubview(sectionLabel(title))
+        stack.setCustomSpacing(5, after: stack.arrangedSubviews.last!)
 
         let field = NSTextField(frame: .zero)
-        field.placeholderString  = "AIza..."
+        field.placeholderString  = placeholder
         field.font               = .monospacedSystemFont(ofSize: 12, weight: .regular)
         field.isEditable         = true
         field.isSelectable       = true
         field.isBezeled          = true
         field.bezelStyle         = .roundedBezel
-        apiKeyField = field
-        s.addArrangedSubview(field)
+        stack.addArrangedSubview(field)
         field.widthAnchor.constraint(equalToConstant: 376).isActive = true
-        s.setCustomSpacing(10, after: field)
+        stack.setCustomSpacing(10, after: field)
 
-        // Save row
-        let saveRow = hstack(spacing: 10); saveRow.alignment = .centerY
-        let saveBtn = NSButton(title: "Save Key", target: self, action: #selector(saveKeyTapped))
+        let row = hstack(spacing: 10); row.alignment = .centerY
+        let saveBtn = NSButton(title: "Save Key", target: self, action: saveAction)
         saveBtn.bezelStyle = .rounded
-        saveRow.addArrangedSubview(saveBtn)
+        row.addArrangedSubview(saveBtn)
 
-        let sl = NSTextField(labelWithString: "")
-        sl.font          = .systemFont(ofSize: 12)
-        sl.textColor     = .secondaryLabelColor
-        sl.lineBreakMode = .byWordWrapping
-        keyStatusLabel   = sl
-        saveRow.addArrangedSubview(sl)
-        s.addArrangedSubview(saveRow)
-        saveRow.widthAnchor.constraint(equalToConstant: 376).isActive = true
-        s.setCustomSpacing(10, after: saveRow)
+        let status = NSTextField(labelWithString: "")
+        status.font          = .systemFont(ofSize: 12)
+        status.textColor     = .secondaryLabelColor
+        status.lineBreakMode = .byWordWrapping
+        row.addArrangedSubview(status)
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        stack.setCustomSpacing(8, after: row)
 
-        // Remove button
-        let removeBtn = NSButton(title: "Remove Saved Key", target: self, action: #selector(removeKeyTapped))
+        let removeBtn = NSButton(title: "Remove Saved Key", target: self, action: removeAction)
         removeBtn.bezelStyle       = .inline
         removeBtn.font             = .systemFont(ofSize: 11)
         removeBtn.contentTintColor = .systemRed
-        s.addArrangedSubview(removeBtn)
+        stack.addArrangedSubview(removeBtn)
         removeBtn.widthAnchor.constraint(equalToConstant: 376).isActive = true
-        s.setCustomSpacing(22, after: removeBtn)
 
-        apiKeysStack = s
-        refreshKeyStatus()
-        return s
+        switch provider {
+        case .gemini:
+            geminiAPIKeyField = field
+            geminiKeyStatusLabel = status
+        case .openAI:
+            openAIAPIKeyField = field
+            openAIKeyStatusLabel = status
+        }
     }
 
     // MARK: – Audio Prompt stack
@@ -595,44 +630,74 @@ final class SetupWindowController: NSWindowController {
     }
 
     private func refreshKeyStatus() {
-        guard let sl = keyStatusLabel else { return }
-        if EncryptedKeyStore.fileExists() {
-            sl.stringValue = "✓ Key saved & encrypted"
-            sl.textColor   = .systemGreen
+        let status = credentialStatus?() ?? AICredentialStatus(hasGeminiKey: false, hasOpenAIKey: false)
+        updateKeyStatusLabel(geminiKeyStatusLabel, saved: status.hasGeminiKey, fallbackText: "Required for visual AI")
+        updateKeyStatusLabel(openAIKeyStatusLabel, saved: status.hasOpenAIKey, fallbackText: "Optional fallback not configured")
+    }
+
+    private func updateKeyStatusLabel(_ label: NSTextField?, saved: Bool, fallbackText: String) {
+        guard let label else { return }
+        if saved {
+            label.stringValue = "✓ Key saved & encrypted"
+            label.textColor   = .systemGreen
         } else {
-            sl.stringValue = "No key saved"
-            sl.textColor   = .secondaryLabelColor
+            label.stringValue = fallbackText
+            label.textColor   = .secondaryLabelColor
         }
     }
 
-    @objc private func saveKeyTapped() {
-        let raw = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    @objc private func saveGeminiKeyTapped() {
+        saveKey(provider: .gemini, field: geminiAPIKeyField, statusLabel: geminiKeyStatusLabel)
+    }
+
+    @objc private func saveOpenAIKeyTapped() {
+        saveKey(provider: .openAI, field: openAIAPIKeyField, statusLabel: openAIKeyStatusLabel)
+    }
+
+    private func saveKey(provider: AIProviderID, field: NSTextField?, statusLabel: NSTextField?) {
+        let raw = field?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !raw.isEmpty else {
-            keyStatusLabel.stringValue = "Paste your key above first"
-            keyStatusLabel.textColor   = .systemOrange
+            statusLabel?.stringValue = "Paste your key above first"
+            statusLabel?.textColor   = .systemOrange
             return
         }
         guard let handler = saveAPIKey else {
-            keyStatusLabel.stringValue = "⚠ Restart the app and enter your passphrase first"
-            keyStatusLabel.textColor   = .systemRed
+            statusLabel?.stringValue = "⚠ Restart the app and enter your passphrase first"
+            statusLabel?.textColor   = .systemRed
             return
         }
         do {
-            try handler(raw)
-            apiKeyField.stringValue    = ""
-            keyStatusLabel.stringValue = "✓ Key saved & encrypted"
-            keyStatusLabel.textColor   = .systemGreen
+            try handler(provider, raw)
+            field?.stringValue = ""
+            refreshKeyStatus()
         } catch {
-            keyStatusLabel.stringValue = "⚠ \(error.localizedDescription)"
-            keyStatusLabel.textColor   = .systemRed
+            statusLabel?.stringValue = "⚠ \(error.localizedDescription)"
+            statusLabel?.textColor   = .systemRed
         }
     }
 
-    @objc private func removeKeyTapped() {
-        EncryptedKeyStore.delete()
-        apiKeyField.stringValue    = ""
-        keyStatusLabel.stringValue = "No key saved"
-        keyStatusLabel.textColor   = .secondaryLabelColor
+    @objc private func removeGeminiKeyTapped() {
+        removeKey(provider: .gemini, field: geminiAPIKeyField, statusLabel: geminiKeyStatusLabel)
+    }
+
+    @objc private func removeOpenAIKeyTapped() {
+        removeKey(provider: .openAI, field: openAIAPIKeyField, statusLabel: openAIKeyStatusLabel)
+    }
+
+    private func removeKey(provider: AIProviderID, field: NSTextField?, statusLabel: NSTextField?) {
+        guard let handler = removeAPIKey else {
+            statusLabel?.stringValue = "⚠ Restart the app and enter your passphrase first"
+            statusLabel?.textColor   = .systemRed
+            return
+        }
+        do {
+            try handler(provider)
+            field?.stringValue = ""
+            refreshKeyStatus()
+        } catch {
+            statusLabel?.stringValue = "⚠ \(error.localizedDescription)"
+            statusLabel?.textColor   = .systemRed
+        }
     }
 
     // MARK: – Tab switching
@@ -732,6 +797,7 @@ final class SetupWindowController: NSWindowController {
         cameraPopup.removeAllItems()
         cameras.forEach { cameraPopup.addItem(withTitle: $0.localizedName) }
         startButton?.isEnabled = !cameras.isEmpty
+        print("[CameraShot] Found \(cameras.count) camera(s): \(cameras.map(\.localizedName).joined(separator: ", "))")
     }
 
     private func startCameraPreview() {
@@ -743,20 +809,48 @@ final class SetupWindowController: NSWindowController {
     private func runCameraPreview(for device: AVCaptureDevice) {
         previewSession?.stopRunning()
         let session = AVCaptureSession()
-        session.sessionPreset = .hd1920x1080
-        guard let input = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(input) else { return }
-        session.addInput(input)
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else {
+                print("[CameraShot] Camera preview could not add input for \(device.localizedName) with initial preset=\(session.sessionPreset.rawValue)")
+                return
+            }
+            session.addInput(input)
+        } catch {
+            print("[CameraShot] Camera preview input failed for \(device.localizedName): \(error.localizedDescription)")
+            return
+        }
+        applyPreviewPreset(to: session)
         DispatchQueue.main.async { [weak self] in self?.livePreview.showCamera(session: session) }
         previewSession = session
         session.startRunning()
+        print("[CameraShot] Camera preview started for \(device.localizedName); running=\(session.isRunning)")
+    }
+
+    private func applyPreviewPreset(to session: AVCaptureSession) {
+        for preset in [AVCaptureSession.Preset.hd1920x1080, .high] {
+            let canSet = session.canSetSessionPreset(preset)
+            print("[CameraShot] Checking camera preview preset \(preset.rawValue): canSet=\(canSet)")
+            if canSet {
+                session.sessionPreset = preset
+                return
+            }
+        }
+        print("[CameraShot] No preferred camera preview preset was accepted; using current preset=\(session.sessionPreset.rawValue)")
     }
 
     private func stopCameraPreview() {
-        let session = previewSession
-        previewSession = nil
-        previewQueue.async {
+        stopCameraPreview { [weak self] in
+            self?.livePreview.clear()
+        }
+    }
+
+    private func stopCameraPreview(completion: @escaping () -> Void) {
+        previewQueue.async { [weak self] in
+            let session = self?.previewSession
+            self?.previewSession = nil
             session?.stopRunning()
+            DispatchQueue.main.async { completion() }
         }
     }
 
@@ -965,7 +1059,8 @@ final class SetupWindowController: NSWindowController {
             model:   GeminiAPI.compatibleModel(modelField.stringValue)
         )
 
-        if aiEnabled && !EncryptedKeyStore.fileExists() {
+        let savedKeys = credentialStatus?() ?? AICredentialStatus(hasGeminiKey: false, hasOpenAIKey: false)
+        if aiEnabled && !savedKeys.hasGeminiKey {
             let alert = NSAlert()
             alert.window.sharingType = .none
             alert.messageText = "Google Gemini API Key Required"
@@ -1000,10 +1095,17 @@ final class SetupWindowController: NSWindowController {
 
         switch sourceType {
         case .camera:
-            guard !cameras.isEmpty else { return }
+            guard !cameras.isEmpty else {
+                print("[CameraShot] Start ignored: no cameras available")
+                return
+            }
             let device = cameras[max(0, cameraPopup.indexOfSelectedItem)]
-            previewQueue.async { [weak self] in self?.previewSession?.stopRunning() }
-            onStart?(.camera(device), iv, quality, outputDir, aiConfig, voiceConfig)
+            print("[CameraShot] Starting camera capture: device=\(device.localizedName), interval=\(iv)s, quality=\(quality), output=\(outputDir.path), ai=\(aiEnabled), voice=\(voiceEnabled)")
+            stopCameraPreview { [weak self] in
+                guard let self else { return }
+                self.livePreview.clear()
+                self.onStart?(.camera(device), iv, quality, outputDir, aiConfig, voiceConfig)
+            }
 
         case .screen:
             guard ensureScreenCapturePermission(promptIfNeeded: false) else {
@@ -1175,7 +1277,7 @@ private final class DualPreviewView: NSView {
 
     func showCamera(session: AVCaptureSession) {
         layer?.contents = nil
-        captureLayer?.removeFromSuperlayer()
+        clear()
         let cl = AVCaptureVideoPreviewLayer(session: session)
         cl.videoGravity = .resizeAspect; cl.frame = bounds
         cl.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
@@ -1183,14 +1285,17 @@ private final class DualPreviewView: NSView {
     }
 
     func showImage(_ image: CGImage) {
-        captureLayer?.removeFromSuperlayer(); captureLayer = nil
+        clear()
         CATransaction.begin(); CATransaction.setDisableActions(true)
         layer?.contentsGravity = .resizeAspect; layer?.contents = image
         CATransaction.commit()
     }
 
     func clear() {
-        captureLayer?.removeFromSuperlayer(); captureLayer = nil; layer?.contents = nil
+        captureLayer?.session = nil
+        captureLayer?.removeFromSuperlayer()
+        captureLayer = nil
+        layer?.contents = nil
     }
 
     override func layout() {

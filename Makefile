@@ -1,15 +1,16 @@
 APP       := CameraShot.app
 MACOS     := $(APP)/Contents/MacOS
 RESOURCES := $(APP)/Contents/Resources
+CONFIG    ?= release
 SIGN_IDENTITY ?=
 NOTARY_PROFILE ?=
 
-.PHONY: build run clean
+.PHONY: build run dev clean
 
 build:
-	swift build -c release
+	swift build -c $(CONFIG)
 	@mkdir -p $(MACOS) $(RESOURCES)/Resources
-	@BUILD_DIR=$$(swift build -c release --show-bin-path); cp "$$BUILD_DIR/CameraShot" $(MACOS)/CameraShot
+	@BUILD_DIR=$$(swift build -c $(CONFIG) --show-bin-path); cp "$$BUILD_DIR/CameraShot" $(MACOS)/CameraShot
 	@cp -R Sources/CameraShot/Resources/. $(RESOURCES)/Resources/
 	@ICON_SRC="Assets.xcassets/AppIcon.appiconset/icon_1024x1024.png"; \
 	if [ -f "$$ICON_SRC" ]; then \
@@ -73,6 +74,11 @@ build:
 # Usage: make run ARGS="5"         (5-second interval, camera menu)
 #        make run ARGS="5 1"       (5-second interval, camera index 1)
 run: build
+	./$(APP)/Contents/MacOS/CameraShot $(ARGS)
+
+dev:
+	$(MAKE) build CONFIG=debug SIGN_IDENTITY=-
+	@echo "✓ Launching debug build. Logs will appear below."
 	./$(APP)/Contents/MacOS/CameraShot $(ARGS)
 
 clean:

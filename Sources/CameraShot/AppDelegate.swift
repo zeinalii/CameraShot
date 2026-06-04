@@ -20,16 +20,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureCtrl: CaptureWindowController?
     private var aiProcessor: AIProcessor?
     private var aiPaused = false
-    /// Max number of concurrent AI responses; set to 1 for strict response-paced capture.
-    private let responseQueueLimit = 1
-    private let responseFlowStateQueue = DispatchQueue(label: "camerashot.response-flow.state")
-    private var responseFlowEnabled = false
-    private var inFlightResponses = 0
 
     // MARK: – Session key (derived from passphrase, held only in RAM)
     private var sessionKey:       SymmetricKey?
     private var sessionSalt:      Data?
-    private var sessionAPIKey:    String?
+    private var sessionCredentials = AICredentials()
 
     // MARK: – Voice / Audio AI controllers
     private var voiceCtrl:    TranscriptionController?
@@ -48,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         captureCtrl?.closeCurrentSession()
+        aiProcessor?.cancel()
         cameraCtrl?.stop()
         screenCtrl?.stop()
         voiceCtrl?.stop()
@@ -68,11 +64,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if EncryptedKeyStore.fileExists() {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 do {
-                    let (apiKey, key, salt) = try EncryptedKeyStore.load(passphrase: passphrase)
+                    let (credentials, key, salt) = try EncryptedKeyStore.load(passphrase: passphrase)
                     DispatchQueue.main.async { [weak self] in
                         self?.sessionKey       = key
                         self?.sessionSalt      = salt
-                        self?.sessionAPIKey    = apiKey
+                        self?.sessionCredentials = credentials
                         self?.showSetup()
                     }
                 } catch {
@@ -93,7 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let salt    = EncryptedKeyStore.generateSalt()
         sessionKey  = EncryptedKeyStore.deriveKey(passphrase: passphrase, salt: salt)
         sessionSalt = salt
-        sessionAPIKey = nil
+        sessionCredentials = AICredentials()
     }
 
     // MARK: – Menu
@@ -247,11 +243,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cameraCtrl?.stop(); screenCtrl?.stop()
         captureCtrl?.closeCurrentSession()
         captureCtrl?.close()
+        aiProcessor?.cancel()
         cameraCtrl = nil; screenCtrl = nil; captureCtrl = nil
         aiProcessor = nil
         voiceCtrl?.stop(); voiceCtrl = nil
         audioAIProc = nil
-        configureResponseFlow(enabled: false)
         showSetup()
     }
 
@@ -265,12 +261,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showSetup() {
         let wc = SetupWindowController()
 
-        wc.saveAPIKey = { [weak self] raw in
+        wc.credentialStatus = { [weak self] in
+            guard let credentials = self?.sessionCredentials else {
+                return AICredentialStatus(hasGeminiKey: false, hasOpenAIKey: false)
+            }
+            return AICredentialStatus(
+                hasGeminiKey: credentials.hasGeminiKey,
+                hasOpenAIKey: credentials.hasOpenAIKey
+            )
+        }
+
+        wc.saveAPIKey = { [weak self] provider, raw in
             guard let key = self?.sessionKey, let salt = self?.sessionSalt else {
                 throw SetupError.noSession
             }
-            try EncryptedKeyStore.save(raw, key: key, salt: salt)
-            self?.sessionAPIKey = raw
+            guard var credentials = self?.sessionCredentials else {
+                throw SetupError.noSession
+            }
+            credentials.setKey(raw, for: provider)
+            try EncryptedKeyStore.save(credentials, key: key, salt: salt)
+            self?.sessionCredentials = credentials
+        }
+
+        wc.removeAPIKey = { [weak self] provider in
+            guard let key = self?.sessionKey, let salt = self?.sessionSalt else {
+                throw SetupError.noSession
+            }
+            guard var credentials = self?.sessionCredentials else {
+                throw SetupError.noSession
+            }
+            credentials.setKey(nil, for: provider)
+            try EncryptedKeyStore.save(credentials, key: key, salt: salt)
+            self?.sessionCredentials = credentials
         }
 
         wc.onStart = { [weak self] source, interval, quality, outputDir, aiConfig, voiceConfig in
@@ -285,20 +307,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: – AI
 
     private func makeAIProcessor(config: AIConfig, window: CaptureWindowController) -> AIProcessor? {
-        guard config.enabled else { return nil }
+        DevLog.log(
+            "VisualAI",
+            "makeAIProcessor enabled=\(config.enabled ? 1 : 0) model=\(config.model) geminiKey=\((sessionCredentials.geminiAPIKey?.isEmpty == false) ? 1 : 0) openAIKey=\((sessionCredentials.openAIAPIKey?.isEmpty == false) ? 1 : 0)"
+        )
+        guard config.enabled else {
+            DevLog.log("VisualAI", "makeAIProcessor skipped because visual AI disabled")
+            return nil
+        }
         let proc = AIProcessor(
             config: config,
-            apiKey: sessionAPIKey,
-            maxConcurrentRequests: responseQueueLimit
+            credentials: sessionCredentials
         )
-        proc.onResult = { [weak self, weak window] text, url in
-            self?.releaseResponseSlot()
+        proc.onProcessingStarted = { [weak window] url, retryIndex, maxRetries in
+            window?.markProcessingStarted(imageURL: url, retryIndex: retryIndex, maxRetries: maxRetries)
+        }
+        proc.onStatus = { [weak window] status, url in
+            window?.updateVisualStatus(status, imageURL: url)
+        }
+        proc.onStreamChunk = { [weak window] chunk, url in
+            window?.appendStreamingChunk(chunk, imageURL: url)
+        }
+        proc.onReplaceResponse = { [weak window] text, url in
+            window?.replaceStreamingContent(text, imageURL: url)
+        }
+        proc.onResult = { [weak window] text, url in
             window?.appendResult(response: text, imageURL: url)
         }
-        proc.onStreamChunk = { [weak window] chunk, url in window?.appendStreamingChunk(chunk, imageURL: url) }
-        proc.onError = { [weak self, weak window] msg, imageURL in
-            self?.releaseResponseSlot()
+        proc.onError = { [weak window] msg, imageURL in
             window?.appendError(msg, imageURL: imageURL)
+        }
+        proc.onDiscard = { [weak window] url in
+            window?.discardStreamingEntry(imageURL: url)
         }
         return proc
     }
@@ -309,35 +349,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         source: CaptureSource, interval: TimeInterval,
         quality: Double, outputDir: URL, aiConfig: AIConfig, voiceConfig: VoiceConfig
     ) {
-        configureResponseFlow(enabled: aiConfig.enabled)
         clearPreviousScreenshots(in: outputDir)
 
         switch source {
         case .camera(let device):
             let ctrl = CameraController(device: device, interval: interval,
                                         jpegQuality: quality, outputDir: outputDir)
-            ctrl.shouldCaptureFrame = { [weak self] in
-                self?.canCaptureNextFrame() ?? false
+            if let error = ctrl.configurationError {
+                showCameraCaptureError(error)
+                return
             }
+            ctrl.shouldCaptureFrame = { true }
             let wc = CaptureWindowController(name: device.localizedName, interval: interval)
             aiProcessor = makeAIProcessor(config: aiConfig, window: wc)
             ctrl.onScreenshotSaved = { [weak self, weak wc] url, n in
+                DevLog.log("Capture", "camera onScreenshotSaved count=\(n) file=\(url.lastPathComponent)")
                 wc?.updateStatus(filename: url.lastPathComponent, count: n)
-                self?.handleNewScreenshot(url, window: wc)
+                self?.handleNewScreenshot(url)
             }
             wc.onPauseAI = { [weak self] paused in self?.aiPaused = paused }
+            wc.onRetryAI = { [weak self] in
+                DevLog.log("VisualAI", "manual retry requested from camera window")
+                self?.aiProcessor?.retryLatestScreenshot()
+            }
             wc.onStop = { [weak self, weak ctrl, weak wc] in
                 let stoppedWindow = wc
                 ctrl?.stop()
                 stoppedWindow?.closeCurrentSession()
                 stoppedWindow?.close()
                 guard let self else { return }
+                self.aiProcessor?.cancel()
                 self.aiProcessor = nil
                 self.aiPaused = false
                 self.voiceCtrl?.stop(); self.voiceCtrl = nil
                 self.audioAIProc = nil
                 self.captureCtrl = nil
-                self.configureResponseFlow(enabled: false)
                 self.showSetup()
                 NSApp.activate(ignoringOtherApps: true)
             }
@@ -382,7 +428,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Audio AI processor — requires Google Gemini key
-        guard let apiKey = sessionAPIKey, !apiKey.isEmpty else { return }
+        guard let apiKey = sessionCredentials.geminiAPIKey, !apiKey.isEmpty else { return }
         let proc = AudioAIProcessor(apiKey: apiKey, systemPrompt: config.audioAIPrompt)
         proc.onChunk = { [weak captureWindow] chunk in captureWindow?.appendAudioAIChunk(chunk) }
         proc.onDone  = { [weak captureWindow] in captureWindow?.finalizeAudioAI() }
@@ -404,28 +450,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) {
         let ctrl = ScreenCaptureController(target: target, interval: interval,
                                            jpegQuality: quality, outputDir: outputDir)
-        ctrl.shouldCaptureFrame = { [weak self] in
-            self?.canCaptureNextFrame() ?? false
-        }
+        ctrl.shouldCaptureFrame = { true }
         let wc = CaptureWindowController(name: name, interval: interval)
         aiProcessor = makeAIProcessor(config: aiConfig, window: wc)
         ctrl.onScreenshotSaved = { [weak self, weak wc] url, n in
+            DevLog.log("Capture", "screen onScreenshotSaved count=\(n) file=\(url.lastPathComponent)")
             wc?.updateStatus(filename: url.lastPathComponent, count: n)
-            self?.handleNewScreenshot(url, window: wc)
+            self?.handleNewScreenshot(url)
         }
         wc.onPauseAI = { [weak self] paused in self?.aiPaused = paused }
+        wc.onRetryAI = { [weak self] in
+            DevLog.log("VisualAI", "manual retry requested from screen window")
+            self?.aiProcessor?.retryLatestScreenshot()
+        }
         wc.onStop = { [weak self, weak ctrl, weak wc] in
             let stoppedWindow = wc
             ctrl?.stop()
             stoppedWindow?.closeCurrentSession()
             stoppedWindow?.close()
             guard let self else { return }
+            self.aiProcessor?.cancel()
             self.aiProcessor = nil
             self.aiPaused = false
             self.voiceCtrl?.stop(); self.voiceCtrl = nil
             self.audioAIProc = nil
             self.captureCtrl = nil
-            self.configureResponseFlow(enabled: false)
             self.showSetup()
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -437,47 +486,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func handleNewScreenshot(_ url: URL, window: CaptureWindowController?) {
-        guard let proc = aiProcessor, !aiPaused else { return }
-        guard reserveResponseSlotIfPossible() else { return }
-        window?.markProcessingStarted(imageURL: url)
+    private func handleNewScreenshot(_ url: URL) {
+        DevLog.log("VisualAI", "handleNewScreenshot file=\(url.lastPathComponent) aiPaused=\(aiPaused ? 1 : 0) hasProcessor=\(aiProcessor == nil ? 0 : 1)")
+        guard let proc = aiProcessor else {
+            DevLog.log("VisualAI", "handleNewScreenshot ignored: no AI processor file=\(url.lastPathComponent)")
+            return
+        }
+        guard !aiPaused else {
+            DevLog.log("VisualAI", "handleNewScreenshot ignored: AI paused file=\(url.lastPathComponent)")
+            return
+        }
+        DevLog.log("VisualAI", "handleNewScreenshot submitting file=\(url.lastPathComponent)")
         proc.process(imageURL: url)
-    }
-
-    // MARK: – Response pacing / capture flow
-
-    private func configureResponseFlow(enabled: Bool) {
-        responseFlowStateQueue.sync {
-            responseFlowEnabled = enabled
-            inFlightResponses = 0
-        }
-    }
-
-    private func canCaptureNextFrame() -> Bool {
-        responseFlowStateQueue.sync {
-            !responseFlowEnabled || inFlightResponses < responseQueueLimit
-        }
-    }
-
-    private func reserveResponseSlotIfPossible() -> Bool {
-        responseFlowStateQueue.sync {
-            guard responseFlowEnabled else { return true }
-            guard inFlightResponses < responseQueueLimit else { return false }
-            inFlightResponses += 1
-            return true
-        }
-    }
-
-    private func releaseResponseSlot() {
-        var shouldTriggerCapture = false
-        responseFlowStateQueue.sync {
-            guard responseFlowEnabled else { return }
-            inFlightResponses = max(0, inFlightResponses - 1)
-            shouldTriggerCapture = inFlightResponses < responseQueueLimit
-        }
-        guard shouldTriggerCapture else { return }
-        cameraCtrl?.requestImmediateCapture()
-        screenCtrl?.requestImmediateCapture()
     }
 
     private func clearPreviousScreenshots(in outputDir: URL) {
@@ -528,6 +548,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         NSApp.terminate(nil)
+    }
+
+    private func showCameraCaptureError(_ message: String) {
+        let alert = NSAlert()
+        alert.window.sharingType = .none
+        alert.messageText = "Camera Capture Failed"
+        alert.informativeText = "\(message)\n\nQuit apps that may be using the camera, then try again. If this is an iPhone/Continuity Camera, make sure it is awake and selected in the camera menu."
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     private func showScreenCaptureError(_ error: Error) {

@@ -20,6 +20,8 @@
     <string>CameraShot.icns</string>
     <key>NSCameraUsageDescription</key>
     <string>CameraShot captures screenshots from your camera at a configurable interval.</string>
+    <key>NSCameraUseContinuityCameraDeviceType</key>
+    <true/>
     <key>NSScreenRecordingUsageDescription</key>
     <string>CameraShot can capture your screen or a specific window at a configurable interval for AI analysis.</string>
     <key>NSPrincipalClass</key>

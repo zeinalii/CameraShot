@@ -69,7 +69,7 @@ final class AudioAIProcessor: @unchecked Sendable {
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else {
             fire { self.onError?("Failed to build request.") }; return
         }
-        guard let url = GeminiAPI.streamURL(model: model, apiKey: apiKey) else {
+        guard let url = GeminiAPI.streamURL(model: model) else {
             fire { self.onError?("Failed to build Gemini request URL.") }; return
         }
 

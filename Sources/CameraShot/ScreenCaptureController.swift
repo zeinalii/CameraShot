@@ -37,7 +37,7 @@ final class ScreenCaptureController: NSObject {
     private var saveCount  = 0
     private let changeFilter = FrameChangeFilter(minimumChangedRatio: 0.03)
     private var savedFiles:  [URL] = []
-    private let maxFiles   = 30
+    private let maxFiles   = RetentionPolicy.screenshotFileLimit
     private let outputDir:   URL
     private let ciContext:   CIContext
 
@@ -97,7 +97,9 @@ final class ScreenCaptureController: NSObject {
     private func captureLoop(filter: SCContentFilter) async {
         while !Task.isCancelled {
             if shouldCaptureFrame?() ?? true {
-                await takeScreenshot(filter: filter)
+                if saveQueue.operationCount == 0 {
+                    await takeScreenshot(filter: filter)
+                }
             }
 
             // Skip sleep if an immediate capture was requested before we got here.

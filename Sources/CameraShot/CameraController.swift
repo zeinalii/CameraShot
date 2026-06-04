@@ -14,11 +14,13 @@ final class CameraController: NSObject {
     var onScreenshotSaved: ((URL, Int) -> Void)?
     /// Capture gate from app flow-control (e.g. AI queue backpressure).
     var shouldCaptureFrame: (() -> Bool)?
+    private(set) var configurationError: String?
 
     // MARK: - Private
 
     private let captureQueue = DispatchQueue(label: "shot.capture", qos: .userInteractive)
     private let saveQueue    = DispatchQueue(label: "shot.save",    qos: .utility)
+    private let saveStateLock = NSLock()
 
     private let interval:     TimeInterval
     private let jpegQuality:  Double
@@ -28,7 +30,8 @@ final class CameraController: NSObject {
 
     /// Rolling buffer — oldest file is deleted once this exceeds maxFiles.
     private var savedFiles:   [URL] = []
-    private let maxFiles      = 30
+    private let maxFiles      = RetentionPolicy.screenshotFileLimit
+    private var saveInFlight  = false
 
     private let outputDir: URL
     private let ciContext: CIContext
@@ -62,7 +65,13 @@ final class CameraController: NSObject {
 
     // MARK: - Control
 
-    func start() { captureQueue.async { self.session.startRunning() } }
+    func start() {
+        captureQueue.async {
+            print("[CameraShot] Starting camera session")
+            self.session.startRunning()
+            print("[CameraShot] Camera session running=\(self.session.isRunning)")
+        }
+    }
     func stop()  { session.stopRunning() }
     /// Allows next frame to bypass interval timing gate once.
     func requestImmediateCapture() {
@@ -74,34 +83,106 @@ final class CameraController: NSObject {
     // MARK: - Session setup
 
     private func configureSession(device: AVCaptureDevice) {
+        print("[CameraShot] Configuring camera session: \(deviceDebugDescription(device))")
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
-
-        for preset in [AVCaptureSession.Preset.hd4K3840x2160, .hd1920x1080, .high] {
-            if session.canSetSessionPreset(preset) { session.sessionPreset = preset; break }
+        defer {
+            session.commitConfiguration()
+            print("[CameraShot] Camera session configuration committed; inputs=\(session.inputs.count), outputs=\(session.outputs.count), preset=\(session.sessionPreset.rawValue)")
         }
 
-        if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else {
+                failConfiguration("Camera session cannot add input for \(device.localizedName) with initial preset=\(session.sessionPreset.rawValue)")
+                return
+            }
             session.addInput(input)
+            print("[CameraShot] Added camera input for \(device.localizedName)")
+        } catch {
+            failConfiguration("Camera input failed for \(device.localizedName): \(error.localizedDescription)")
+            return
         }
 
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(self, queue: captureQueue)
-        if session.canAddOutput(output) { session.addOutput(output) }
+        guard session.canAddOutput(output) else {
+            failConfiguration("Camera session cannot add video output; inputs=\(session.inputs.count), outputs=\(session.outputs.count)")
+            return
+        }
+        session.addOutput(output)
+        print("[CameraShot] Added camera video output")
 
+        applyBestSessionPreset()
         configureDevice(device)
+        print("[CameraShot] Camera session configured for \(device.localizedName), preset=\(session.sessionPreset.rawValue)")
+    }
+
+    private func applyBestSessionPreset() {
+        var selectedPreset: AVCaptureSession.Preset?
+        for preset in [AVCaptureSession.Preset.hd4K3840x2160, .hd1920x1080, .high] {
+            let canSet = session.canSetSessionPreset(preset)
+            print("[CameraShot] Checking camera preset after input/output \(preset.rawValue): canSet=\(canSet)")
+            if canSet {
+                session.sessionPreset = preset
+                selectedPreset = preset
+                break
+            }
+        }
+        if selectedPreset == nil {
+            print("[CameraShot] No preferred camera preset was accepted after input/output; using current preset=\(session.sessionPreset.rawValue)")
+        }
     }
 
     private func configureDevice(_ device: AVCaptureDevice) {
-        do { try device.lockForConfiguration() } catch { return }
+        do { try device.lockForConfiguration() } catch {
+            print("[CameraShot] Could not lock camera for configuration: \(error.localizedDescription)")
+            return
+        }
         defer { device.unlockForConfiguration() }
 
-        device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 60)
+        configureFrameDuration(for: device)
         if device.isFocusModeSupported(.continuousAutoFocus)              { device.focusMode = .continuousAutoFocus }
         if device.isExposureModeSupported(.continuousAutoExposure)        { device.exposureMode = .continuousAutoExposure }
         if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+    }
+
+    private func configureFrameDuration(for device: AVCaptureDevice) {
+        let ranges = device.activeFormat.videoSupportedFrameRateRanges
+        guard !ranges.isEmpty else {
+            print("[CameraShot] Camera active format has no advertised frame-rate ranges; leaving default frame duration")
+            return
+        }
+
+        let preferredMaxFPS = 60.0
+        let preferredRange = ranges
+            .filter { $0.maxFrameRate <= preferredMaxFPS + 0.5 }
+            .max { $0.maxFrameRate < $1.maxFrameRate }
+            ?? ranges.max { $0.maxFrameRate < $1.maxFrameRate }
+
+        guard let range = preferredRange else { return }
+        device.activeVideoMinFrameDuration = range.minFrameDuration
+        device.activeVideoMaxFrameDuration = range.maxFrameDuration
+        print("[CameraShot] Using camera frame-rate range \(String(format: "%.2f", range.minFrameRate))-\(String(format: "%.2f", range.maxFrameRate)) fps")
+    }
+
+    private func failConfiguration(_ message: String) {
+        configurationError = message
+        print("[CameraShot] \(message)")
+    }
+
+    private func deviceDebugDescription(_ device: AVCaptureDevice) -> String {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        return [
+            "name=\(device.localizedName)",
+            "uniqueID=\(device.uniqueID)",
+            "modelID=\(device.modelID)",
+            "type=\(device.deviceType.rawValue)",
+            "position=\(device.position.rawValue)",
+            "formats=\(device.formats.count)",
+            "active=\(dimensions.width)x\(dimensions.height)"
+        ].joined(separator: ", ")
     }
 }
 
@@ -117,10 +198,31 @@ extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastSaveTime >= interval else { return }
         guard shouldCaptureFrame?() ?? true else { return }
+        guard beginSaveIfIdle() else { return }
         lastSaveTime = now
 
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        saveQueue.async { [weak self, pixelBuffer] in self?.persistFrame(pixelBuffer) }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            endSave()
+            return
+        }
+        saveQueue.async { [weak self, pixelBuffer] in
+            defer { self?.endSave() }
+            self?.persistFrame(pixelBuffer)
+        }
+    }
+
+    private func beginSaveIfIdle() -> Bool {
+        saveStateLock.lock()
+        defer { saveStateLock.unlock() }
+        guard !saveInFlight else { return false }
+        saveInFlight = true
+        return true
+    }
+
+    private func endSave() {
+        saveStateLock.lock()
+        saveInFlight = false
+        saveStateLock.unlock()
     }
 
     private func persistFrame(_ pixelBuffer: CVPixelBuffer) {

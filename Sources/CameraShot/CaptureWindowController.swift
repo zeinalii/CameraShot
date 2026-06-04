@@ -13,6 +13,7 @@ final class CaptureWindowController: NSWindowController {
     private let visualBridge = WebViewBatchBridge(label: "visual")
     private var aiPageReady = false
     private var pendingEntries: [(header: String, body: String, isError: Bool)] = []
+    private var pendingVisualScripts: [String] = []
     private var visualPendingChunksByEntryID: [Int: String] = [:]
     private var visualChunkFlushWorkItem: DispatchWorkItem?
     private weak var spinner:  NSProgressIndicator!
@@ -30,6 +31,8 @@ final class CaptureWindowController: NSWindowController {
 
     /// Called when AI is paused (`true`) or resumed (`false`).
     var onPauseAI: ((Bool) -> Void)?
+    /// Called when the user wants to cancel the current visual AI call and retry the latest screenshot.
+    var onRetryAI: (() -> Void)?
     /// Called when the user clicks Stop — stops capture entirely.
     var onStop: (() -> Void)?
 
@@ -49,6 +52,7 @@ final class CaptureWindowController: NSWindowController {
     // Visual-tab buttons
     private weak var zoomOutBtn:    NSButton!
     private weak var zoomInBtn:     NSButton!
+    private weak var visualRetryBtn: NSButton!
     private weak var visualClearBtn: NSButton!
 
     // Transcript-tab buttons
@@ -140,6 +144,7 @@ final class CaptureWindowController: NSWindowController {
     var onAudioAIRequest: ((String) -> Bool)?
     var audioAITokenLimit: Int = 500          // ~4 chars per token
     private var audioAITimer: Timer?
+    private var memoryMaintenanceTimer: Timer?
     private let captureInterval: TimeInterval
     private var lastSentTranscript: String = ""
     private var pendingTranscriptCharsSinceLastSend: Int = 0
@@ -165,14 +170,17 @@ final class CaptureWindowController: NSWindowController {
         win.isMovableByWindowBackground = true
         super.init(window: win)
         buildUI(name: name, interval: interval)
+        startMemoryMaintenanceTimer()
     }
 
     deinit {
         audioAITimer?.invalidate()
+        memoryMaintenanceTimer?.invalidate()
         visualChunkFlushWorkItem?.cancel()
         audioAIChunkFlushWorkItem?.cancel()
         opencodeChunkFlushWorkItem?.cancel()
         fileExploreChangeDebounceWorkItem?.cancel()
+        pendingVisualScripts.removeAll(keepingCapacity: false)
         visualBridge.clear()
         audioAIBridge.clear()
         opencodeBridge.clear()
@@ -198,6 +206,7 @@ final class CaptureWindowController: NSWindowController {
     func closeCurrentSession() {
         audioAITimer?.invalidate()
         audioAITimer = nil
+        stopMemoryMaintenanceTimer()
         stopActiveOpencodeProcess(resetSession: true, closeRemoteSession: true)
         stopFileExploreRealtimeRefresh()
     }
@@ -205,31 +214,165 @@ final class CaptureWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
 
+    // MARK: - Self Maintenance
+
+    private func startMemoryMaintenanceTimer() {
+        memoryMaintenanceTimer?.invalidate()
+        let interval = RetentionPolicy.memoryMaintenanceInterval
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.runMemoryMaintenance(reason: "timer")
+        }
+        timer.tolerance = min(10, interval * 0.25)
+        RunLoop.main.add(timer, forMode: .common)
+        memoryMaintenanceTimer = timer
+        runMemoryMaintenance(reason: "startup")
+    }
+
+    private func stopMemoryMaintenanceTimer() {
+        memoryMaintenanceTimer?.invalidate()
+        memoryMaintenanceTimer = nil
+    }
+
+    private func runMemoryMaintenance(reason: String) {
+        trimVisualNativeState(reason: reason)
+        trimAudioAINativeState(reason: reason)
+        trimOpencodeNativeState(reason: reason)
+        trimFileExploreNativeState(reason: reason)
+
+        if aiPageReady {
+            visualBridge.enqueue("performMemoryMaintenance()", immediate: true)
+        }
+        if audioAIPageReady {
+            audioAIBridge.enqueue("performMemoryMaintenance()", immediate: true)
+        }
+        if opencodeChatPageReady {
+            opencodeBridge.enqueue("performMemoryMaintenance()", immediate: true)
+        }
+    }
+
+    private func trimVisualNativeState(reason: String) {
+        let activeEntryIDs = Set(entryIdByImageURL.values)
+        let chunkCountBefore = visualPendingChunksByEntryID.count
+        visualPendingChunksByEntryID = visualPendingChunksByEntryID.filter { activeEntryIDs.contains($0.key) }
+
+        if pendingEntries.count > RetentionPolicy.pendingVisualEntryLimit {
+            pendingEntries.removeFirst(pendingEntries.count - RetentionPolicy.pendingVisualEntryLimit)
+        }
+        if pendingVisualScripts.count > RetentionPolicy.pendingVisualScriptLimit {
+            pendingVisualScripts.removeFirst(pendingVisualScripts.count - RetentionPolicy.pendingVisualScriptLimit)
+        }
+        if pendingCount != entryIdByImageURL.count {
+            pendingCount = entryIdByImageURL.count
+        }
+
+        if chunkCountBefore != visualPendingChunksByEntryID.count {
+            DevLog.log(
+                "VisualUI",
+                "memory maintenance reason=\(reason) trimmedVisualChunks \(chunkCountBefore)->\(visualPendingChunksByEntryID.count)"
+            )
+        }
+    }
+
+    private func trimAudioAINativeState(reason: String) {
+        guard let activeEntry = audioAICurrentEntry else {
+            if !audioAIPendingChunksByEntryID.isEmpty {
+                DevLog.log("AudioAI", "memory maintenance reason=\(reason) clearing stale audio chunks count=\(audioAIPendingChunksByEntryID.count)")
+                audioAIPendingChunksByEntryID.removeAll(keepingCapacity: false)
+            }
+            return
+        }
+        audioAIPendingChunksByEntryID = audioAIPendingChunksByEntryID.filter { $0.key == activeEntry }
+    }
+
+    private func trimOpencodeNativeState(reason: String) {
+        guard let activeEntry = opencodeCurrentStreamingEntryID else {
+            if !opencodePendingStreamingChunksByEntryID.isEmpty {
+                DevLog.log("Opencode", "memory maintenance reason=\(reason) clearing stale opencode chunks count=\(opencodePendingStreamingChunksByEntryID.count)")
+                opencodePendingStreamingChunksByEntryID.removeAll(keepingCapacity: false)
+            }
+            return
+        }
+        opencodePendingStreamingChunksByEntryID = opencodePendingStreamingChunksByEntryID.filter { $0.key == activeEntry }
+    }
+
+    private func trimFileExploreNativeState(reason: String) {
+        guard fileExploreIconCache.count > RetentionPolicy.fileExploreIconCacheLimit else { return }
+        DevLog.log("FileExplore", "memory maintenance reason=\(reason) clearing icon cache count=\(fileExploreIconCache.count)")
+        fileExploreIconCache.removeAll(keepingCapacity: true)
+    }
+
     // MARK: – Public
 
     func updateStatus(filename: String, count: Int) {
         DispatchQueue.main.async { [weak self] in
+            DevLog.log("VisualUI", "saved status count=\(count) file=\(filename)")
             self?.countLabel.stringValue = "saved \(count)"
         }
     }
 
     // MARK: – Public — AI results
 
-    func markProcessingStarted(imageURL: URL) {
+    func markProcessingStarted(imageURL: URL, retryIndex: Int = 0, maxRetries: Int = 3) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            if entryIdByImageURL[imageURL] != nil {
+                DevLog.log("VisualUI", "markProcessingStarted duplicate file=\(imageURL.lastPathComponent) retry=\(retryIndex)/\(maxRetries)")
+                updateVisualStatus("Retry \(retryIndex) of \(maxRetries)", imageURL: imageURL)
+                return
+            }
             pendingCount += 1
             let entryId = nextStreamingEntryId
             nextStreamingEntryId += 1
             entryIdByImageURL[imageURL] = entryId
-            startStreamingEntry(imageURL: imageURL, entryId: entryId)
+            DevLog.log(
+                "VisualUI",
+                "markProcessingStarted entry=\(entryId) file=\(imageURL.lastPathComponent) retry=\(retryIndex)/\(maxRetries) aiPageReady=\(aiPageReady ? 1 : 0) pendingCount=\(pendingCount)"
+            )
+            startStreamingEntry(imageURL: imageURL, entryId: entryId, retryIndex: retryIndex, maxRetries: maxRetries)
+        }
+    }
+
+    func updateVisualStatus(_ status: String, imageURL: URL) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let entryId = entryIdByImageURL[imageURL] else {
+                DevLog.log("VisualUI", "status dropped missing entry file=\(imageURL.lastPathComponent) status=\(status)")
+                return
+            }
+            guard let js = jsLiteral(status) else {
+                DevLog.log("VisualUI", "status dropped jsLiteral failed entry=\(entryId) statusLength=\(status.count)")
+                return
+            }
+            DevLog.log("VisualUI", "status entry=\(entryId) file=\(imageURL.lastPathComponent) status=\(status)")
+            enqueueVisualJavaScript("setStreamingEntryStatus(\(entryId), \(js))", immediate: true)
+        }
+    }
+
+    func replaceStreamingContent(_ markdown: String, imageURL: URL) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let entryId = entryIdByImageURL[imageURL] else {
+                DevLog.log("VisualUI", "replace dropped missing entry file=\(imageURL.lastPathComponent) chars=\(markdown.count)")
+                return
+            }
+            guard let js = jsLiteral(markdown) else {
+                DevLog.log("VisualUI", "replace dropped jsLiteral failed entry=\(entryId) chars=\(markdown.count)")
+                return
+            }
+            DevLog.log("VisualUI", "replace entry=\(entryId) file=\(imageURL.lastPathComponent) chars=\(markdown.count)")
+            visualPendingChunksByEntryID.removeValue(forKey: entryId)
+            enqueueVisualJavaScript("replaceStreamingEntryContent(\(entryId), \(js))", immediate: true)
         }
     }
 
     func appendStreamingChunk(_ chunk: String, imageURL: URL) {
         DispatchQueue.main.async { [weak self] in
-            guard let self,
-                  let entryId = entryIdByImageURL[imageURL] else { return }
+            guard let self else { return }
+            guard let entryId = entryIdByImageURL[imageURL] else {
+                DevLog.log("VisualUI", "chunk dropped missing entry file=\(imageURL.lastPathComponent) chars=\(chunk.count)")
+                return
+            }
+            DevLog.log("VisualUI", "chunk queued entry=\(entryId) file=\(imageURL.lastPathComponent) chars=\(chunk.count)")
             visualPendingChunksByEntryID[entryId, default: ""] += chunk
             scheduleVisualChunkFlush()
         }
@@ -239,10 +382,17 @@ final class CaptureWindowController: NSWindowController {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             pendingCount = max(0, pendingCount - 1)
-            guard let entryId = entryIdByImageURL.removeValue(forKey: imageURL) else { return }
+            guard let entryId = entryIdByImageURL.removeValue(forKey: imageURL) else {
+                DevLog.log("VisualUI", "result dropped missing entry file=\(imageURL.lastPathComponent) chars=\(fullMarkdown.count) pendingCount=\(pendingCount)")
+                return
+            }
+            DevLog.log("VisualUI", "result entry=\(entryId) file=\(imageURL.lastPathComponent) chars=\(fullMarkdown.count) pendingCount=\(pendingCount)")
             flushVisualStreamingChunks(for: entryId)
-            guard let js = jsLiteral(fullMarkdown) else { return }
-            visualBridge.enqueue("endStreamingEntry(\(entryId), \(js))", immediate: true)
+            guard let js = jsLiteral(fullMarkdown) else {
+                DevLog.log("VisualUI", "result dropped jsLiteral failed entry=\(entryId) chars=\(fullMarkdown.count)")
+                return
+            }
+            enqueueVisualJavaScript("endStreamingEntry(\(entryId), \(js))", immediate: true)
         }
     }
 
@@ -257,12 +407,28 @@ final class CaptureWindowController: NSWindowController {
             if let imageURL,
                let entryId = entryIdByImageURL.removeValue(forKey: imageURL),
                let js = jsLiteral(message) {
+                DevLog.log("VisualUI", "error entry=\(entryId) file=\(imageURL.lastPathComponent) message=\(message)")
                 flushVisualStreamingChunks(for: entryId)
-                visualBridge.enqueue("endStreamingEntryAsError(\(entryId), \(js))", immediate: true)
+                enqueueVisualJavaScript("endStreamingEntryAsError(\(entryId), \(js))", immediate: true)
                 return
             }
+            DevLog.log("VisualUI", "error standalone image=\(imageURL?.lastPathComponent ?? "nil") message=\(message)")
             let header = "[\(Self.timeString())]  Error"
             appendEntry(header: header, body: message, isError: true)
+        }
+    }
+
+    func discardStreamingEntry(imageURL: URL) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let entryId = entryIdByImageURL.removeValue(forKey: imageURL) else {
+                DevLog.log("VisualUI", "discard dropped missing entry file=\(imageURL.lastPathComponent)")
+                return
+            }
+            pendingCount = max(0, pendingCount - 1)
+            DevLog.log("VisualUI", "discard entry=\(entryId) file=\(imageURL.lastPathComponent) pendingCount=\(pendingCount)")
+            visualPendingChunksByEntryID.removeValue(forKey: entryId)
+            enqueueVisualJavaScript("removeStreamingEntry(\(entryId))", immediate: true)
         }
     }
 
@@ -519,8 +685,8 @@ final class CaptureWindowController: NSWindowController {
         let config = WKWebViewConfiguration()
         let handler = CopyCodeHandler(pageReady: { [weak self] in
             DispatchQueue.main.async {
-                self?.aiPageReady = true
-                self?.flushPendingEntries()
+                DevLog.log("VisualUI", "pageReady message received")
+                self?.markVisualPageReady(reason: "pageReady")
             }
         })
         config.userContentController.add(handler, name: "copyCode")
@@ -559,6 +725,7 @@ final class CaptureWindowController: NSWindowController {
         let aiHandler = CopyCodeHandler(pageReady: { [weak self] in
             DispatchQueue.main.async {
                 self?.audioAIPageReady = true
+                self?.audioAIBridge.enqueue("setMaxRenderedEntries(\(RetentionPolicy.audioAIRenderedEntryLimit))", immediate: true)
             }
         })
         aiCfg.userContentController.add(aiHandler, name: "copyCode")
@@ -636,6 +803,7 @@ final class CaptureWindowController: NSWindowController {
         let opencodeChatHandler = CopyCodeHandler(pageReady: { [weak self] in
             DispatchQueue.main.async {
                 self?.opencodeChatPageReady = true
+                self?.opencodeBridge.enqueue("setMaxRenderedEntries(\(RetentionPolicy.opencodeRenderedEntryLimit))", immediate: true)
                 self?.flushOpencodePendingChatEntries()
                 self?.flushOpencodePendingChatScripts()
             }
@@ -779,6 +947,8 @@ final class CaptureWindowController: NSWindowController {
         // Visual-tab buttons (right side)
         let zo = barBtn("−", action: #selector(zoomOut)); zoomOutBtn    = zo
         let zi = barBtn("+", action: #selector(zoomIn));  zoomInBtn     = zi
+        let vr = barBtn("Retry", action: #selector(retryAI))
+        vr.font = .systemFont(ofSize: 11);                visualRetryBtn = vr
         let vc = barBtn("Clear", action: #selector(clearAI))
         vc.font = .systemFont(ofSize: 11);                visualClearBtn = vc
 
@@ -795,7 +965,7 @@ final class CaptureWindowController: NSWindowController {
         let askBtn = barBtn("Ask AI", action: #selector(askAITapped))
         askBtn.font = .systemFont(ofSize: 11); askBtn.isHidden = true; audioAIAskBtn = askBtn
 
-        [zo, zi, vc, ac, azo, azi, aac, askBtn].forEach { innerBar.addSubview($0) }
+        [zo, zi, vr, vc, ac, azo, azi, aac, askBtn].forEach { innerBar.addSubview($0) }
 
         let divider = NSBox(); divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
@@ -820,8 +990,10 @@ final class CaptureWindowController: NSWindowController {
             // Visual buttons (right)
             zo.trailingAnchor.constraint(equalTo: zi.leadingAnchor, constant: -2),
             zo.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
-            zi.trailingAnchor.constraint(equalTo: vc.leadingAnchor, constant: -10),
+            zi.trailingAnchor.constraint(equalTo: vr.leadingAnchor, constant: -10),
             zi.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            vr.trailingAnchor.constraint(equalTo: vc.leadingAnchor, constant: -6),
+            vr.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
             vc.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
             vc.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
 
@@ -960,6 +1132,7 @@ final class CaptureWindowController: NSWindowController {
 
         zoomOutBtn.isHidden       = !isVisual
         zoomInBtn.isHidden        = !isVisual
+        visualRetryBtn.isHidden   = !isVisual
         visualClearBtn.isHidden   = !isVisual
         audioClearBtn.isHidden    = !isTranscript
         audioAIZoomOutBtn.isHidden = !isAudioAI
@@ -2743,16 +2916,21 @@ final class CaptureWindowController: NSWindowController {
 
     // MARK: – AI helpers
 
-    private func startStreamingEntry(imageURL: URL, entryId: Int) {
-        let header = "[\(Self.timeString())]  \(imageURL.lastPathComponent)"
+    private func startStreamingEntry(imageURL: URL, entryId: Int, retryIndex: Int, maxRetries: Int) {
+        let retryText = retryIndex == 0 ? "Attempt 1" : "Retry \(retryIndex) of \(maxRetries)"
+        let header = "[\(Self.timeString())]  \(imageURL.lastPathComponent)\n\(retryText)"
         guard let hJS = jsLiteral(header) else { return }
-        visualBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
+        DevLog.log("VisualUI", "startStreamingEntry entry=\(entryId) file=\(imageURL.lastPathComponent) aiPageReady=\(aiPageReady ? 1 : 0)")
+        enqueueVisualJavaScript("startStreamingEntry(\(hJS), null, \(entryId))")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let dataURL = Self.thumbnailDataURL(for: imageURL, maxWidth: 280)
             DispatchQueue.main.async {
                 guard let self else { return }
                 if let url = dataURL, let urlJS = self.jsLiteral(url) {
-                    self.visualBridge.enqueue("setStreamingEntryThumbnail(\(entryId), \(urlJS))")
+                    DevLog.log("VisualUI", "thumbnail ready entry=\(entryId) file=\(imageURL.lastPathComponent) chars=\(url.count)")
+                    self.enqueueVisualJavaScript("setStreamingEntryThumbnail(\(entryId), \(urlJS))")
+                } else {
+                    DevLog.log("VisualUI", "thumbnail failed entry=\(entryId) file=\(imageURL.lastPathComponent)")
                 }
             }
         }
@@ -2793,7 +2971,8 @@ final class CaptureWindowController: NSWindowController {
         }
         for (id, text) in targets.sorted(by: { $0.0 < $1.0 }) {
             guard let js = jsLiteral(text) else { continue }
-            visualBridge.enqueue("appendStreamingChunk(\(id), \(js))")
+            DevLog.log("VisualUI", "flush chunk entry=\(id) chars=\(text.count) aiPageReady=\(aiPageReady ? 1 : 0)")
+            enqueueVisualJavaScript("appendStreamingChunk(\(id), \(js))")
         }
         visualBridge.flushNow()
     }
@@ -2853,28 +3032,132 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func appendEntry(header: String, body: String, isError: Bool) {
+        DevLog.log("VisualUI", "appendEntry queued isError=\(isError ? 1 : 0) aiPageReady=\(aiPageReady ? 1 : 0) header=\(header)")
         pendingEntries.append((header, body, isError))
+        if pendingEntries.count > RetentionPolicy.pendingVisualEntryLimit {
+            let overflow = pendingEntries.count - RetentionPolicy.pendingVisualEntryLimit
+            pendingEntries.removeFirst(overflow)
+            DevLog.log("VisualUI", "trimmed pending visual entries overflow=\(overflow) remaining=\(pendingEntries.count)")
+        }
         flushPendingEntries()
     }
 
     private func flushPendingEntries() {
+        DevLog.log("VisualUI", "flushPendingEntries ready=\(aiPageReady ? 1 : 0) count=\(pendingEntries.count)")
         guard aiPageReady, !pendingEntries.isEmpty else { return }
         for item in pendingEntries {
             guard let hJS = jsLiteral(item.header), let bJS = jsLiteral(item.body) else { continue }
             let js = "appendEntry(\(hJS), \(bJS), \(item.isError ? "true" : "false"))"
-            visualBridge.enqueue(js)
+            enqueueVisualJavaScript(js)
         }
         pendingEntries.removeAll()
+        flushPendingVisualScripts()
         visualBridge.flushNow()
     }
 
-    @objc private func zoomIn()  { visualBridge.enqueue("adjustZoom(1)", immediate: true) }
-    @objc private func zoomOut() { visualBridge.enqueue("adjustZoom(-1)", immediate: true) }
+    private func markVisualPageReady(reason: String) {
+        if aiPageReady {
+            DevLog.log("VisualUI", "markVisualPageReady ignored alreadyReady reason=\(reason)")
+            return
+        }
+        DevLog.log("VisualUI", "markVisualPageReady reason=\(reason)")
+        aiPageReady = true
+        enqueueVisualJavaScript("setMaxRenderedEntries(\(RetentionPolicy.visualRenderedEntryLimit))", immediate: true)
+        flushPendingEntries()
+        flushPendingVisualScripts()
+    }
+
+    private func probeVisualPageReadiness(reason: String) {
+        guard let webView else {
+            DevLog.log("VisualUI", "probeVisualPageReadiness skipped no webView reason=\(reason)")
+            return
+        }
+        let js = """
+        (function() {
+          return [
+            typeof startStreamingEntry,
+            typeof setStreamingEntryStatus,
+            typeof appendStreamingChunk,
+            typeof endStreamingEntry
+          ].join(",");
+        })()
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, error in
+            DispatchQueue.main.async {
+                if let error {
+                    DevLog.log("VisualUI", "probeVisualPageReadiness error reason=\(reason) error=\(error.localizedDescription)")
+                    return
+                }
+                let value = result as? String ?? "nil"
+                DevLog.log("VisualUI", "probeVisualPageReadiness reason=\(reason) result=\(value)")
+                if value == "function,function,function,function" {
+                    self?.markVisualPageReady(reason: "probe:\(reason)")
+                }
+            }
+        }
+    }
+
+    private func enqueueVisualJavaScript(_ script: String, immediate: Bool = false) {
+        guard aiPageReady else {
+            pendingVisualScripts.append(script)
+            if pendingVisualScripts.count > RetentionPolicy.pendingVisualScriptLimit {
+                let overflow = pendingVisualScripts.count - RetentionPolicy.pendingVisualScriptLimit
+                pendingVisualScripts.removeFirst(overflow)
+                DevLog.log("VisualUI", "trimmed pending visual scripts overflow=\(overflow) remaining=\(pendingVisualScripts.count)")
+            }
+            DevLog.log("VisualUI", "queue visual script count=\(pendingVisualScripts.count) script=\(visualScriptName(script))")
+            return
+        }
+        DevLog.log("VisualUI", "enqueue visual script immediate=\(immediate ? 1 : 0) script=\(visualScriptName(script))")
+        visualBridge.enqueue(script, immediate: immediate)
+    }
+
+    private func flushPendingVisualScripts() {
+        DevLog.log("VisualUI", "flushPendingVisualScripts ready=\(aiPageReady ? 1 : 0) count=\(pendingVisualScripts.count)")
+        guard aiPageReady, !pendingVisualScripts.isEmpty else { return }
+        let scripts = pendingVisualScripts
+        pendingVisualScripts.removeAll(keepingCapacity: true)
+        for script in scripts {
+            visualBridge.enqueue(script)
+        }
+        visualBridge.flushNow()
+    }
+
+    @objc private func zoomIn()  { enqueueVisualJavaScript("adjustZoom(1)", immediate: true) }
+    @objc private func zoomOut() { enqueueVisualJavaScript("adjustZoom(-1)", immediate: true) }
+    @objc private func retryAI() {
+        DevLog.log("VisualUI", "retryAI tapped activeEntries=\(entryIdByImageURL.count) pendingCount=\(pendingCount)")
+        removeActiveVisualStreamingEntriesForRetry()
+        onRetryAI?()
+    }
+
     @objc private func clearAI() {
+        DevLog.log("VisualUI", "clearAI pendingEntries=\(pendingEntries.count) pendingScripts=\(pendingVisualScripts.count) activeEntries=\(entryIdByImageURL.count)")
         visualPendingChunksByEntryID.removeAll(keepingCapacity: false)
+        pendingVisualScripts.removeAll(keepingCapacity: false)
         visualChunkFlushWorkItem?.cancel()
         visualChunkFlushWorkItem = nil
-        visualBridge.enqueue("clearFeed()", immediate: true)
+        enqueueVisualJavaScript("clearFeed()", immediate: true)
+    }
+
+    private func removeActiveVisualStreamingEntriesForRetry() {
+        let activeEntries = entryIdByImageURL
+        guard !activeEntries.isEmpty else { return }
+        entryIdByImageURL.removeAll(keepingCapacity: true)
+        pendingCount = max(0, pendingCount - activeEntries.count)
+        for (imageURL, entryId) in activeEntries {
+            DevLog.log("VisualUI", "retry removing active entry=\(entryId) file=\(imageURL.lastPathComponent)")
+            visualPendingChunksByEntryID.removeValue(forKey: entryId)
+            enqueueVisualJavaScript("removeStreamingEntry(\(entryId))", immediate: true)
+        }
+    }
+
+    private func visualScriptName(_ script: String) -> String {
+        let trimmed = script.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let paren = trimmed.firstIndex(of: "(") {
+            return String(trimmed[..<paren])
+        }
+        return String(trimmed.prefix(80))
     }
 
     private func jsLiteral(_ s: String) -> String? {
@@ -3299,7 +3582,7 @@ final class CaptureWindowController: NSWindowController {
       var userScrolledUp = false;
       var streamingBodiesById = Object.create(null);
       var pendingAutoScroll = false;
-      var maxRenderedEntries = 220;
+      var maxRenderedEntries = 80;
       window.addEventListener('scroll', function() {
         var sv = document.scrollingElement || document.documentElement;
         userScrolledUp = sv.scrollTop + sv.clientHeight < sv.scrollHeight - 60;
@@ -3340,6 +3623,31 @@ final class CaptureWindowController: NSWindowController {
             feed.removeChild(prev);
           }
         }
+      }
+
+      function setMaxRenderedEntries(limit) {
+        var parsed = Number(limit);
+        if (!Number.isFinite(parsed)) return;
+        maxRenderedEntries = Math.max(1, Math.floor(parsed));
+        pruneFeedIfNeeded();
+      }
+
+      function performMemoryMaintenance() {
+        pruneFeedIfNeeded();
+        var feed = document.getElementById('feed');
+        var liveStreamingIds = Object.create(null);
+        if (feed) {
+          Array.from(feed.children).forEach(function(node) {
+            if (!node || !node.dataset || node.dataset.entryKind !== 'entry') return;
+            if (node.dataset.entryId) liveStreamingIds[String(node.dataset.entryId)] = true;
+          });
+        }
+        Object.keys(streamingBodiesById).forEach(function(entryId) {
+          var body = streamingBodiesById[entryId];
+          if (!body || !body.isConnected || !liveStreamingIds[entryId]) {
+            delete streamingBodiesById[entryId];
+          }
+        });
       }
 
       function escapeHtml(s) {
@@ -3389,6 +3697,41 @@ final class CaptureWindowController: NSWindowController {
           streamingBodiesById[String(entryId)] = body;
           scheduleAutoScroll();
         } catch (e) { console.error('startStreamingEntry', e); }
+      }
+      function setStreamingEntryStatus(entryId, status) {
+        var entry = document.querySelector('[data-entry-id="' + entryId + '"]');
+        if (!entry) return;
+        var hdr = entry.querySelector('.entry-header');
+        if (!hdr) return;
+        var lines = (hdr.textContent || '').split('\\n');
+        if (lines.length <= 1) hdr.textContent = lines[0] + '\\n' + status;
+        else { lines[lines.length - 1] = status; hdr.textContent = lines.join('\\n'); }
+      }
+      function replaceStreamingEntryContent(entryId, markdown) {
+        var key = String(entryId);
+        var body = streamingBodiesById[key];
+        if (!body) {
+          var entry = document.querySelector('[data-entry-id="' + entryId + '"]');
+          body = entry ? entry.querySelector('.streaming-body, .entry-body, .entry-error-body') : null;
+        }
+        if (!body) return;
+        body.classList.remove('entry-error-body');
+        body.classList.add('streaming-body');
+        streamingBodiesById[key] = body;
+        body.textContent = markdown || '';
+        scheduleAutoScroll();
+      }
+      function removeStreamingEntry(entryId) {
+        var entry = document.querySelector('[data-entry-id="' + entryId + '"]');
+        if (!entry || !entry.parentNode) return;
+        delete streamingBodiesById[String(entryId)];
+        destroyEntryNode(entry);
+        var prev = entry.previousElementSibling;
+        var next = entry.nextElementSibling;
+        var parent = entry.parentNode;
+        parent.removeChild(entry);
+        if (next && next.classList && next.classList.contains('entry-divider')) parent.removeChild(next);
+        else if (prev && prev.classList && prev.classList.contains('entry-divider')) parent.removeChild(prev);
       }
       function setStreamingEntryThumbnail(entryId, dataURL) {
         var entry = document.querySelector('[data-entry-id="' + entryId + '"]');
@@ -3561,7 +3904,12 @@ final class CaptureWindowController: NSWindowController {
 
       function clearFeed() {
         var feed = document.getElementById('feed');
-        if (feed) feed.innerHTML = '';
+        if (feed) {
+          Array.from(feed.children).forEach(function(node) {
+            if (node && node.dataset && node.dataset.entryKind === 'entry') destroyEntryNode(node);
+          });
+          feed.innerHTML = '';
+        }
         streamingBodiesById = Object.create(null);
       }
 
@@ -3697,8 +4045,8 @@ extension CaptureWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
 
 extension CaptureWindowController: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        aiPageReady = true
-        flushPendingEntries()
+        DevLog.log("VisualUI", "WKNavigation didFinish visual webView")
+        probeVisualPageReadiness(reason: "didFinish")
     }
 }
 
