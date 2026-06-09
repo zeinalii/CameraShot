@@ -23,7 +23,7 @@
     <key>NSCameraUseContinuityCameraDeviceType</key>
     <true/>
     <key>NSScreenRecordingUsageDescription</key>
-    <string>CameraShot can capture your screen or a specific window at a configurable interval for AI analysis.</string>
+    <string>CameraShot can capture your screen, window, and system audio at a configurable interval for AI analysis.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>LSApplicationCategoryType</key>

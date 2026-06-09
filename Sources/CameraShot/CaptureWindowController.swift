@@ -35,14 +35,26 @@ final class CaptureWindowController: NSWindowController {
     var onRetryAI: (() -> Void)?
     /// Called when the user clicks Stop — stops capture entirely.
     var onStop: (() -> Void)?
+    /// Called when passive Audio AI is paused (`true`) or resumed (`false`).
+    var onAudioAIPauseChanged: ((Bool) -> Void)?
+    /// Called when the user sends a Chat tab message.
+    var onChatSend: ((String, URL?) -> Void)?
+    /// Called when the user restarts the Chat tab session.
+    var onChatRestart: (() -> Void)?
 
-    // MARK: – Content tab (Visual / Transcript / Audio AI / Opencode / File Explore)
+    // MARK: – Content tab (Visual / Audio AI / Instant Voice / Opencode / File Explore)
 
     private enum ContentTab: Int {
         case visual = 0
-        case transcript = 1
-        case audioAI = 2
-        case opencode = 3
+        case audioAI = 1
+        case instantVoice = 2
+        case chat = 3
+        case opencode = 4
+    }
+
+    private enum InstantVoiceHoldSource: Hashable {
+        case mouse
+        case keyboard
     }
 
     private weak var contentTabControl: NSSegmentedControl!
@@ -55,14 +67,29 @@ final class CaptureWindowController: NSWindowController {
     private weak var visualRetryBtn: NSButton!
     private weak var visualClearBtn: NSButton!
 
-    // Transcript-tab buttons
-    private weak var audioClearBtn: NSButton!
-
     // Audio AI-tab buttons
-    private weak var audioAIAskBtn:    NSButton!
     private weak var audioAIClearBtn:  NSButton!
+    private weak var audioAIPauseBtn:  NSButton!
+    private weak var audioAIManualTurnBtn: NSButton!
     private weak var audioAIZoomOutBtn: NSButton!
     private weak var audioAIZoomInBtn:  NSButton!
+    private var audioAIPaused = false
+    private var audioAIState: RealtimeAudioAIController.PassiveState = .starting
+
+    // Instant Voice-tab buttons
+    private weak var instantVoiceHoldBtn: HoldToTalkButton!
+    private weak var instantVoiceClearBtn: NSButton!
+    private weak var instantVoiceZoomOutBtn: NSButton!
+    private weak var instantVoiceZoomInBtn: NSButton!
+
+    // Chat-tab controls
+    private weak var chatContainerView: NSView!
+    private weak var chatRestartBtn: NSButton!
+    private weak var chatSendButton: NSButton!
+    private weak var chatInputField: NSTextField!
+    private weak var chatAttachScreenshotCheckbox: NSButton!
+    private weak var chatZoomOutBtn: NSButton!
+    private weak var chatZoomInBtn: NSButton!
 
     // Opencode tab controls
     private weak var opencodeContainerView: NSView!
@@ -124,12 +151,6 @@ final class CaptureWindowController: NSWindowController {
     private var fileExploreSelectedFingerprint: String?
     private let fileExplorePreviewMaxBytes = 1_500_000
 
-    // Transcript feed
-    private weak var audioScrollView: NSScrollView!
-    private var audioTextView:        NSTextView!   // strong (inside scrollview)
-    private var transcriptBuffer:     String = ""   // last N chars for Audio AI
-    private let transcriptDisplayCharLimit = 200_000
-
     // Audio AI feed
     private var audioAIWebView:      WKWebView!     // strong
     private let audioAIBridge = WebViewBatchBridge(label: "audioAI")
@@ -140,14 +161,37 @@ final class CaptureWindowController: NSWindowController {
     private var audioAIPendingChunksByEntryID: [Int: String] = [:]
     private var audioAIChunkFlushWorkItem: DispatchWorkItem?
 
-    // Audio AI callbacks / timer
-    var onAudioAIRequest: ((String) -> Bool)?
-    var audioAITokenLimit: Int = 500          // ~4 chars per token
-    private var audioAITimer: Timer?
+    // Instant Voice feed
+    private var instantVoiceWebView:      WKWebView!     // strong
+    private let instantVoiceBridge = WebViewBatchBridge(label: "instantVoice")
+    private var instantVoicePageReady     = false
+    private var instantVoiceNextEntryId   = 0
+    private var instantVoiceCurrentEntry: Int?
+    private var instantVoiceStreamingText = ""
+    private var instantVoicePendingChunksByEntryID: [Int: String] = [:]
+    private var instantVoiceChunkFlushWorkItem: DispatchWorkItem?
+
+    // Chat feed
+    private var chatWebView: WKWebView!
+    private let chatBridge = WebViewBatchBridge(label: "chat")
+    private var chatPageReady = false
+    private var chatAvailable = false
+    private var chatIsResponding = false
+    private var chatNextEntryId = 0
+    private var chatCurrentAssistantEntry: Int?
+    private var chatStreamingText = ""
+    private var chatPendingChunksByEntryID: [Int: String] = [:]
+    private var chatChunkFlushWorkItem: DispatchWorkItem?
+    private var latestVisualScreenshotURL: URL?
+
+    // Instant Voice callbacks
+    var onInstantVoiceHoldChanged: ((Bool) -> Void)?
+    var onAudioAIManualTurnEnd: (() -> Void)?
+    private var instantVoiceAvailable = false
+    private var instantVoiceHoldSources: Set<InstantVoiceHoldSource> = []
+    private var instantVoiceSpaceMonitor: Any?
     private var memoryMaintenanceTimer: Timer?
     private let captureInterval: TimeInterval
-    private var lastSentTranscript: String = ""
-    private var pendingTranscriptCharsSinceLastSend: Int = 0
 
     // MARK: – Init
 
@@ -170,19 +214,34 @@ final class CaptureWindowController: NSWindowController {
         win.isMovableByWindowBackground = true
         super.init(window: win)
         buildUI(name: name, interval: interval)
+        installInstantVoiceSpaceMonitor()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(captureWindowDidResignKey(_:)),
+            name: NSWindow.didResignKeyNotification,
+            object: win
+        )
         startMemoryMaintenanceTimer()
     }
 
     deinit {
-        audioAITimer?.invalidate()
+        releaseInstantVoiceHoldSources()
+        NotificationCenter.default.removeObserver(self)
+        if let instantVoiceSpaceMonitor {
+            NSEvent.removeMonitor(instantVoiceSpaceMonitor)
+        }
         memoryMaintenanceTimer?.invalidate()
         visualChunkFlushWorkItem?.cancel()
         audioAIChunkFlushWorkItem?.cancel()
+        instantVoiceChunkFlushWorkItem?.cancel()
+        chatChunkFlushWorkItem?.cancel()
         opencodeChunkFlushWorkItem?.cancel()
         fileExploreChangeDebounceWorkItem?.cancel()
         pendingVisualScripts.removeAll(keepingCapacity: false)
         visualBridge.clear()
         audioAIBridge.clear()
+        instantVoiceBridge.clear()
+        chatBridge.clear()
         opencodeBridge.clear()
         fileExploreBridge.clear()
         stopOpencodeEventStream()
@@ -191,21 +250,14 @@ final class CaptureWindowController: NSWindowController {
         opencodeWorkingScopeURL?.stopAccessingSecurityScopedResource()
     }
 
-    /// Call this once voice input is confirmed enabled to start the auto-trigger timer.
-    func startAudioAITimer() {
-        audioAITimer?.invalidate()
-        let interval = max(0.5, captureInterval)
-        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            self?.triggerAudioAI()
-        }
-        timer.tolerance = min(0.4, interval * 0.25)
-        RunLoop.main.add(timer, forMode: .common)
-        audioAITimer = timer
-    }
-
     func closeCurrentSession() {
-        audioAITimer?.invalidate()
-        audioAITimer = nil
+        releaseInstantVoiceHoldSources()
+        chatChunkFlushWorkItem?.cancel()
+        chatChunkFlushWorkItem = nil
+        chatPendingChunksByEntryID.removeAll(keepingCapacity: false)
+        chatCurrentAssistantEntry = nil
+        chatStreamingText = ""
+        chatIsResponding = false
         stopMemoryMaintenanceTimer()
         stopActiveOpencodeProcess(resetSession: true, closeRemoteSession: true)
         stopFileExploreRealtimeRefresh()
@@ -213,6 +265,96 @@ final class CaptureWindowController: NSWindowController {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
+
+    private func installInstantVoiceSpaceMonitor() {
+        instantVoiceSpaceMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            self?.handleInstantVoiceSpaceEvent(event) ?? event
+        }
+    }
+
+    private func handleInstantVoiceSpaceEvent(_ event: NSEvent) -> NSEvent? {
+        guard event.window === window,
+              event.keyCode == 49 else { return event }
+
+        let blockedModifiers: NSEvent.ModifierFlags = [.command, .control, .option]
+        guard event.modifierFlags.intersection(blockedModifiers).isEmpty else { return event }
+
+        if activeContentTab == ContentTab.audioAI.rawValue {
+            switch event.type {
+            case .keyDown:
+                guard !event.isARepeat else { return nil }
+                requestAudioAIManualTurnEnd(source: "space")
+                return nil
+            case .keyUp:
+                return nil
+            default:
+                return event
+            }
+        }
+
+        guard activeContentTab == ContentTab.instantVoice.rawValue else { return event }
+
+        switch event.type {
+        case .keyDown:
+            guard !event.isARepeat else { return nil }
+            setInstantVoiceHoldActive(true, source: .keyboard)
+            return nil
+        case .keyUp:
+            setInstantVoiceHoldActive(false, source: .keyboard)
+            return nil
+        default:
+            return event
+        }
+    }
+
+    private func setInstantVoiceHoldActive(_ active: Bool, source: InstantVoiceHoldSource) {
+        guard instantVoiceAvailable else {
+            DevLog.log("InstantVoice", "hold ignored unavailable source=\(source)")
+            return
+        }
+        let wasActive = !instantVoiceHoldSources.isEmpty
+        if active {
+            instantVoiceHoldSources.insert(source)
+        } else {
+            instantVoiceHoldSources.remove(source)
+        }
+        let isActive = !instantVoiceHoldSources.isEmpty
+        guard wasActive != isActive else { return }
+
+        DevLog.log("InstantVoice", "hold active=\(isActive ? 1 : 0) source=\(source)")
+        instantVoiceHoldBtn?.title = isActive ? "Recording..." : "Hold to Talk"
+        instantVoiceHoldBtn?.setHolding(isActive)
+        onInstantVoiceHoldChanged?(isActive)
+    }
+
+    private func releaseInstantVoiceHoldSources() {
+        guard !instantVoiceHoldSources.isEmpty else { return }
+        DevLog.log("InstantVoice", "hold release all sources=\(instantVoiceHoldSources.count)")
+        instantVoiceHoldSources.removeAll()
+        instantVoiceHoldBtn?.title = "Hold to Talk"
+        instantVoiceHoldBtn?.setHolding(false)
+        onInstantVoiceHoldChanged?(false)
+    }
+
+    func setInstantVoiceAvailable(_ available: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if !available {
+                releaseInstantVoiceHoldSources()
+            }
+            instantVoiceAvailable = available
+            instantVoiceHoldBtn?.title = available ? "Hold to Talk" : "Disabled"
+            instantVoiceHoldBtn?.setAvailable(available)
+            instantVoiceHoldBtn?.toolTip = available
+                ? "Hold the button or Space to send system audio to Instant Voice."
+                : "Enable Instant Voice in Settings to use this tab."
+            DevLog.log("InstantVoice", "availability changed available=\(available ? 1 : 0)")
+        }
+    }
+
+    @objc private func captureWindowDidResignKey(_ notification: Notification) {
+        releaseInstantVoiceHoldSources()
+    }
 
     // MARK: - Self Maintenance
 
@@ -236,6 +378,8 @@ final class CaptureWindowController: NSWindowController {
     private func runMemoryMaintenance(reason: String) {
         trimVisualNativeState(reason: reason)
         trimAudioAINativeState(reason: reason)
+        trimInstantVoiceNativeState(reason: reason)
+        trimChatNativeState(reason: reason)
         trimOpencodeNativeState(reason: reason)
         trimFileExploreNativeState(reason: reason)
 
@@ -244,6 +388,12 @@ final class CaptureWindowController: NSWindowController {
         }
         if audioAIPageReady {
             audioAIBridge.enqueue("performMemoryMaintenance()", immediate: true)
+        }
+        if instantVoicePageReady {
+            instantVoiceBridge.enqueue("performMemoryMaintenance()", immediate: true)
+        }
+        if chatPageReady {
+            chatBridge.enqueue("performMemoryMaintenance()", immediate: true)
         }
         if opencodeChatPageReady {
             opencodeBridge.enqueue("performMemoryMaintenance()", immediate: true)
@@ -284,7 +434,30 @@ final class CaptureWindowController: NSWindowController {
         audioAIPendingChunksByEntryID = audioAIPendingChunksByEntryID.filter { $0.key == activeEntry }
     }
 
+    private func trimInstantVoiceNativeState(reason: String) {
+        guard let activeEntry = instantVoiceCurrentEntry else {
+            if !instantVoicePendingChunksByEntryID.isEmpty {
+                DevLog.log("InstantVoice", "memory maintenance reason=\(reason) clearing stale instant chunks count=\(instantVoicePendingChunksByEntryID.count)")
+                instantVoicePendingChunksByEntryID.removeAll(keepingCapacity: false)
+            }
+            return
+        }
+        instantVoicePendingChunksByEntryID = instantVoicePendingChunksByEntryID.filter { $0.key == activeEntry }
+    }
+
+    private func trimChatNativeState(reason: String) {
+        guard let activeEntry = chatCurrentAssistantEntry else {
+            if !chatPendingChunksByEntryID.isEmpty {
+                DevLog.log("Chat", "memory maintenance reason=\(reason) clearing stale chat chunks count=\(chatPendingChunksByEntryID.count)")
+                chatPendingChunksByEntryID.removeAll(keepingCapacity: false)
+            }
+            return
+        }
+        chatPendingChunksByEntryID = chatPendingChunksByEntryID.filter { $0.key == activeEntry }
+    }
+
     private func trimOpencodeNativeState(reason: String) {
+        trimOpencodePendingChatQueues(reason: reason)
         guard let activeEntry = opencodeCurrentStreamingEntryID else {
             if !opencodePendingStreamingChunksByEntryID.isEmpty {
                 DevLog.log("Opencode", "memory maintenance reason=\(reason) clearing stale opencode chunks count=\(opencodePendingStreamingChunksByEntryID.count)")
@@ -301,12 +474,45 @@ final class CaptureWindowController: NSWindowController {
         fileExploreIconCache.removeAll(keepingCapacity: true)
     }
 
+    private func trimOpencodePendingChatQueues(reason: String) {
+        if opencodePendingChatEntries.count > RetentionPolicy.pendingOpencodeChatEntryLimit {
+            let overflow = opencodePendingChatEntries.count - RetentionPolicy.pendingOpencodeChatEntryLimit
+            opencodePendingChatEntries.removeFirst(overflow)
+            DevLog.log("Opencode", "memory maintenance reason=\(reason) trimmed pending chat entries overflow=\(overflow)")
+        }
+        if opencodePendingChatScripts.count > RetentionPolicy.pendingOpencodeScriptLimit {
+            let overflow = opencodePendingChatScripts.count - RetentionPolicy.pendingOpencodeScriptLimit
+            opencodePendingChatScripts.removeFirst(overflow)
+            DevLog.log("Opencode", "memory maintenance reason=\(reason) trimmed pending chat scripts overflow=\(overflow)")
+        }
+    }
+
+    private func appendBoundedStreamingText(_ chunk: String, to text: inout String, category: String) {
+        text += chunk
+        guard text.count > RetentionPolicy.streamingTextBufferLimit else { return }
+        let notice = "[Earlier output trimmed for memory.]\n\n"
+        let keepCount = max(0, RetentionPolicy.streamingTextBufferLimit - notice.count)
+        let start = text.index(text.endIndex, offsetBy: -keepCount)
+        text = notice + String(text[start...])
+        DevLog.log(category, "trimmed active streaming text to \(RetentionPolicy.streamingTextBufferLimit) chars")
+    }
+
     // MARK: – Public
 
     func updateStatus(filename: String, count: Int) {
         DispatchQueue.main.async { [weak self] in
             DevLog.log("VisualUI", "saved status count=\(count) file=\(filename)")
             self?.countLabel.stringValue = "saved \(count)"
+        }
+    }
+
+    func noteLatestScreenshot(_ url: URL) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            latestVisualScreenshotURL = url
+            chatAttachScreenshotCheckbox?.toolTip = "Attach \(url.lastPathComponent) to the next chat message."
+            updateChatControls()
+            DevLog.log("Chat", "latest visual screenshot=\(url.lastPathComponent)")
         }
     }
 
@@ -432,59 +638,31 @@ final class CaptureWindowController: NSWindowController {
         }
     }
 
-    // MARK: – Public — Transcript feed
-
-    /// Appends each server message permanently (no partial vs final distinction).
-    func appendTranscript(_ text: String) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let ts = audioTextView.textStorage else { return }
-            let started = CapturePerf.begin()
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 13),
-                .foregroundColor: NSColor.labelColor,
-            ]
-            ts.append(NSAttributedString(string: text + "\n", attributes: attrs))
-            if ts.length > transcriptDisplayCharLimit * 2 {
-                let target = transcriptDisplayCharLimit
-                let removeCount = max(0, ts.length - target)
-                if removeCount > 0 {
-                    ts.deleteCharacters(in: NSRange(location: 0, length: removeCount))
-                }
-            }
-            transcriptBuffer += text + "\n"
-            pendingTranscriptCharsSinceLastSend += text.count + 1
-            let cap = audioAITokenLimit * 4
-            if transcriptBuffer.count > cap * 2 {
-                transcriptBuffer = String(transcriptBuffer.suffix(cap))
-            }
-            if activeContentTab == ContentTab.transcript.rawValue {
-                scrollAudioToBottom()
-            }
-            CapturePerf.end(started, "transcript.append", details: "chars=\(text.count)")
-        }
-    }
-
     // MARK: – Public — Audio AI feed
 
-    /// Streams a chunk of Gemini's response into the Audio AI WebView.
+    /// Streams a chunk of Realtime's passive response into the Audio AI WebView.
     func appendAudioAIChunk(_ text: String) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, audioAIPageReady else { return }
+            guard let self else { return }
+            guard audioAIPageReady else {
+                DevLog.log("AudioAI", "chunk dropped pageReady=0 chars=\(text.count)")
+                return
+            }
             // Start a new streaming entry on the first chunk
             if audioAICurrentEntry == nil {
                 let entryId = audioAINextEntryId
                 audioAINextEntryId += 1
                 audioAICurrentEntry = entryId
                 audioAIStreamingText = ""
-                let preview = String(transcriptBuffer.suffix(100))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let header = "[\(Self.timeString())]\n…\(preview)"
+                let header = "[\(Self.timeString())]\nPassive Realtime audio"
+                DevLog.log("AudioAI", "start entry=\(entryId)")
                 if let hJS = jsLiteral(header) {
                     audioAIBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
                 }
             }
             guard let entryId = audioAICurrentEntry else { return }
-            audioAIStreamingText += text
+            DevLog.log("AudioAI", "chunk entry=\(entryId) chars=\(text.count)")
+            appendBoundedStreamingText(text, to: &audioAIStreamingText, category: "AudioAI")
             audioAIPendingChunksByEntryID[entryId, default: ""] += text
             scheduleAudioAIChunkFlush()
         }
@@ -495,6 +673,7 @@ final class CaptureWindowController: NSWindowController {
         DispatchQueue.main.async { [weak self] in
             guard let self, let entryId = audioAICurrentEntry,
                   let mdJS = jsLiteral(audioAIStreamingText) else { return }
+            DevLog.log("AudioAI", "finalize entry=\(entryId) chars=\(audioAIStreamingText.count)")
             flushAudioAIStreamingChunks(for: entryId)
             audioAIBridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))", immediate: true)
             audioAICurrentEntry = nil
@@ -505,7 +684,12 @@ final class CaptureWindowController: NSWindowController {
     /// Appends an error entry to the Audio AI tab.
     func appendAudioAIError(_ message: String) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, audioAIPageReady else { return }
+            guard let self else { return }
+            guard audioAIPageReady else {
+                DevLog.log("AudioAI", "error dropped pageReady=0 message=\(message)")
+                return
+            }
+            DevLog.log("AudioAI", "error message=\(message)")
             // Close any open entry first
             if let entryId = audioAICurrentEntry, let mdJS = jsLiteral(audioAIStreamingText) {
                 flushAudioAIStreamingChunks(for: entryId)
@@ -526,44 +710,317 @@ final class CaptureWindowController: NSWindowController {
     @objc private func audioAIZoomIn()  { audioAIBridge.enqueue("adjustZoom(1)", immediate: true) }
     @objc private func audioAIZoomOut() { audioAIBridge.enqueue("adjustZoom(-1)", immediate: true) }
 
-    @objc private func askAITapped() { triggerAudioAI(force: true) }
-
-    private func triggerAudioAI(force: Bool = false) {
-        let full    = transcriptBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !full.isEmpty else { return }
-        // Trim to the configured token limit before sending
-        let current = String(full.suffix(audioAITokenLimit * 4))
-        guard force || current != lastSentTranscript else { return }
-
-        // Skip auto-send if fewer than 3% of transcript chars were appended since the last request.
-        let base = max(lastSentTranscript.count, 1)
-        let growthRatio = Double(pendingTranscriptCharsSinceLastSend) / Double(base)
-        guard force || lastSentTranscript.isEmpty || growthRatio >= 0.03 else { return }
-
-        guard onAudioAIRequest?(current) == true else { return }
-        CapturePerf.log("audioAI.request sent chars=\(current.count) growthRatio=\(String(format: "%.3f", growthRatio)) force=\(force ? 1 : 0)")
-        lastSentTranscript = current
-        pendingTranscriptCharsSinceLastSend = 0
-    }
-
-    /// Appends a red error entry to the audio feed.
-    func appendAudioError(_ message: String) {
+    func updateAudioAIState(_ state: RealtimeAudioAIController.PassiveState) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let attrStr = NSAttributedString(
-                string: "⚠ \(message)\n",
-                attributes: [.font: NSFont.systemFont(ofSize: 12),
-                             .foregroundColor: NSColor.systemRed])
-            audioTextView.textStorage?.append(attrStr)
-            if activeContentTab == ContentTab.transcript.rawValue {
-                scrollAudioToBottom()
+            audioAIState = state
+            audioAIPaused = state == .paused
+            audioAIPauseBtn?.title = audioAIPaused ? "Resume" : "Pause"
+            audioAIPauseBtn?.contentTintColor = audioAIPaused ? .systemGreen : nil
+            updateAudioAIListeningButtonState()
+        }
+    }
+
+    @objc private func audioAIManualTurnTapped() {
+        requestAudioAIManualTurnEnd(source: "button")
+    }
+
+    @objc private func audioAIPauseTapped() {
+        audioAIPaused.toggle()
+        audioAIState = audioAIPaused ? .paused : .starting
+        audioAIPauseBtn.title = audioAIPaused ? "Resume" : "Pause"
+        audioAIPauseBtn.contentTintColor = audioAIPaused ? .systemGreen : nil
+        updateAudioAIListeningButtonState()
+        DevLog.log("AudioAI", "pause toggled paused=\(audioAIPaused ? 1 : 0)")
+        onAudioAIPauseChanged?(audioAIPaused)
+    }
+
+    private func requestAudioAIManualTurnEnd(source: String) {
+        guard !audioAIPaused else {
+            DevLog.log("AudioAI", "manual turn-end ignored paused source=\(source)")
+            return
+        }
+        guard audioAIState == .listening else {
+            DevLog.log("AudioAI", "manual turn-end ignored state=\(audioAIState) source=\(source)")
+            return
+        }
+        DevLog.log("AudioAI", "manual turn-end requested source=\(source)")
+        onAudioAIManualTurnEnd?()
+    }
+
+    private func updateAudioAIListeningButtonState() {
+        guard let audioAIManualTurnBtn else { return }
+        if audioAIPaused {
+            audioAIManualTurnBtn.title = "Paused"
+            audioAIManualTurnBtn.contentTintColor = .secondaryLabelColor
+            audioAIManualTurnBtn.isEnabled = false
+            return
+        }
+
+        switch audioAIState {
+        case .starting:
+            audioAIManualTurnBtn.title = "Starting"
+            audioAIManualTurnBtn.contentTintColor = .secondaryLabelColor
+            audioAIManualTurnBtn.isEnabled = false
+        case .listening:
+            audioAIManualTurnBtn.title = "Listening"
+            audioAIManualTurnBtn.contentTintColor = .systemYellow
+            audioAIManualTurnBtn.isEnabled = true
+        case .sending:
+            audioAIManualTurnBtn.title = "Sending"
+            audioAIManualTurnBtn.contentTintColor = .systemOrange
+            audioAIManualTurnBtn.isEnabled = false
+        case .waiting:
+            audioAIManualTurnBtn.title = "Waiting"
+            audioAIManualTurnBtn.contentTintColor = .systemBlue
+            audioAIManualTurnBtn.isEnabled = false
+        case .responding:
+            audioAIManualTurnBtn.title = "Responding"
+            audioAIManualTurnBtn.contentTintColor = .systemBlue
+            audioAIManualTurnBtn.isEnabled = false
+        case .paused:
+            audioAIManualTurnBtn.title = "Paused"
+            audioAIManualTurnBtn.contentTintColor = .secondaryLabelColor
+            audioAIManualTurnBtn.isEnabled = false
+        case .reconnecting:
+            audioAIManualTurnBtn.title = "Reconnecting"
+            audioAIManualTurnBtn.contentTintColor = .secondaryLabelColor
+            audioAIManualTurnBtn.isEnabled = false
+        case .unavailable:
+            audioAIManualTurnBtn.title = "Unavailable"
+            audioAIManualTurnBtn.contentTintColor = .systemRed
+            audioAIManualTurnBtn.isEnabled = false
+        }
+    }
+
+    // MARK: – Public — Instant Voice feed
+
+    func appendInstantVoiceChunk(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard instantVoicePageReady else {
+                DevLog.log("InstantVoice", "chunk dropped pageReady=0 chars=\(text.count)")
+                return
+            }
+            if instantVoiceCurrentEntry == nil {
+                let entryId = instantVoiceNextEntryId
+                instantVoiceNextEntryId += 1
+                instantVoiceCurrentEntry = entryId
+                instantVoiceStreamingText = ""
+                let header = "[\(Self.timeString())]\nInstant Voice"
+                DevLog.log("InstantVoice", "start entry=\(entryId)")
+                if let hJS = jsLiteral(header) {
+                    instantVoiceBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
+                }
+            }
+            guard let entryId = instantVoiceCurrentEntry else { return }
+            DevLog.log("InstantVoice", "chunk entry=\(entryId) chars=\(text.count)")
+            appendBoundedStreamingText(text, to: &instantVoiceStreamingText, category: "InstantVoice")
+            instantVoicePendingChunksByEntryID[entryId, default: ""] += text
+            scheduleInstantVoiceChunkFlush()
+        }
+    }
+
+    func finalizeInstantVoice() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let entryId = instantVoiceCurrentEntry,
+                  let mdJS = jsLiteral(instantVoiceStreamingText) else { return }
+            DevLog.log("InstantVoice", "finalize entry=\(entryId) chars=\(instantVoiceStreamingText.count)")
+            flushInstantVoiceStreamingChunks(for: entryId)
+            instantVoiceBridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))", immediate: true)
+            instantVoiceCurrentEntry = nil
+            instantVoiceStreamingText = ""
+        }
+    }
+
+    func appendInstantVoiceError(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard instantVoicePageReady else {
+                DevLog.log("InstantVoice", "error dropped pageReady=0 message=\(message)")
+                return
+            }
+            DevLog.log("InstantVoice", "error message=\(message)")
+            if let entryId = instantVoiceCurrentEntry, let mdJS = jsLiteral(instantVoiceStreamingText) {
+                flushInstantVoiceStreamingChunks(for: entryId)
+                instantVoiceBridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))")
+                instantVoiceCurrentEntry = nil; instantVoiceStreamingText = ""
+            }
+            let entryId = instantVoiceNextEntryId; instantVoiceNextEntryId += 1
+            let header = "[\(Self.timeString())]"
+            if let hJS = jsLiteral(header) {
+                instantVoiceBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
+            }
+            if let errJS = jsLiteral("⚠ \(message)") {
+                instantVoiceBridge.enqueue("endStreamingEntry(\(entryId), \(errJS))", immediate: true)
             }
         }
     }
 
-    private func scrollAudioToBottom() {
-        guard let ts = audioTextView.textStorage else { return }
-        audioTextView.scrollRangeToVisible(NSRange(location: ts.length, length: 0))
+    @objc private func instantVoiceZoomIn()  { instantVoiceBridge.enqueue("adjustZoom(1)", immediate: true) }
+    @objc private func instantVoiceZoomOut() { instantVoiceBridge.enqueue("adjustZoom(-1)", immediate: true) }
+
+    // MARK: – Public — Chat feed
+
+    func setChatAvailable(_ available: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            chatAvailable = available
+            if !available {
+                chatIsResponding = false
+                chatInputField?.placeholderString = "OpenAI API key required"
+            } else {
+                chatInputField?.placeholderString = "Message GPT-5.5"
+            }
+            updateChatControls()
+            DevLog.log("Chat", "availability changed available=\(available ? 1 : 0)")
+        }
+    }
+
+    func setChatResponding(_ responding: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            chatIsResponding = responding
+            updateChatControls()
+        }
+    }
+
+    func appendChatAssistantChunk(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, chatPageReady else {
+                DevLog.log("Chat", "chunk dropped pageReady=0 chars=\(text.count)")
+                return
+            }
+            if chatCurrentAssistantEntry == nil {
+                let entryId = chatNextEntryId
+                chatNextEntryId += 1
+                chatCurrentAssistantEntry = entryId
+                chatStreamingText = ""
+                DevLog.log("Chat", "start assistant entry=\(entryId)")
+                if let hJS = jsLiteral("GPT-5.5") {
+                    chatBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
+                }
+            }
+            guard let entryId = chatCurrentAssistantEntry else { return }
+            appendBoundedStreamingText(text, to: &chatStreamingText, category: "Chat")
+            chatPendingChunksByEntryID[entryId, default: ""] += text
+            scheduleChatChunkFlush()
+        }
+    }
+
+    func finalizeChatAssistant() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let entryId = chatCurrentAssistantEntry,
+               let mdJS = jsLiteral(chatStreamingText) {
+                DevLog.log("Chat", "finalize assistant entry=\(entryId) chars=\(chatStreamingText.count)")
+                flushChatStreamingChunks(for: entryId)
+                chatBridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))", immediate: true)
+            }
+            chatCurrentAssistantEntry = nil
+            chatStreamingText = ""
+            chatIsResponding = false
+            updateChatControls()
+        }
+    }
+
+    func appendChatError(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            DevLog.log("Chat", "error message=\(message)")
+            if let entryId = chatCurrentAssistantEntry, let mdJS = jsLiteral(chatStreamingText) {
+                flushChatStreamingChunks(for: entryId)
+                chatBridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))")
+                chatCurrentAssistantEntry = nil
+                chatStreamingText = ""
+            }
+            if chatPageReady,
+               let headerJS = jsLiteral("GPT-5.5"),
+               let bodyJS = jsLiteral(message) {
+                chatBridge.enqueue("appendEntry(\(headerJS), \(bodyJS), true)", immediate: true)
+            }
+            chatIsResponding = false
+            updateChatControls()
+        }
+    }
+
+    func resetChatUI() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            chatBridge.enqueue("clearFeed()", immediate: true)
+            chatPendingChunksByEntryID.removeAll(keepingCapacity: false)
+            chatChunkFlushWorkItem?.cancel()
+            chatChunkFlushWorkItem = nil
+            chatCurrentAssistantEntry = nil
+            chatStreamingText = ""
+            chatIsResponding = false
+            updateChatControls()
+        }
+    }
+
+    @objc private func chatZoomIn()  { chatBridge.enqueue("adjustZoom(1)", immediate: true) }
+    @objc private func chatZoomOut() { chatBridge.enqueue("adjustZoom(-1)", immediate: true) }
+
+    @objc private func chatRestartTapped() {
+        DevLog.log("Chat", "restart tapped")
+        onChatRestart?()
+        resetChatUI()
+    }
+
+    @objc private func chatSendTapped() {
+        guard chatAvailable else {
+            appendChatError("No OpenAI API key is saved. Add it in the API Keys tab, then restart capture.")
+            return
+        }
+        guard !chatIsResponding else { return }
+        let message = chatInputField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        let attachmentURL = selectedChatScreenshotAttachment()
+        chatInputField.stringValue = ""
+        appendChatUserMessage(message, attachmentURL: attachmentURL)
+        chatIsResponding = true
+        updateChatControls()
+        onChatSend?(message, attachmentURL)
+    }
+
+    private func selectedChatScreenshotAttachment() -> URL? {
+        guard chatAttachScreenshotCheckbox?.state == .on,
+              let url = latestVisualScreenshotURL,
+              FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        return url
+    }
+
+    private func appendChatUserMessage(_ message: String, attachmentURL: URL?) {
+        guard chatPageReady,
+              let headerJS = jsLiteral("You"),
+              let bodyJS = jsLiteral(message) else {
+            DevLog.log("Chat", "user message dropped pageReady=\(chatPageReady ? 1 : 0) chars=\(message.count)")
+            return
+        }
+        let imageDataURL = attachmentURL.flatMap { Self.thumbnailDataURL(for: $0, maxWidth: 280) }
+        let imageJS = imageDataURL.flatMap { jsLiteral($0) } ?? "null"
+        chatBridge.enqueue("appendEntry(\(headerJS), \(bodyJS), false, \(imageJS))", immediate: true)
+    }
+
+    private func updateChatControls() {
+        let canSend = chatAvailable && chatPageReady && !chatIsResponding
+        let hasScreenshot = latestVisualScreenshotURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        if !hasScreenshot {
+            latestVisualScreenshotURL = nil
+            chatAttachScreenshotCheckbox?.state = .off
+        }
+        chatInputField?.isEnabled = canSend
+        chatSendButton?.isEnabled = canSend
+        chatSendButton?.title = chatIsResponding ? "Sending..." : "Send"
+        chatRestartBtn?.isEnabled = chatPageReady
+        chatAttachScreenshotCheckbox?.isEnabled = canSend && hasScreenshot
+        if hasScreenshot, let filename = latestVisualScreenshotURL?.lastPathComponent {
+            chatAttachScreenshotCheckbox?.toolTip = "Attach \(filename) to the next chat message."
+        } else {
+            chatAttachScreenshotCheckbox?.toolTip = "No screenshot has been saved yet."
+        }
     }
 
     // MARK: – UI construction
@@ -676,6 +1133,10 @@ final class CaptureWindowController: NSWindowController {
     @objc private func stopTapped() {
         stopButton.isEnabled  = false
         pauseButton.isEnabled = false
+        audioAIManualTurnBtn?.isEnabled = false
+        audioAIPauseBtn?.isEnabled = false
+        chatSendButton?.isEnabled = false
+        chatRestartBtn?.isEnabled = false
         closeCurrentSession()
         onStop?()
     }
@@ -700,30 +1161,11 @@ final class CaptureWindowController: NSWindowController {
         webView = wv
         visualBridge.attach(webView: wv)
 
-        // ── Transcript feed ────────────────────────────────────────
-        let tv = NSTextView()
-        tv.isEditable         = false
-        tv.isSelectable       = true
-        tv.drawsBackground    = false
-        tv.textContainerInset = NSSize(width: 16, height: 16)
-        tv.autoresizingMask   = [.width]
-        tv.textContainer?.widthTracksTextView = true
-        audioTextView = tv
-
-        let sv = NSScrollView()
-        sv.documentView          = tv
-        sv.hasVerticalScroller   = true
-        sv.autohidesScrollers    = true
-        sv.hasHorizontalScroller = false
-        sv.drawsBackground       = false
-        sv.translatesAutoresizingMaskIntoConstraints = false
-        sv.isHidden = true   // hidden until Transcript tab is selected
-        audioScrollView = sv
-
         // ── Audio AI feed (WKWebView — same renderer as Visual) ──────
         let aiCfg = WKWebViewConfiguration()
         let aiHandler = CopyCodeHandler(pageReady: { [weak self] in
             DispatchQueue.main.async {
+                DevLog.log("AudioAI", "pageReady message received")
                 self?.audioAIPageReady = true
                 self?.audioAIBridge.enqueue("setMaxRenderedEntries(\(RetentionPolicy.audioAIRenderedEntryLimit))", immediate: true)
             }
@@ -738,6 +1180,78 @@ final class CaptureWindowController: NSWindowController {
         aiWV.isHidden = true
         audioAIWebView = aiWV
         audioAIBridge.attach(webView: aiWV)
+
+        // ── Instant Voice feed (separate Realtime session) ────────────
+        let instantCfg = WKWebViewConfiguration()
+        let instantHandler = CopyCodeHandler(pageReady: { [weak self] in
+            DispatchQueue.main.async {
+                DevLog.log("InstantVoice", "pageReady message received")
+                self?.instantVoicePageReady = true
+                self?.instantVoiceBridge.enqueue("setMaxRenderedEntries(\(RetentionPolicy.instantVoiceRenderedEntryLimit))", immediate: true)
+            }
+        })
+        instantCfg.userContentController.add(instantHandler, name: "copyCode")
+        instantCfg.userContentController.add(instantHandler, name: "pageReady")
+
+        let instantWV = WKWebView(frame: .zero, configuration: instantCfg)
+        instantWV.translatesAutoresizingMaskIntoConstraints = false
+        instantWV.wantsLayer = true
+        instantWV.layer?.backgroundColor = NSColor.clear.cgColor
+        instantWV.isHidden = true
+        instantVoiceWebView = instantWV
+        instantVoiceBridge.attach(webView: instantWV)
+
+        // ── Chat tab content ───────────────────────────────────────
+        let chatView = NSView()
+        chatView.translatesAutoresizingMaskIntoConstraints = false
+        chatView.isHidden = true
+        chatContainerView = chatView
+
+        let chatCfg = WKWebViewConfiguration()
+        let chatHandler = CopyCodeHandler(pageReady: { [weak self] in
+            DispatchQueue.main.async {
+                DevLog.log("Chat", "pageReady message received")
+                self?.chatPageReady = true
+                self?.chatBridge.enqueue("setMaxRenderedEntries(\(RetentionPolicy.chatRenderedEntryLimit))", immediate: true)
+                self?.updateChatControls()
+            }
+        })
+        chatCfg.userContentController.add(chatHandler, name: "copyCode")
+        chatCfg.userContentController.add(chatHandler, name: "pageReady")
+
+        let chatWV = WKWebView(frame: .zero, configuration: chatCfg)
+        chatWV.translatesAutoresizingMaskIntoConstraints = false
+        chatWV.wantsLayer = true
+        chatWV.layer?.backgroundColor = NSColor.clear.cgColor
+        chatWebView = chatWV
+        chatBridge.attach(webView: chatWV)
+
+        let chatInput = NSTextField(string: "")
+        chatInput.placeholderString = "Message GPT-5.5"
+        chatInput.font = .systemFont(ofSize: 13)
+        chatInput.translatesAutoresizingMaskIntoConstraints = false
+        chatInput.target = self
+        chatInput.action = #selector(chatSendTapped)
+        chatInput.isEnabled = false
+        chatInputField = chatInput
+
+        let chatAttach = NSButton(checkboxWithTitle: "Attach latest screenshot", target: nil, action: nil)
+        chatAttach.font = .systemFont(ofSize: 12)
+        chatAttach.translatesAutoresizingMaskIntoConstraints = false
+        chatAttach.isEnabled = false
+        chatAttach.toolTip = "No screenshot has been saved yet."
+        chatAttachScreenshotCheckbox = chatAttach
+
+        let chatSend = NSButton(title: "Send", target: self, action: #selector(chatSendTapped))
+        chatSend.bezelStyle = .rounded
+        chatSend.translatesAutoresizingMaskIntoConstraints = false
+        chatSend.isEnabled = false
+        chatSendButton = chatSend
+
+        chatView.addSubview(chatWV)
+        chatView.addSubview(chatInput)
+        chatView.addSubview(chatAttach)
+        chatView.addSubview(chatSend)
 
         // ── Opencode tab content ───────────────────────────────────
         let opencodeView = NSView()
@@ -934,7 +1448,7 @@ final class CaptureWindowController: NSWindowController {
 
         // Content tab selector (left side of inner bar)
         let contentTabs = NSSegmentedControl(
-            labels: ["Visual", "Transcript", "Audio AI", "Opencode"],
+            labels: ["Visual", "Audio AI", "Instant Voice", "Chat", "Opencode"],
             trackingMode: .selectOne, target: self,
             action: #selector(contentTabChanged))
         contentTabs.selectedSegment = 0
@@ -952,27 +1466,54 @@ final class CaptureWindowController: NSWindowController {
         let vc = barBtn("Clear", action: #selector(clearAI))
         vc.font = .systemFont(ofSize: 11);                visualClearBtn = vc
 
-        // Transcript-tab buttons (hidden initially)
-        let ac = barBtn("Clear", action: #selector(clearAudioFeed))
-        ac.font = .systemFont(ofSize: 11)
-        ac.isHidden = true;                               audioClearBtn = ac
-
         // Audio AI-tab buttons (hidden initially)
         let azo = barBtn("−", action: #selector(audioAIZoomOut)); azo.isHidden = true; audioAIZoomOutBtn = azo
         let azi = barBtn("+", action: #selector(audioAIZoomIn));  azi.isHidden = true; audioAIZoomInBtn  = azi
         let aac = barBtn("Clear", action: #selector(clearAudioAI))
         aac.font = .systemFont(ofSize: 11); aac.isHidden = true; audioAIClearBtn = aac
-        let askBtn = barBtn("Ask AI", action: #selector(askAITapped))
-        askBtn.font = .systemFont(ofSize: 11); askBtn.isHidden = true; audioAIAskBtn = askBtn
+        let aam = barBtn("Starting", action: #selector(audioAIManualTurnTapped))
+        aam.font = .systemFont(ofSize: 11); aam.contentTintColor = .secondaryLabelColor
+        aam.toolTip = "Press Space or click to send the current Audio AI turn now."
+        aam.isHidden = true; audioAIManualTurnBtn = aam
+        let aap = barBtn("Pause", action: #selector(audioAIPauseTapped))
+        aap.font = .systemFont(ofSize: 11)
+        aap.isHidden = true; audioAIPauseBtn = aap
 
-        [zo, zi, vr, vc, ac, azo, azi, aac, askBtn].forEach { innerBar.addSubview($0) }
+        // Instant Voice-tab buttons (hidden initially)
+        let ivo = barBtn("−", action: #selector(instantVoiceZoomOut)); ivo.isHidden = true; instantVoiceZoomOutBtn = ivo
+        let ivi = barBtn("+", action: #selector(instantVoiceZoomIn));  ivi.isHidden = true; instantVoiceZoomInBtn  = ivi
+        let ivc = barBtn("Clear", action: #selector(clearInstantVoice))
+        ivc.font = .systemFont(ofSize: 11); ivc.isHidden = true; instantVoiceClearBtn = ivc
+        let holdBtn = HoldToTalkButton(title: "Hold to Talk", target: nil, action: nil)
+        holdBtn.bezelStyle = .rounded
+        holdBtn.font = .systemFont(ofSize: 11, weight: .medium)
+        holdBtn.translatesAutoresizingMaskIntoConstraints = false
+        holdBtn.isHidden = true
+        holdBtn.isEnabled = false
+        holdBtn.toolTip = "Enable Instant Voice in Settings to use this tab."
+        holdBtn.setAvailable(false)
+        holdBtn.onHoldChanged = { [weak self] isHolding in
+            self?.setInstantVoiceHoldActive(isHolding, source: .mouse)
+        }
+        instantVoiceHoldBtn = holdBtn
+
+        // Chat-tab buttons (hidden initially)
+        let czo = barBtn("−", action: #selector(chatZoomOut)); czo.isHidden = true; chatZoomOutBtn = czo
+        let czi = barBtn("+", action: #selector(chatZoomIn));  czi.isHidden = true; chatZoomInBtn  = czi
+        let cr = barBtn("Restart", action: #selector(chatRestartTapped))
+        cr.font = .systemFont(ofSize: 11)
+        cr.isHidden = true
+        chatRestartBtn = cr
+
+        [zo, zi, vr, vc, azo, azi, aac, aam, aap, ivo, ivi, ivc, holdBtn, czo, czi, cr].forEach { innerBar.addSubview($0) }
 
         let divider = NSBox(); divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(divider)
         container.addSubview(wv)
-        container.addSubview(sv)
         container.addSubview(aiWV)
+        container.addSubview(instantWV)
+        container.addSubview(chatView)
         container.addSubview(opencodeView)
         container.addSubview(fileExploreView)
 
@@ -997,19 +1538,37 @@ final class CaptureWindowController: NSWindowController {
             vc.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
             vc.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
 
-            // Transcript buttons (same position – shown/hidden on tab switch)
-            ac.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
-            ac.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
-
             // Audio AI buttons (shown/hidden on tab switch)
             azo.trailingAnchor.constraint(equalTo: azi.leadingAnchor, constant: -2),
             azo.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
             azi.trailingAnchor.constraint(equalTo: aac.leadingAnchor, constant: -10),
             azi.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
-            aac.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            aac.trailingAnchor.constraint(equalTo: aam.leadingAnchor, constant: -6),
             aac.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
-            askBtn.trailingAnchor.constraint(equalTo: azo.leadingAnchor, constant: -12),
-            askBtn.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            aam.trailingAnchor.constraint(equalTo: aap.leadingAnchor, constant: -6),
+            aam.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            aam.widthAnchor.constraint(greaterThanOrEqualToConstant: 112),
+            aap.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            aap.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+
+            // Instant Voice buttons (shown/hidden on tab switch)
+            ivo.trailingAnchor.constraint(equalTo: ivi.leadingAnchor, constant: -2),
+            ivo.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            ivi.trailingAnchor.constraint(equalTo: ivc.leadingAnchor, constant: -10),
+            ivi.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            ivc.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            ivc.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            holdBtn.trailingAnchor.constraint(equalTo: ivo.leadingAnchor, constant: -12),
+            holdBtn.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            holdBtn.widthAnchor.constraint(equalToConstant: 104),
+
+            // Chat buttons (shown/hidden on tab switch)
+            czo.trailingAnchor.constraint(equalTo: czi.leadingAnchor, constant: -2),
+            czo.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            czi.trailingAnchor.constraint(equalTo: cr.leadingAnchor, constant: -10),
+            czi.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            cr.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            cr.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
 
             // Divider
             divider.topAnchor.constraint(equalTo: innerBar.bottomAnchor),
@@ -1022,15 +1581,20 @@ final class CaptureWindowController: NSWindowController {
             wv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             wv.bottomAnchor.constraint(equalTo: container.bottomAnchor),
 
-            sv.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            sv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            sv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            sv.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-
             aiWV.topAnchor.constraint(equalTo: divider.bottomAnchor),
             aiWV.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             aiWV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             aiWV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            instantWV.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            instantWV.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            instantWV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            instantWV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            chatView.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            chatView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            chatView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            chatView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
 
             opencodeView.topAnchor.constraint(equalTo: divider.bottomAnchor),
             opencodeView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -1041,6 +1605,24 @@ final class CaptureWindowController: NSWindowController {
             fileExploreView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             fileExploreView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             fileExploreView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            chatWV.topAnchor.constraint(equalTo: chatView.topAnchor),
+            chatWV.leadingAnchor.constraint(equalTo: chatView.leadingAnchor),
+            chatWV.trailingAnchor.constraint(equalTo: chatView.trailingAnchor),
+            chatWV.bottomAnchor.constraint(equalTo: chatInput.topAnchor, constant: -10),
+
+            chatInput.leadingAnchor.constraint(equalTo: chatView.leadingAnchor, constant: 16),
+            chatInput.bottomAnchor.constraint(equalTo: chatView.bottomAnchor, constant: -16),
+            chatInput.heightAnchor.constraint(equalToConstant: 30),
+
+            chatAttach.leadingAnchor.constraint(equalTo: chatInput.trailingAnchor, constant: 10),
+            chatAttach.centerYAnchor.constraint(equalTo: chatInput.centerYAnchor),
+            chatAttach.widthAnchor.constraint(equalToConstant: 168),
+
+            chatSend.leadingAnchor.constraint(equalTo: chatAttach.trailingAnchor, constant: 8),
+            chatSend.trailingAnchor.constraint(equalTo: chatView.trailingAnchor, constant: -16),
+            chatSend.centerYAnchor.constraint(equalTo: chatInput.centerYAnchor),
+            chatSend.widthAnchor.constraint(equalToConstant: 82),
 
             sourceLabel.topAnchor.constraint(equalTo: opencodeView.topAnchor, constant: 16),
             sourceLabel.leadingAnchor.constraint(equalTo: opencodeView.leadingAnchor, constant: 16),
@@ -1110,6 +1692,8 @@ final class CaptureWindowController: NSWindowController {
         let baseURL: URL? = Self.resourcesBaseURL()
         wv.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         aiWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
+        instantWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
+        chatWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         opencodeChatWebView.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         fileExplorePreviewWebView.loadHTMLString(Self.fileExploreHTMLTemplate, baseURL: baseURL)
         renderFileExploreDocument(kind: "text", content: "Start Opencode to open File Explore.")
@@ -1119,14 +1703,17 @@ final class CaptureWindowController: NSWindowController {
     @objc private func contentTabChanged() {
         activeContentTab = contentTabControl.selectedSegment
         let isVisual = activeContentTab == ContentTab.visual.rawValue
-        let isTranscript = activeContentTab == ContentTab.transcript.rawValue
         let isAudioAI = activeContentTab == ContentTab.audioAI.rawValue
+        let isInstantVoice = activeContentTab == ContentTab.instantVoice.rawValue
+        let isChat = activeContentTab == ContentTab.chat.rawValue
         let isOpencode = activeContentTab == ContentTab.opencode.rawValue
         let isFileExplore = fileExploreTabIndex == activeContentTab
+        DevLog.log("CaptureUI", "contentTabChanged index=\(activeContentTab) audioAI=\(isAudioAI ? 1 : 0) instant=\(isInstantVoice ? 1 : 0) chat=\(isChat ? 1 : 0)")
 
         webView.isHidden         = !isVisual
-        audioScrollView.isHidden = !isTranscript
         audioAIWebView.isHidden  = !isAudioAI
+        instantVoiceWebView.isHidden = !isInstantVoice
+        chatContainerView.isHidden = !isChat
         opencodeContainerView.isHidden = !isOpencode
         fileExploreContainerView?.isHidden = !isFileExplore
 
@@ -1134,11 +1721,27 @@ final class CaptureWindowController: NSWindowController {
         zoomInBtn.isHidden        = !isVisual
         visualRetryBtn.isHidden   = !isVisual
         visualClearBtn.isHidden   = !isVisual
-        audioClearBtn.isHidden    = !isTranscript
         audioAIZoomOutBtn.isHidden = !isAudioAI
         audioAIZoomInBtn.isHidden  = !isAudioAI
         audioAIClearBtn.isHidden   = !isAudioAI
-        audioAIAskBtn.isHidden     = !isAudioAI
+        audioAIManualTurnBtn.isHidden = !isAudioAI
+        audioAIPauseBtn.isHidden   = !isAudioAI
+        if isAudioAI {
+            updateAudioAIListeningButtonState()
+        }
+        instantVoiceZoomOutBtn.isHidden = !isInstantVoice
+        instantVoiceZoomInBtn.isHidden  = !isInstantVoice
+        instantVoiceClearBtn.isHidden   = !isInstantVoice
+        instantVoiceHoldBtn.isHidden    = !isInstantVoice
+        if !isInstantVoice {
+            releaseInstantVoiceHoldSources()
+        }
+        chatZoomOutBtn.isHidden = !isChat
+        chatZoomInBtn.isHidden  = !isChat
+        chatRestartBtn.isHidden = !isChat
+        if isChat {
+            updateChatControls()
+        }
 
         if isFileExplore, let rootURL = fileExploreCurrentRootURL {
             if fileExploreRootNode?.url != rootURL {
@@ -1146,9 +1749,6 @@ final class CaptureWindowController: NSWindowController {
             } else {
                 scheduleFileExploreDebouncedRefresh(reason: "tab-switch")
             }
-        }
-        if isTranscript {
-            scrollAudioToBottom()
         }
         updateFileExploreRealtimeRefreshState()
     }
@@ -2672,6 +3272,7 @@ final class CaptureWindowController: NSWindowController {
         private var lineBuffer = Data()
         private var dataLines: [String] = []
         private var isStopped = false
+        private let newline = Data([0x0A])
 
         init(onEvent: @escaping ([String: Any]) -> Void, onFailure: @escaping (String) -> Void) {
             self.onEvent = onEvent
@@ -2729,8 +3330,12 @@ final class CaptureWindowController: NSWindowController {
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
             guard !isStopped else { return }
             lineBuffer.append(data)
+            guard lineBuffer.count <= RetentionPolicy.sseLineBufferLimitBytes else {
+                fail("Opencode stream line exceeded the memory safety limit.")
+                return
+            }
 
-            while let newlineRange = lineBuffer.range(of: Data([0x0A])) {
+            while let newlineRange = lineBuffer.range(of: newline) {
                 let lineData = lineBuffer.subdata(in: 0..<newlineRange.lowerBound)
                 lineBuffer.removeSubrange(0..<newlineRange.upperBound)
                 guard var line = String(data: lineData, encoding: .utf8) else { continue }
@@ -2760,6 +3365,9 @@ final class CaptureWindowController: NSWindowController {
             var data = String(line.dropFirst(5))
             if data.hasPrefix(" ") { data.removeFirst() }
             dataLines.append(data)
+            if dataLines.count > RetentionPolicy.sseDataLineLimit {
+                fail("Opencode stream event exceeded the memory safety limit.")
+            }
         }
 
         private func emitEventIfReady() {
@@ -2813,6 +3421,7 @@ final class CaptureWindowController: NSWindowController {
 
     private func appendOpencodeChatEntry(header: String, markdown: String, isError: Bool) {
         opencodePendingChatEntries.append((header, markdown, isError))
+        trimOpencodePendingChatQueues(reason: "append")
         flushOpencodePendingChatEntries()
     }
 
@@ -2849,6 +3458,7 @@ final class CaptureWindowController: NSWindowController {
     private func runOpencodeChatJavaScript(_ js: String) {
         guard opencodeChatPageReady else {
             opencodePendingChatScripts.append(js)
+            trimOpencodePendingChatQueues(reason: "enqueue-script")
             return
         }
         opencodeBridge.enqueue(js)
@@ -2898,13 +3508,6 @@ final class CaptureWindowController: NSWindowController {
         opencodeStatusLabel.isHidden = message.isEmpty
     }
 
-    @objc private func clearAudioFeed() {
-        audioTextView.textStorage?.setAttributedString(NSAttributedString())
-        transcriptBuffer = ""
-        lastSentTranscript = ""
-        pendingTranscriptCharsSinceLastSend = 0
-    }
-
     @objc private func clearAudioAI() {
         audioAIBridge.enqueue("clearFeed()", immediate: true)
         audioAIPendingChunksByEntryID.removeAll(keepingCapacity: false)
@@ -2912,6 +3515,15 @@ final class CaptureWindowController: NSWindowController {
         audioAIChunkFlushWorkItem = nil
         audioAICurrentEntry = nil
         audioAIStreamingText = ""
+    }
+
+    @objc private func clearInstantVoice() {
+        instantVoiceBridge.enqueue("clearFeed()", immediate: true)
+        instantVoicePendingChunksByEntryID.removeAll(keepingCapacity: false)
+        instantVoiceChunkFlushWorkItem?.cancel()
+        instantVoiceChunkFlushWorkItem = nil
+        instantVoiceCurrentEntry = nil
+        instantVoiceStreamingText = ""
     }
 
     // MARK: – AI helpers
@@ -3002,6 +3614,60 @@ final class CaptureWindowController: NSWindowController {
             audioAIBridge.enqueue("appendStreamingChunk(\(id), \(js))")
         }
         audioAIBridge.flushNow()
+    }
+
+    private func scheduleInstantVoiceChunkFlush() {
+        guard instantVoiceChunkFlushWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            self?.instantVoiceChunkFlushWorkItem = nil
+            self?.flushInstantVoiceStreamingChunks()
+        }
+        instantVoiceChunkFlushWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: item)
+    }
+
+    private func flushInstantVoiceStreamingChunks(for entryID: Int? = nil) {
+        guard !instantVoicePendingChunksByEntryID.isEmpty else { return }
+        let targets: [(Int, String)]
+        if let entryID {
+            guard let text = instantVoicePendingChunksByEntryID.removeValue(forKey: entryID), !text.isEmpty else { return }
+            targets = [(entryID, text)]
+        } else {
+            targets = instantVoicePendingChunksByEntryID.map { ($0.key, $0.value) }
+            instantVoicePendingChunksByEntryID.removeAll(keepingCapacity: true)
+        }
+        for (id, text) in targets.sorted(by: { $0.0 < $1.0 }) {
+            guard let js = jsLiteral(text) else { continue }
+            instantVoiceBridge.enqueue("appendStreamingChunk(\(id), \(js))")
+        }
+        instantVoiceBridge.flushNow()
+    }
+
+    private func scheduleChatChunkFlush() {
+        guard chatChunkFlushWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            self?.chatChunkFlushWorkItem = nil
+            self?.flushChatStreamingChunks()
+        }
+        chatChunkFlushWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: item)
+    }
+
+    private func flushChatStreamingChunks(for entryID: Int? = nil) {
+        guard !chatPendingChunksByEntryID.isEmpty else { return }
+        let targets: [(Int, String)]
+        if let entryID {
+            guard let text = chatPendingChunksByEntryID.removeValue(forKey: entryID), !text.isEmpty else { return }
+            targets = [(entryID, text)]
+        } else {
+            targets = chatPendingChunksByEntryID.map { ($0.key, $0.value) }
+            chatPendingChunksByEntryID.removeAll(keepingCapacity: true)
+        }
+        for (id, text) in targets.sorted(by: { $0.0 < $1.0 }) {
+            guard let js = jsLiteral(text) else { continue }
+            chatBridge.enqueue("appendStreamingChunk(\(id), \(js))")
+        }
+        chatBridge.flushNow()
     }
 
     private func scheduleOpencodeChunkFlush() {
@@ -3657,7 +4323,7 @@ final class CaptureWindowController: NSWindowController {
       }
 
       function applyRoleStyle(entry, header) {
-        var normalized = (header || '').trim().toLowerCase();
+        var normalized = (header || '').trim().split('\\n')[0].toLowerCase();
         if (normalized === 'you') {
           entry.classList.add('entry-card', 'entry-user');
         } else if (normalized === 'opencode') {
@@ -3818,7 +4484,7 @@ final class CaptureWindowController: NSWindowController {
         body.textContent = message;
       }
 
-      function appendEntry(header, markdown, isError) {
+      function appendEntry(header, markdown, isError, imageDataURL) {
         try {
           var feed = document.getElementById('feed');
           if (!feed) return;
@@ -3834,6 +4500,13 @@ final class CaptureWindowController: NSWindowController {
           hdr.className = 'entry-header';
           hdr.textContent = header;
           entry.appendChild(hdr);
+          if (imageDataURL) {
+            var img = document.createElement('img');
+            img.className = 'entry-thumbnail';
+            img.src = imageDataURL;
+            img.alt = 'Screenshot';
+            entry.appendChild(img);
+          }
           var body = document.createElement('div');
           if (isError) {
             body.className = 'entry-error-body';
@@ -4068,5 +4741,75 @@ private final class CopyCodeHandler: NSObject, WKScriptMessageHandler {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(text, forType: .string)
         }
+    }
+}
+
+private final class HoldToTalkButton: NSButton {
+    var onHoldChanged: ((Bool) -> Void)?
+    private var isHolding = false
+
+    func setAvailable(_ available: Bool) {
+        isEnabled = available
+        if !available {
+            isHolding = false
+        }
+        applyHoldAppearance()
+    }
+
+    func setHolding(_ holding: Bool) {
+        isHolding = holding && isEnabled
+        applyHoldAppearance()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else {
+            super.mouseDown(with: event)
+            return
+        }
+        setHolding(true)
+        onHoldChanged?(true)
+
+        var keepTracking = true
+        while keepTracking {
+            guard let nextEvent = window?.nextEvent(
+                matching: [.leftMouseDragged, .leftMouseUp],
+                until: .distantFuture,
+                inMode: .eventTracking,
+                dequeue: true
+            ) else { break }
+
+            switch nextEvent.type {
+            case .leftMouseUp:
+                keepTracking = false
+            default:
+                continue
+            }
+        }
+
+        setHolding(false)
+        onHoldChanged?(false)
+    }
+
+    private func applyHoldAppearance() {
+        wantsLayer = true
+
+        let fill: NSColor
+        let text: NSColor
+        if !isEnabled {
+            fill = .controlColor
+            text = .disabledControlTextColor
+        } else if isHolding {
+            fill = .systemRed
+            text = .white
+        } else {
+            fill = .systemYellow
+            text = .black
+        }
+
+        bezelColor = fill
+        contentTintColor = text
+        layer?.cornerRadius = 5
+        layer?.borderWidth = isEnabled ? 1 : 0
+        layer?.borderColor = fill.withAlphaComponent(isHolding ? 0.95 : 0.75).cgColor
     }
 }

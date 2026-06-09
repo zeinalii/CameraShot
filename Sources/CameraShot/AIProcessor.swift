@@ -247,7 +247,10 @@ private final class GeminiProviderClient: AIProviderClient, @unchecked Sendable 
         DevLog.log("Provider", "Gemini HTTP status=\(status)")
         guard status == 200 else {
             var errData = Data()
-            for try await b in bytes { errData.append(b) }
+            for try await b in bytes {
+                guard errData.count < RetentionPolicy.httpErrorBodyLimitBytes else { break }
+                errData.append(b)
+            }
             let msg = GeminiAPI.errorMessage(from: errData) ?? "HTTP \(status)"
             throw AIProviderError.http(providerID, status, msg)
         }
@@ -265,6 +268,9 @@ private final class GeminiProviderClient: AIProviderClient, @unchecked Sendable 
                     var buffer = [UInt8]()
                     for try await byte in bytes {
                         buffer.append(byte)
+                        guard buffer.count <= RetentionPolicy.sseLineBufferLimitBytes else {
+                            throw AIProviderError.network(providerID, "SSE line exceeded the memory safety limit.")
+                        }
                         if byte == 10 {
                             let line = String(bytes: buffer, encoding: .utf8)?
                                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -388,7 +394,10 @@ private final class OpenAIProviderClient: AIProviderClient, @unchecked Sendable 
         DevLog.log("Provider", "OpenAI HTTP status=\(status)")
         guard status == 200 else {
             var errData = Data()
-            for try await b in bytes { errData.append(b) }
+            for try await b in bytes {
+                guard errData.count < RetentionPolicy.httpErrorBodyLimitBytes else { break }
+                errData.append(b)
+            }
             let msg = OpenAIAPI.errorMessage(from: errData) ?? "HTTP \(status)"
             throw AIProviderError.http(providerID, status, msg)
         }
@@ -398,6 +407,9 @@ private final class OpenAIProviderClient: AIProviderClient, @unchecked Sendable 
         var buffer = [UInt8]()
         for try await byte in bytes {
             buffer.append(byte)
+            guard buffer.count <= RetentionPolicy.sseLineBufferLimitBytes else {
+                throw AIProviderError.network(providerID, "SSE line exceeded the memory safety limit.")
+            }
             if byte == 10 {
                 let line = String(bytes: buffer, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

@@ -26,9 +26,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sessionSalt:      Data?
     private var sessionCredentials = AICredentials()
 
-    // MARK: – Voice / Audio AI controllers
-    private var voiceCtrl:    TranscriptionController?
-    private var audioAIProc:  AudioAIProcessor?
+    // MARK: – Realtime Audio controllers
+    private var passiveAudioCtrl: RealtimeAudioAIController?
+    private var instantVoiceCtrl: RealtimeAudioAIController?
+    private var chatCtrl: GPTChatController?
     private var windowPrivacyObserversInstalled = false
     private var documentsScopeURL: URL?
     private static let documentsAccessBookmarkKey = "documentsAccessBookmark"
@@ -46,7 +47,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         aiProcessor?.cancel()
         cameraCtrl?.stop()
         screenCtrl?.stop()
-        voiceCtrl?.stop()
+        passiveAudioCtrl?.stop()
+        instantVoiceCtrl?.stop()
+        chatCtrl?.cancel()
         documentsScopeURL?.stopAccessingSecurityScopedResource()
         documentsScopeURL = nil
     }
@@ -246,8 +249,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         aiProcessor?.cancel()
         cameraCtrl = nil; screenCtrl = nil; captureCtrl = nil
         aiProcessor = nil
-        voiceCtrl?.stop(); voiceCtrl = nil
-        audioAIProc = nil
+        passiveAudioCtrl?.stop(); passiveAudioCtrl = nil
+        instantVoiceCtrl?.stop(); instantVoiceCtrl = nil
+        chatCtrl?.cancel(); chatCtrl = nil
         showSetup()
     }
 
@@ -343,11 +347,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return proc
     }
 
+    private func wireChatCallbacks(for window: CaptureWindowController) {
+        window.onChatSend = { [weak self, weak window] message, attachmentURL in
+            guard let self else { return }
+            guard let chatCtrl = self.chatCtrl else {
+                window?.appendChatError("No OpenAI API key is saved. Add it in the API Keys tab, then restart capture.")
+                return
+            }
+            DevLog.log("Chat", "send requested chars=\(message.count) attachment=\(attachmentURL?.lastPathComponent ?? "nil")")
+            chatCtrl.send(message, attachmentURL: attachmentURL)
+        }
+        window.onChatRestart = { [weak self, weak window] in
+            DevLog.log("Chat", "restart requested from window")
+            self?.chatCtrl?.restart()
+            window?.setChatResponding(false)
+        }
+    }
+
+    private func configureChatControllerForCurrentCapture() {
+        let captureWindow = captureCtrl
+        guard let apiKey = sessionCredentials.openAIAPIKey, !apiKey.isEmpty else {
+            DevLog.log("Chat", "disabled: missing OpenAI API key")
+            chatCtrl?.cancel()
+            chatCtrl = nil
+            captureWindow?.setChatAvailable(false)
+            return
+        }
+
+        let chat = GPTChatController(apiKey: apiKey)
+        chat.onChunk = { [weak captureWindow] chunk in
+            captureWindow?.appendChatAssistantChunk(chunk)
+        }
+        chat.onDone = { [weak captureWindow] in
+            captureWindow?.finalizeChatAssistant()
+        }
+        chat.onError = { [weak captureWindow] message in
+            captureWindow?.appendChatError(message)
+        }
+        chat.onStatus = { message in
+            DevLog.log("Chat", "status=\(message)")
+        }
+        chatCtrl = chat
+        captureWindow?.setChatAvailable(true)
+        DevLog.log("Chat", "enabled model=\(GPTChatController.model)")
+    }
+
     // MARK: – Capture
 
     private func startCapture(
         source: CaptureSource, interval: TimeInterval,
-        quality: Double, outputDir: URL, aiConfig: AIConfig, voiceConfig: VoiceConfig
+        quality: Double, outputDir: URL, aiConfig: AIConfig, voiceConfig: RealtimeAudioConfig
     ) {
         clearPreviousScreenshots(in: outputDir)
 
@@ -361,13 +410,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             ctrl.shouldCaptureFrame = { true }
             let wc = CaptureWindowController(name: device.localizedName, interval: interval)
+            wireChatCallbacks(for: wc)
             aiProcessor = makeAIProcessor(config: aiConfig, window: wc)
             ctrl.onScreenshotSaved = { [weak self, weak wc] url, n in
                 DevLog.log("Capture", "camera onScreenshotSaved count=\(n) file=\(url.lastPathComponent)")
                 wc?.updateStatus(filename: url.lastPathComponent, count: n)
+                wc?.noteLatestScreenshot(url)
                 self?.handleNewScreenshot(url)
             }
             wc.onPauseAI = { [weak self] paused in self?.aiPaused = paused }
+            wc.onAudioAIPauseChanged = { [weak self] paused in
+                DevLog.log("RealtimeAudio", "passive pause changed paused=\(paused ? 1 : 0)")
+                self?.passiveAudioCtrl?.setPassiveAudioPaused(paused)
+            }
             wc.onRetryAI = { [weak self] in
                 DevLog.log("VisualAI", "manual retry requested from camera window")
                 self?.aiProcessor?.retryLatestScreenshot()
@@ -381,8 +436,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.aiProcessor?.cancel()
                 self.aiProcessor = nil
                 self.aiPaused = false
-                self.voiceCtrl?.stop(); self.voiceCtrl = nil
-                self.audioAIProc = nil
+                self.passiveAudioCtrl?.stop(); self.passiveAudioCtrl = nil
+                self.instantVoiceCtrl?.stop(); self.instantVoiceCtrl = nil
+                self.chatCtrl?.cancel(); self.chatCtrl = nil
                 self.captureCtrl = nil
                 self.showSetup()
                 NSApp.activate(ignoringOtherApps: true)
@@ -400,65 +456,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 aiConfig: aiConfig, voiceConfig: voiceConfig)
         }
 
-        startVoiceControllerIfNeeded(config: voiceConfig)
+        startRealtimeAudioControllersIfNeeded(config: voiceConfig)
+        configureChatControllerForCurrentCapture()
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func startVoiceControllerIfNeeded(config: VoiceConfig) {
-        guard config.enabled else { return }
+    private func startRealtimeAudioControllersIfNeeded(config: RealtimeAudioConfig) {
+        DevLog.log(
+            "RealtimeAudio",
+            "start requested passiveEnabled=\(config.passiveEnabled ? 1 : 0) instantEnabled=\(config.instantEnabled ? 1 : 0) openAIKey=\((sessionCredentials.openAIAPIKey?.isEmpty == false) ? 1 : 0) passivePromptChars=\(config.passiveSystemPrompt.count) instantPromptChars=\(config.instantSystemPrompt.count)"
+        )
+        captureCtrl?.setInstantVoiceAvailable(config.instantEnabled)
+        if !config.passiveEnabled {
+            captureCtrl?.updateAudioAIState(.unavailable)
+        }
+        guard config.enabled else {
+            DevLog.log("RealtimeAudio", "start skipped: both Realtime audio checkboxes are off")
+            return
+        }
+        guard let apiKey = sessionCredentials.openAIAPIKey, !apiKey.isEmpty else {
+            DevLog.log("RealtimeAudio", "start failed: missing OpenAI API key")
+            captureCtrl?.setInstantVoiceAvailable(false)
+            if config.passiveEnabled {
+                captureCtrl?.updateAudioAIState(.unavailable)
+                captureCtrl?.appendAudioAIError("No OpenAI API key is saved. Add it in the API Keys tab.")
+            }
+            if config.instantEnabled {
+                captureCtrl?.appendInstantVoiceError("No OpenAI API key is saved. Add it in the API Keys tab.")
+            }
+            return
+        }
 
-        // Transcription controller
-        let vc = TranscriptionController(config: config)
         let captureWindow = captureCtrl
-        vc.onTranscript = { [weak captureWindow] text, _ in
-            captureWindow?.appendTranscript(text)
-        }
-        vc.onError = { [weak captureWindow] msg in
-            captureWindow?.appendAudioError(msg)
-        }
-        voiceCtrl = vc
-        Task { [weak vc] in
-            do { try await vc?.start() }
-            catch {
-                await MainActor.run {
-                    captureWindow?.appendAudioError(
-                        "Voice setup failed: \(error.localizedDescription)")
+
+        if config.passiveEnabled {
+            let passive = RealtimeAudioAIController(
+                apiKey: apiKey,
+                systemPrompt: config.passiveSystemPrompt,
+                mode: .passiveSystemAudio
+            )
+            passive.onChunk = { [weak captureWindow] chunk in captureWindow?.appendAudioAIChunk(chunk) }
+            passive.onDone  = { [weak captureWindow] in captureWindow?.finalizeAudioAI() }
+            passive.onError = { [weak captureWindow] msg in captureWindow?.appendAudioAIError(msg) }
+            passive.onStatus = { msg in DevLog.log("RealtimeAudio", "passive status=\(msg)") }
+            passive.onPassiveState = { [weak captureWindow] state in
+                DevLog.log("RealtimeAudio", "passive state=\(state)")
+                captureWindow?.updateAudioAIState(state)
+            }
+            passiveAudioCtrl = passive
+            captureCtrl?.onAudioAIManualTurnEnd = { [weak passive] in
+                DevLog.log("RealtimeAudio", "passive manual turn-end requested")
+                passive?.forcePassiveTurnEnd()
+            }
+
+            Task { [weak passive] in
+                do { try await passive?.start() }
+                catch {
+                    DevLog.log("RealtimeAudio", "passive start failed error=\(error.localizedDescription)")
+                    await MainActor.run {
+                        captureWindow?.updateAudioAIState(.unavailable)
+                        captureWindow?.appendAudioAIError(
+                            "Passive Realtime setup failed: \(error.localizedDescription)")
+                    }
                 }
             }
+        } else {
+            passiveAudioCtrl = nil
+            captureCtrl?.onAudioAIManualTurnEnd = nil
         }
 
-        // Audio AI processor — requires Google Gemini key
-        guard let apiKey = sessionCredentials.geminiAPIKey, !apiKey.isEmpty else { return }
-        let proc = AudioAIProcessor(apiKey: apiKey, systemPrompt: config.audioAIPrompt)
-        proc.onChunk = { [weak captureWindow] chunk in captureWindow?.appendAudioAIChunk(chunk) }
-        proc.onDone  = { [weak captureWindow] in captureWindow?.finalizeAudioAI() }
-        proc.onError = { [weak captureWindow] msg in captureWindow?.appendAudioAIError(msg) }
-        audioAIProc = proc
+        if config.instantEnabled {
+            let instant = RealtimeAudioAIController(
+                apiKey: apiKey,
+                systemPrompt: config.instantSystemPrompt,
+                mode: .pushToTalkSystemAudio
+            )
+            instant.onChunk = { [weak captureWindow] chunk in captureWindow?.appendInstantVoiceChunk(chunk) }
+            instant.onDone  = { [weak captureWindow] in captureWindow?.finalizeInstantVoice() }
+            instant.onError = { [weak captureWindow] msg in captureWindow?.appendInstantVoiceError(msg) }
+            instant.onStatus = { msg in DevLog.log("RealtimeAudio", "instant status=\(msg)") }
+            instantVoiceCtrl = instant
 
-        // Wire the Ask AI button + interval timer
-        captureCtrl?.audioAITokenLimit = config.transcriptTokenLimit
-        captureCtrl?.onAudioAIRequest = { [weak proc] transcript in
-            proc?.query(transcript: transcript) ?? false
+            captureCtrl?.onInstantVoiceHoldChanged = { [weak instant] isHolding in
+                DevLog.log("RealtimeAudio", "instant hold changed active=\(isHolding ? 1 : 0)")
+                if isHolding {
+                    instant?.beginPushToTalk()
+                } else {
+                    instant?.endPushToTalk()
+                }
+            }
+
+            Task { [weak instant] in
+                do { try await instant?.start() }
+                catch {
+                    DevLog.log("RealtimeAudio", "instant start failed error=\(error.localizedDescription)")
+                    await MainActor.run {
+                        captureWindow?.setInstantVoiceAvailable(false)
+                        captureWindow?.appendInstantVoiceError(
+                            "Instant Voice setup failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        } else {
+            instantVoiceCtrl = nil
+            captureCtrl?.onInstantVoiceHoldChanged = nil
         }
-        captureCtrl?.startAudioAITimer()
     }
 
     private func launchScreenCapture(
         target: ScreenTarget, name: String,
         interval: TimeInterval, quality: Double, outputDir: URL,
-        aiConfig: AIConfig, voiceConfig: VoiceConfig
+        aiConfig: AIConfig, voiceConfig: RealtimeAudioConfig
     ) {
         let ctrl = ScreenCaptureController(target: target, interval: interval,
                                            jpegQuality: quality, outputDir: outputDir)
         ctrl.shouldCaptureFrame = { true }
         let wc = CaptureWindowController(name: name, interval: interval)
+        wireChatCallbacks(for: wc)
         aiProcessor = makeAIProcessor(config: aiConfig, window: wc)
         ctrl.onScreenshotSaved = { [weak self, weak wc] url, n in
             DevLog.log("Capture", "screen onScreenshotSaved count=\(n) file=\(url.lastPathComponent)")
             wc?.updateStatus(filename: url.lastPathComponent, count: n)
+            wc?.noteLatestScreenshot(url)
             self?.handleNewScreenshot(url)
         }
         wc.onPauseAI = { [weak self] paused in self?.aiPaused = paused }
+        wc.onAudioAIPauseChanged = { [weak self] paused in
+            DevLog.log("RealtimeAudio", "passive pause changed paused=\(paused ? 1 : 0)")
+            self?.passiveAudioCtrl?.setPassiveAudioPaused(paused)
+        }
         wc.onRetryAI = { [weak self] in
             DevLog.log("VisualAI", "manual retry requested from screen window")
             self?.aiProcessor?.retryLatestScreenshot()
@@ -472,8 +598,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.aiProcessor?.cancel()
             self.aiProcessor = nil
             self.aiPaused = false
-            self.voiceCtrl?.stop(); self.voiceCtrl = nil
-            self.audioAIProc = nil
+            self.passiveAudioCtrl?.stop(); self.passiveAudioCtrl = nil
+            self.instantVoiceCtrl?.stop(); self.instantVoiceCtrl = nil
+            self.chatCtrl?.cancel(); self.chatCtrl = nil
             self.captureCtrl = nil
             self.showSetup()
             NSApp.activate(ignoringOtherApps: true)

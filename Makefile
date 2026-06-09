@@ -4,6 +4,7 @@ RESOURCES := $(APP)/Contents/Resources
 CONFIG    ?= release
 SIGN_IDENTITY ?=
 NOTARY_PROFILE ?=
+HIDE_DOCK ?= 0
 
 .PHONY: build run dev clean
 
@@ -73,13 +74,14 @@ build:
 
 # Usage: make run ARGS="5"         (5-second interval, camera menu)
 #        make run ARGS="5 1"       (5-second interval, camera index 1)
+#        make run HIDE_DOCK=1      (launch without a Dock icon)
 run: build
-	./$(APP)/Contents/MacOS/CameraShot $(ARGS)
+	CAMERASHOT_HIDE_DOCK=$(HIDE_DOCK) ./$(APP)/Contents/MacOS/CameraShot $(ARGS)
 
 dev:
 	$(MAKE) build CONFIG=debug SIGN_IDENTITY=-
 	@echo "✓ Launching debug build. Logs will appear below."
-	./$(APP)/Contents/MacOS/CameraShot $(ARGS)
+	CAMERASHOT_HIDE_DOCK=$(HIDE_DOCK) ./$(APP)/Contents/MacOS/CameraShot $(ARGS)
 
 clean:
 	rm -rf .build $(APP)

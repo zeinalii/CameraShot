@@ -6,7 +6,7 @@ import ScreenCaptureKit
 
 final class SetupWindowController: NSWindowController {
 
-    var onStart:       ((CaptureSource, TimeInterval, Double, URL, AIConfig, VoiceConfig) -> Void)?
+    var onStart:       ((CaptureSource, TimeInterval, Double, URL, AIConfig, RealtimeAudioConfig) -> Void)?
     /// Encrypt and persist provider API keys using the current session.
     var saveAPIKey:    ((AIProviderID, String) throws -> Void)?
     var removeAPIKey:  ((AIProviderID) throws -> Void)?
@@ -46,9 +46,9 @@ final class SetupWindowController: NSWindowController {
     private static let aiModelDefaultsKey = "setup.aiModel"
     private static let aiPromptDefaultsKey = "setup.aiPrompt"
     private static let voiceInputEnabledDefaultsKey = "setup.voiceInputEnabled"
-    private static let voiceServerURLDefaultsKey = "setup.voiceServerURL"
+    private static let instantVoiceEnabledDefaultsKey = "setup.instantVoiceEnabled"
     private static let audioPromptDefaultsKey = "setup.audioPrompt"
-    private static let audioTokenLimitDefaultsKey = "setup.audioTokenLimit"
+    private static let instantVoicePromptDefaultsKey = "setup.instantVoicePrompt"
     private static let screenCapturePromptedDefaultsKey = "setup.screenCapturePrompted"
 
     private var didPromptScreenCaptureThisLaunch = false
@@ -90,19 +90,16 @@ final class SetupWindowController: NSWindowController {
     private weak var openAIAPIKeyField:   NSTextField!
     private weak var openAIKeyStatusLabel: NSTextField!
 
-    // MARK: – Outlets — Voice Input URL (in Capture tab)
-
-    private weak var audioModelField: NSTextField!
-
     // MARK: – Outlets — Voice Input (in Capture tab)
 
     private weak var voiceInputCheckbox: NSButton!
+    private weak var instantVoiceInputCheckbox: NSButton!
 
     // MARK: – Outlets — Audio Prompt tab
 
     private weak var audioPromptStack:         NSStackView!
     private      var audioAIPromptTextView:    NSTextView!
-    private weak var tokenLimitField:          NSTextField!
+    private      var instantVoicePromptTextView: NSTextView!
     private weak var audioPromptSaveStatusLabel: NSTextField!
 
     // MARK: – Init
@@ -168,7 +165,7 @@ final class SetupWindowController: NSWindowController {
 
         // ── Tab bar ──────────────────────────────────────────────
         let tabs = NSSegmentedControl(
-            labels: ["Capture", "Prompts", "API Keys", "Audio Prompt"],
+            labels: ["Capture", "Prompts", "API Keys", "Audio Prompts"],
             trackingMode: .selectOne,
             target: self,
             action: #selector(tabChanged)
@@ -322,7 +319,7 @@ final class SetupWindowController: NSWindowController {
         divider.widthAnchor.constraint(equalToConstant: 376).isActive = true
         s.setCustomSpacing(14, after: divider)
 
-        let vcb = NSButton(checkboxWithTitle: "Voice Input  (Live Transcription)",
+        let vcb = NSButton(checkboxWithTitle: "Audio AI tab",
                            target: self, action: #selector(voiceInputToggled))
         vcb.state = .off
         voiceInputCheckbox = vcb
@@ -330,8 +327,16 @@ final class SetupWindowController: NSWindowController {
         vcb.widthAnchor.constraint(equalToConstant: 376).isActive = true
         s.setCustomSpacing(6, after: vcb)
 
+        let ivcb = NSButton(checkboxWithTitle: "Instant Voice tab",
+                            target: self, action: #selector(voiceInputToggled))
+        ivcb.state = .off
+        instantVoiceInputCheckbox = ivcb
+        s.addArrangedSubview(ivcb)
+        ivcb.widthAnchor.constraint(equalToConstant: 376).isActive = true
+        s.setCustomSpacing(6, after: ivcb)
+
         let hint = NSTextField(wrappingLabelWithString:
-            "Captures all system audio output (speakers/headphones) via ScreenCaptureKit.")
+            "Audio AI listens to system audio continuously. Instant Voice captures system audio only while its button or Space is held.")
         hint.font      = .systemFont(ofSize: 11)
         hint.textColor = .tertiaryLabelColor
         hint.isHidden  = true
@@ -339,34 +344,15 @@ final class SetupWindowController: NSWindowController {
         hint.widthAnchor.constraint(equalToConstant: 376).isActive = true
         s.setCustomSpacing(6, after: hint)
 
-        // Server URL row (hidden until voice input is enabled)
-        let urlRow = hstack(spacing: 8); urlRow.alignment = .centerY
-        urlRow.isHidden = true
-        let urlLabel = plainLabel("Server:", size: 12, weight: .regular)
-        urlLabel.textColor = .secondaryLabelColor
-        urlRow.addArrangedSubview(urlLabel)
-        let urlField = NSTextField(string: "ws://aseman:8765")
-        urlField.font              = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        urlField.placeholderString = "ws://hostname:port"
-        urlField.isBezeled         = true
-        urlField.bezelStyle        = .roundedBezel
-        urlField.isEditable        = true
-        audioModelField = urlField
-        urlRow.addArrangedSubview(urlField)
-        s.addArrangedSubview(urlRow)
-        urlRow.widthAnchor.constraint(equalToConstant: 376).isActive = true
-        s.setCustomSpacing(4, after: urlRow)
-
         captureStack = s
         return s
     }
 
     @objc private func voiceInputToggled() {
-        let enabled = voiceInputCheckbox.state == .on
-        guard let idx = captureStack.arrangedSubviews.firstIndex(of: voiceInputCheckbox) else { return }
-        // hint label is idx+1, url row is idx+2
+        let enabled = voiceInputCheckbox.state == .on || instantVoiceInputCheckbox.state == .on
+        guard let idx = captureStack.arrangedSubviews.firstIndex(of: instantVoiceInputCheckbox) else { return }
+        // hint label is after the two audio checkboxes
         captureStack.arrangedSubviews[safe: idx + 1]?.isHidden = !enabled
-        captureStack.arrangedSubviews[safe: idx + 2]?.isHidden = !enabled
         persistPromptSettings()
     }
 
@@ -558,59 +544,29 @@ final class SetupWindowController: NSWindowController {
         s.alignment = .centerX
         s.isHidden  = true
 
-        // Token limit row
-        let tokenRow = hstack(spacing: 8); tokenRow.alignment = .centerY
-        tokenRow.addArrangedSubview(sectionLabel("Transcript Tokens Sent to Gemini"))
-        tokenRow.addArrangedSubview(hFlex())
-        let tf = NSTextField(string: "500")
-        tf.font              = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        tf.alignment         = .right
-        tf.isBezeled         = true
-        tf.bezelStyle        = .roundedBezel
-        tf.isEditable        = true
-        tf.placeholderString = "500"
-        tf.widthAnchor.constraint(equalToConstant: 64).isActive = true
-        tokenLimitField = tf
-        tokenRow.addArrangedSubview(tf)
-        s.addArrangedSubview(tokenRow)
-        tokenRow.widthAnchor.constraint(equalToConstant: 376).isActive = true
-        s.setCustomSpacing(4, after: tokenRow)
-
         let hint = NSTextField(wrappingLabelWithString:
-            "Each Audio AI request sends the system prompt plus the last ~this many tokens of the Transcript tab (including <partial> lines and errors), approximated as 4 characters per token.")
+            "Each Realtime audio mode has its own session and system prompt. Passive Audio AI listens continuously; Instant Voice captures system audio while you hold its button or Space.")
         hint.font      = .systemFont(ofSize: 11)
         hint.textColor = .tertiaryLabelColor
         s.addArrangedSubview(hint)
         hint.widthAnchor.constraint(equalToConstant: 376).isActive = true
         s.setCustomSpacing(14, after: hint)
 
-        s.addArrangedSubview(sectionLabel("Audio AI System Prompt"))
+        s.addArrangedSubview(sectionLabel("Passive Audio AI Prompt"))
         s.setCustomSpacing(5, after: s.arrangedSubviews.last!)
 
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller   = true
-        scroll.autohidesScrollers    = true
-        scroll.hasHorizontalScroller = false
-        scroll.borderType = .bezelBorder
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            scroll.widthAnchor.constraint(equalToConstant: 376),
-            scroll.heightAnchor.constraint(equalToConstant: 180),
-        ])
+        let passive = promptEditor(defaultText: RealtimeAudioConfig.defaultPassivePrompt, height: 130)
+        audioAIPromptTextView = passive.textView
+        s.addArrangedSubview(passive.scrollView)
+        s.setCustomSpacing(16, after: passive.scrollView)
 
-        let tv = NSTextView()
-        tv.font    = .systemFont(ofSize: 13)
-        tv.string  = "You are listening to a live conversation or meeting. Based on the transcript, answer questions being asked, summarize key points, or provide helpful context. Be concise."
-        tv.isEditable   = true
-        tv.isSelectable = true
-        tv.autoresizingMask = [.width]
-        tv.textContainerInset = NSSize(width: 4, height: 6)
-        tv.textContainer?.widthTracksTextView = true
-        scroll.documentView = tv
-        audioAIPromptTextView = tv
+        s.addArrangedSubview(sectionLabel("Instant Voice Prompt"))
+        s.setCustomSpacing(5, after: s.arrangedSubviews.last!)
 
-        s.addArrangedSubview(scroll)
-        s.setCustomSpacing(14, after: scroll)
+        let instant = promptEditor(defaultText: RealtimeAudioConfig.defaultInstantPrompt, height: 130)
+        instantVoicePromptTextView = instant.textView
+        s.addArrangedSubview(instant.scrollView)
+        s.setCustomSpacing(14, after: instant.scrollView)
 
         let saveRow = hstack(spacing: 10); saveRow.alignment = .centerY
         let saveBtn = NSButton(title: "Save Prompt", target: self, action: #selector(saveAudioPromptTapped))
@@ -629,10 +585,34 @@ final class SetupWindowController: NSWindowController {
         return s
     }
 
+    private func promptEditor(defaultText: String, height: CGFloat) -> (scrollView: NSScrollView, textView: NSTextView) {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller   = true
+        scroll.autohidesScrollers    = true
+        scroll.hasHorizontalScroller = false
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            scroll.widthAnchor.constraint(equalToConstant: 376),
+            scroll.heightAnchor.constraint(equalToConstant: height),
+        ])
+
+        let tv = NSTextView()
+        tv.font    = .systemFont(ofSize: 13)
+        tv.string  = defaultText
+        tv.isEditable   = true
+        tv.isSelectable = true
+        tv.autoresizingMask = [.width]
+        tv.textContainerInset = NSSize(width: 4, height: 6)
+        tv.textContainer?.widthTracksTextView = true
+        scroll.documentView = tv
+        return (scroll, tv)
+    }
+
     private func refreshKeyStatus() {
         let status = credentialStatus?() ?? AICredentialStatus(hasGeminiKey: false, hasOpenAIKey: false)
         updateKeyStatusLabel(geminiKeyStatusLabel, saved: status.hasGeminiKey, fallbackText: "Required for visual AI")
-        updateKeyStatusLabel(openAIKeyStatusLabel, saved: status.hasOpenAIKey, fallbackText: "Optional fallback not configured")
+        updateKeyStatusLabel(openAIKeyStatusLabel, saved: status.hasOpenAIKey, fallbackText: "Required for realtime audio and Chat; optional visual fallback")
     }
 
     private func updateKeyStatusLabel(_ label: NSTextField?, saved: Bool, fallbackText: String) {
@@ -1071,15 +1051,26 @@ final class SetupWindowController: NSWindowController {
             return
         }
 
-        let voiceEnabled = voiceInputCheckbox.state == .on
-        let rawURL    = audioModelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rawPrompt = audioAIPromptTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        let tokenLimit = Int(tokenLimitField.stringValue) ?? 500
-        let voiceConfig = VoiceConfig(
-            enabled:              voiceEnabled,
-            serverURL:            rawURL.isEmpty    ? "ws://aseman:8765" : rawURL,
-            audioAIPrompt:        rawPrompt.isEmpty ? "You are listening to a live conversation or meeting. Based on the transcript, answer questions being asked, summarize key points, or provide helpful context. Be concise." : rawPrompt,
-            transcriptTokenLimit: max(50, tokenLimit)
+        let passiveAudioEnabled = voiceInputCheckbox.state == .on
+        let instantVoiceEnabled = instantVoiceInputCheckbox.state == .on
+        if (passiveAudioEnabled || instantVoiceEnabled) && !savedKeys.hasOpenAIKey {
+            let alert = NSAlert()
+            alert.window.sharingType = .none
+            alert.messageText = "OpenAI API Key Required"
+            alert.informativeText = "A Realtime audio mode is enabled but no OpenAI API key is saved. Open the \"API Keys\" tab, enter your key, and click \"Save Key\"."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        let passivePrompt = audioAIPromptTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let instantPrompt = instantVoicePromptTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let voiceConfig = RealtimeAudioConfig(
+            passiveEnabled: passiveAudioEnabled,
+            instantEnabled: instantVoiceEnabled,
+            passiveSystemPrompt: passivePrompt.isEmpty ? RealtimeAudioConfig.defaultPassivePrompt : passivePrompt,
+            instantSystemPrompt: instantPrompt.isEmpty ? RealtimeAudioConfig.defaultInstantPrompt : instantPrompt
         )
 
         var outputDir = selectedOutputDir
@@ -1100,7 +1091,7 @@ final class SetupWindowController: NSWindowController {
                 return
             }
             let device = cameras[max(0, cameraPopup.indexOfSelectedItem)]
-            print("[CameraShot] Starting camera capture: device=\(device.localizedName), interval=\(iv)s, quality=\(quality), output=\(outputDir.path), ai=\(aiEnabled), voice=\(voiceEnabled)")
+            print("[CameraShot] Starting camera capture: device=\(device.localizedName), interval=\(iv)s, quality=\(quality), output=\(outputDir.path), ai=\(aiEnabled), audioAI=\(passiveAudioEnabled), instantVoice=\(instantVoiceEnabled)")
             stopCameraPreview { [weak self] in
                 guard let self else { return }
                 self.livePreview.clear()
@@ -1159,14 +1150,14 @@ final class SetupWindowController: NSWindowController {
         if defaults.object(forKey: Self.voiceInputEnabledDefaultsKey) != nil {
             voiceInputCheckbox.state = defaults.bool(forKey: Self.voiceInputEnabledDefaultsKey) ? .on : .off
         }
-        if let serverURL = defaults.string(forKey: Self.voiceServerURLDefaultsKey) {
-            audioModelField.stringValue = serverURL
+        if defaults.object(forKey: Self.instantVoiceEnabledDefaultsKey) != nil {
+            instantVoiceInputCheckbox.state = defaults.bool(forKey: Self.instantVoiceEnabledDefaultsKey) ? .on : .off
         }
         if let audioPrompt = defaults.string(forKey: Self.audioPromptDefaultsKey) {
             audioAIPromptTextView.string = audioPrompt
         }
-        if let tokenLimit = defaults.string(forKey: Self.audioTokenLimitDefaultsKey) {
-            tokenLimitField.stringValue = tokenLimit
+        if let instantPrompt = defaults.string(forKey: Self.instantVoicePromptDefaultsKey) {
+            instantVoicePromptTextView.string = instantPrompt
         }
         voiceInputToggled()
     }
@@ -1182,18 +1173,6 @@ final class SetupWindowController: NSWindowController {
         nc.addObserver(
             self,
             selector: #selector(promptSettingChanged(_:)),
-            name: NSControl.textDidChangeNotification,
-            object: audioModelField
-        )
-        nc.addObserver(
-            self,
-            selector: #selector(promptSettingChanged(_:)),
-            name: NSControl.textDidChangeNotification,
-            object: tokenLimitField
-        )
-        nc.addObserver(
-            self,
-            selector: #selector(promptSettingChanged(_:)),
             name: NSText.didChangeNotification,
             object: promptTextView
         )
@@ -1202,6 +1181,12 @@ final class SetupWindowController: NSWindowController {
             selector: #selector(promptSettingChanged(_:)),
             name: NSText.didChangeNotification,
             object: audioAIPromptTextView
+        )
+        nc.addObserver(
+            self,
+            selector: #selector(promptSettingChanged(_:)),
+            name: NSText.didChangeNotification,
+            object: instantVoicePromptTextView
         )
     }
 
@@ -1214,9 +1199,9 @@ final class SetupWindowController: NSWindowController {
         UserDefaults.standard.set(GeminiAPI.compatibleModel(modelField.stringValue), forKey: Self.aiModelDefaultsKey)
         UserDefaults.standard.set(promptTextView.string, forKey: Self.aiPromptDefaultsKey)
         UserDefaults.standard.set(voiceInputCheckbox.state == .on, forKey: Self.voiceInputEnabledDefaultsKey)
-        UserDefaults.standard.set(audioModelField.stringValue, forKey: Self.voiceServerURLDefaultsKey)
+        UserDefaults.standard.set(instantVoiceInputCheckbox.state == .on, forKey: Self.instantVoiceEnabledDefaultsKey)
         UserDefaults.standard.set(audioAIPromptTextView.string, forKey: Self.audioPromptDefaultsKey)
-        UserDefaults.standard.set(tokenLimitField.stringValue, forKey: Self.audioTokenLimitDefaultsKey)
+        UserDefaults.standard.set(instantVoicePromptTextView.string, forKey: Self.instantVoicePromptDefaultsKey)
     }
 
     // MARK: – Layout helpers

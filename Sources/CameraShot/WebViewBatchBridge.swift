@@ -81,7 +81,7 @@ final class WebViewBatchBridge {
     }
 
     private func log(_ message: String) {
-        guard label == "visual" else { return }
+        guard ["visual", "audioAI", "instantVoice", "chat"].contains(label) else { return }
         DevLog.log("WebViewBridge", "\(label): \(message)")
     }
 
