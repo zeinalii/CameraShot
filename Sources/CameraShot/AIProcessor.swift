@@ -3,14 +3,14 @@ import Foundation
 // MARK: - GeminiAPI
 
 enum GeminiAPI {
-    static let defaultModel = "gemini-3.5-flash"
+    static let defaultModel = "gemini-3.8-flash"
 
     static func compatibleModel(_ model: String) -> String {
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return defaultModel }
 
         let lowercased = trimmed.lowercased()
-        if lowercased == "gemini-3-5-flash" ||
+        if lowercased == "gemini-3.8-flash" ||
             lowercased.hasPrefix("claude") ||
             lowercased.contains("sonnet") ||
             lowercased.contains("opus") ||
@@ -68,7 +68,7 @@ enum GeminiAPI {
 // MARK: - OpenAIAPI
 
 enum OpenAIAPI {
-    static let fallbackModel = "gpt-5.3-codex"
+    static let fallbackModel = "gpt-6.1-terra"
 
     static var responsesURL: URL? {
         URL(string: "https://api.openai.com/v1/responses")
@@ -102,7 +102,7 @@ enum OpenAIAPI {
 
 struct AIConfig {
     var enabled: Bool   = true
-    var prompt:  String = "try to solve this question that you see on the screen."
+    var prompt:  String = ""
     var model:   String = GeminiAPI.defaultModel
 }
 
@@ -218,8 +218,7 @@ private final class GeminiProviderClient: AIProviderClient, @unchecked Sendable 
                 "role": "user",
                 "parts": [
                     ["inline_data": ["mime_type": mimeType, "data": imageData.base64EncodedString()]],
-                    ["text": prompt],
-                ],
+                ] + (prompt.isEmpty ? [] : [["text": prompt]]),
             ]],
             "tools": GeminiAPI.googleSearchTools(),
             "generationConfig": [
@@ -362,8 +361,7 @@ private final class OpenAIProviderClient: AIProviderClient, @unchecked Sendable 
             "instructions": GeminiProviderClient.systemInstruction,
             "input": [[
                 "role": "user",
-                "content": [
-                    ["type": "input_text", "text": prompt],
+                "content": (prompt.isEmpty ? [] : [["type": "input_text", "text": prompt]]) + [
                     ["type": "input_image", "image_url": imageURL],
                 ],
             ]],

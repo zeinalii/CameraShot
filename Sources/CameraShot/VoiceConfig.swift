@@ -1,13 +1,11 @@
 // MARK: - RealtimeAudioConfig
 
 struct RealtimeAudioConfig {
-    static let model = "gpt-realtime-2"
+    static let model = "gpt-realtime-2.1"
 
-    static let defaultPassivePrompt =
-        "You are listening to live system audio from a conversation or meeting. Respond only when there is a question, request, decision point, or useful context to add. Be concise and practical."
+    static let defaultPassivePrompt = ""
 
-    static let defaultInstantPrompt =
-        "You are an instant voice assistant. The user will hold a push-to-talk button while relevant system audio plays, then release it. Answer or summarize the captured system audio directly and concisely."
+    static let defaultInstantPrompt = ""
 
     var passiveEnabled: Bool = false
     var instantEnabled: Bool = false

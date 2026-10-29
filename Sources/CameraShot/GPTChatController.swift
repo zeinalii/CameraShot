@@ -3,7 +3,7 @@ import Foundation
 // MARK: - GPTChatController
 
 final class GPTChatController: @unchecked Sendable {
-    static let model = "gpt-5.6-sol"
+    static let model = "gpt-6.1-sol"
     static let displayName = "GPT-5.6 Sol"
 
     var onChunk: ((String) -> Void)?

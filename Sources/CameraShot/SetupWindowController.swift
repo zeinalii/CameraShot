@@ -392,7 +392,7 @@ final class SetupWindowController: NSWindowController {
 
         let mf = NSTextField(string: GeminiAPI.defaultModel)
         mf.font = .systemFont(ofSize: 13)
-        mf.placeholderString = "e.g. gemini-3.5-flash"
+        mf.placeholderString = "e.g. gemini-3.8-flash"
         modelField = mf
         s.addArrangedSubview(mf)
         mf.widthAnchor.constraint(equalToConstant: 376).isActive = true
@@ -415,7 +415,7 @@ final class SetupWindowController: NSWindowController {
 
         let tv = NSTextView()
         tv.font    = .systemFont(ofSize: 13)
-        tv.string  = "try to solve this question that you see on the screen."
+        tv.string  = ""
         tv.isEditable   = true
         tv.isSelectable = true
         tv.autoresizingMask = [.width]
@@ -1055,9 +1055,7 @@ final class SetupWindowController: NSWindowController {
         let aiEnabled = aiEnabledCheckbox.state == .on
         let aiConfig = AIConfig(
             enabled: aiEnabled,
-            prompt:  promptTextView.string.isEmpty
-                         ? "try to solve this question that you see on the screen."
-                         : promptTextView.string,
+            prompt:  promptTextView.string,
             model:   GeminiAPI.compatibleModel(modelField.stringValue)
         )
 
@@ -1094,9 +1092,9 @@ final class SetupWindowController: NSWindowController {
             passiveEnabled: passiveAudioEnabled,
             instantEnabled: instantVoiceEnabled,
             instant2Enabled: instantVoice2Enabled,
-            passiveSystemPrompt: passivePrompt.isEmpty ? RealtimeAudioConfig.defaultPassivePrompt : passivePrompt,
-            instantSystemPrompt: instantPrompt.isEmpty ? RealtimeAudioConfig.defaultInstantPrompt : instantPrompt,
-            instant2SystemPrompt: instant2Prompt.isEmpty ? RealtimeAudioConfig.defaultInstantPrompt : instant2Prompt
+            passiveSystemPrompt: passivePrompt,
+            instantSystemPrompt: instantPrompt,
+            instant2SystemPrompt: instant2Prompt
         )
 
         var outputDir = selectedOutputDir
