@@ -3,6 +3,58 @@ import Darwin
 import ImageIO
 import WebKit
 
+private final class AudioActivityBarView: NSView {
+    private let fillLayer = CALayer()
+    private var displayedLevel: CGFloat = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+        layer?.cornerRadius = 3
+        layer?.masksToBounds = false
+        fillLayer.backgroundColor = NSColor.systemGreen.cgColor
+        fillLayer.cornerRadius = 3
+        fillLayer.shadowColor = NSColor.systemGreen.cgColor
+        fillLayer.shadowOpacity = 0.75
+        fillLayer.shadowRadius = 4
+        fillLayer.shadowOffset = .zero
+        layer?.addSublayer(fillLayer)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.levelIndicator)
+        setAccessibilityLabel("System audio activity")
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        updateFillFrame()
+    }
+
+    func setLevel(_ level: Float) {
+        let target = CGFloat(max(0, min(1, level)))
+        let smoothing: CGFloat = target > displayedLevel ? 0.58 : 0.2
+        displayedLevel += (target - displayedLevel) * smoothing
+        if displayedLevel < 0.015 { displayedLevel = 0 }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fillLayer.backgroundColor = (displayedLevel > 0.82
+            ? NSColor.systemYellow : NSColor.systemGreen).cgColor
+        updateFillFrame()
+        CATransaction.commit()
+        setAccessibilityValue(Int(displayedLevel * 100))
+    }
+
+    private func updateFillFrame() {
+        fillLayer.frame = CGRect(x: 0, y: 0,
+                                 width: bounds.width * displayedLevel,
+                                 height: bounds.height)
+    }
+}
+
 // MARK: - CaptureWindowController
 
 final class CaptureWindowController: NSWindowController {
@@ -42,14 +94,16 @@ final class CaptureWindowController: NSWindowController {
     /// Called when the user restarts the Chat tab session.
     var onChatRestart: (() -> Void)?
 
-    // MARK: – Content tab (Visual / Audio AI / Instant Voice / Opencode / File Explore)
+    // MARK: – Content tab (Visual / Audio AI / Instant Voice / Instant Audio2 / Note / Opencode / File Explore)
 
     private enum ContentTab: Int {
         case visual = 0
         case audioAI = 1
         case instantVoice = 2
-        case chat = 3
-        case opencode = 4
+        case instantAudio2 = 3
+        case note = 4
+        case chat = 5
+        case opencode = 6
     }
 
     private enum InstantVoiceHoldSource: Hashable {
@@ -73,6 +127,8 @@ final class CaptureWindowController: NSWindowController {
     private weak var audioAIManualTurnBtn: NSButton!
     private weak var audioAIZoomOutBtn: NSButton!
     private weak var audioAIZoomInBtn:  NSButton!
+    private weak var audioAIActivityLabel: NSTextField!
+    private weak var audioAIActivityBar: AudioActivityBarView!
     private var audioAIPaused = false
     private var audioAIState: RealtimeAudioAIController.PassiveState = .starting
 
@@ -81,6 +137,19 @@ final class CaptureWindowController: NSWindowController {
     private weak var instantVoiceClearBtn: NSButton!
     private weak var instantVoiceZoomOutBtn: NSButton!
     private weak var instantVoiceZoomInBtn: NSButton!
+
+    // Instant Audio2-tab buttons
+    private weak var instantVoice2HoldBtn: HoldToTalkButton!
+    private weak var instantVoice2ClearBtn: NSButton!
+    private weak var instantVoice2ZoomOutBtn: NSButton!
+    private weak var instantVoice2ZoomInBtn: NSButton!
+
+    // Note-tab controls
+    private weak var noteContainerView: NSView!
+    private var noteTextView: NSTextView!
+    private weak var noteZoomOutBtn: NSButton!
+    private weak var noteZoomInBtn: NSButton!
+    private var noteFontSize: CGFloat = 14
 
     // Chat-tab controls
     private weak var chatContainerView: NSView!
@@ -110,6 +179,7 @@ final class CaptureWindowController: NSWindowController {
     private var opencodeCommandToken: Int = 0
     private var opencodeIsBusy = false
     private let opencodeDefaultAttachURL = "http://127.0.0.1:4096"
+    private var opencodeCodexProcess: Process?
     private var opencodeEventStreamClient: OpencodeEventStreamClient?
     private var opencodeStreamingAssistantMessageID: String?
     private var opencodeStreamingAssistantText: String = ""
@@ -125,6 +195,15 @@ final class CaptureWindowController: NSWindowController {
     private var opencodeSourceScopeURL: URL?
     private var opencodeWorkingScopeURL: URL?
     private let opencodeInitialPromptDefaultsKey = "opencode.initialPrompt"
+    private let opencodeInputExcludedDirectoryNames: Set<String> = [
+        ".build", ".cache", ".git", ".gradle", ".hg", ".mypy_cache", ".next", ".nox",
+        ".parcel-cache", ".pytest_cache", ".ruff_cache", ".svn", ".tox", ".turbo",
+        ".venv", "DerivedData", "__pycache__", "build", "dist", "env", "node_modules",
+        "target", "venv"
+    ]
+    private let opencodeInputExcludedFileNames: Set<String> = [
+        ".DS_Store"
+    ]
 
     // File Explore tab controls
     private weak var fileExploreContainerView: NSView!
@@ -171,6 +250,16 @@ final class CaptureWindowController: NSWindowController {
     private var instantVoicePendingChunksByEntryID: [Int: String] = [:]
     private var instantVoiceChunkFlushWorkItem: DispatchWorkItem?
 
+    // Instant Audio2 feed
+    private var instantVoice2WebView:      WKWebView!     // strong
+    private let instantVoice2Bridge = WebViewBatchBridge(label: "instantVoice2")
+    private var instantVoice2PageReady     = false
+    private var instantVoice2NextEntryId   = 0
+    private var instantVoice2CurrentEntry: Int?
+    private var instantVoice2StreamingText = ""
+    private var instantVoice2PendingChunksByEntryID: [Int: String] = [:]
+    private var instantVoice2ChunkFlushWorkItem: DispatchWorkItem?
+
     // Chat feed
     private var chatWebView: WKWebView!
     private let chatBridge = WebViewBatchBridge(label: "chat")
@@ -186,9 +275,12 @@ final class CaptureWindowController: NSWindowController {
 
     // Instant Voice callbacks
     var onInstantVoiceHoldChanged: ((Bool) -> Void)?
+    var onInstantVoice2HoldChanged: ((Bool) -> Void)?
     var onAudioAIManualTurnEnd: (() -> Void)?
     private var instantVoiceAvailable = false
     private var instantVoiceHoldSources: Set<InstantVoiceHoldSource> = []
+    private var instantVoice2Available = false
+    private var instantVoice2HoldSources: Set<InstantVoiceHoldSource> = []
     private var instantVoiceSpaceMonitor: Any?
     private var memoryMaintenanceTimer: Timer?
     private let captureInterval: TimeInterval
@@ -226,6 +318,7 @@ final class CaptureWindowController: NSWindowController {
 
     deinit {
         releaseInstantVoiceHoldSources()
+        releaseInstantVoice2HoldSources()
         NotificationCenter.default.removeObserver(self)
         if let instantVoiceSpaceMonitor {
             NSEvent.removeMonitor(instantVoiceSpaceMonitor)
@@ -234,6 +327,7 @@ final class CaptureWindowController: NSWindowController {
         visualChunkFlushWorkItem?.cancel()
         audioAIChunkFlushWorkItem?.cancel()
         instantVoiceChunkFlushWorkItem?.cancel()
+        instantVoice2ChunkFlushWorkItem?.cancel()
         chatChunkFlushWorkItem?.cancel()
         opencodeChunkFlushWorkItem?.cancel()
         fileExploreChangeDebounceWorkItem?.cancel()
@@ -241,9 +335,11 @@ final class CaptureWindowController: NSWindowController {
         visualBridge.clear()
         audioAIBridge.clear()
         instantVoiceBridge.clear()
+        instantVoice2Bridge.clear()
         chatBridge.clear()
         opencodeBridge.clear()
         fileExploreBridge.clear()
+        stopOpencodeCodexProcess()
         stopOpencodeEventStream()
         stopFileExploreRealtimeRefresh()
         opencodeSourceScopeURL?.stopAccessingSecurityScopedResource()
@@ -252,6 +348,22 @@ final class CaptureWindowController: NSWindowController {
 
     func closeCurrentSession() {
         releaseInstantVoiceHoldSources()
+        releaseInstantVoice2HoldSources()
+        audioAIChunkFlushWorkItem?.cancel()
+        audioAIChunkFlushWorkItem = nil
+        audioAIPendingChunksByEntryID.removeAll(keepingCapacity: false)
+        audioAICurrentEntry = nil
+        audioAIStreamingText = ""
+        instantVoiceChunkFlushWorkItem?.cancel()
+        instantVoiceChunkFlushWorkItem = nil
+        instantVoicePendingChunksByEntryID.removeAll(keepingCapacity: false)
+        instantVoiceCurrentEntry = nil
+        instantVoiceStreamingText = ""
+        instantVoice2ChunkFlushWorkItem?.cancel()
+        instantVoice2ChunkFlushWorkItem = nil
+        instantVoice2PendingChunksByEntryID.removeAll(keepingCapacity: false)
+        instantVoice2CurrentEntry = nil
+        instantVoice2StreamingText = ""
         chatChunkFlushWorkItem?.cancel()
         chatChunkFlushWorkItem = nil
         chatPendingChunksByEntryID.removeAll(keepingCapacity: false)
@@ -286,6 +398,20 @@ final class CaptureWindowController: NSWindowController {
                 requestAudioAIManualTurnEnd(source: "space")
                 return nil
             case .keyUp:
+                return nil
+            default:
+                return event
+            }
+        }
+
+        if activeContentTab == ContentTab.instantAudio2.rawValue {
+            switch event.type {
+            case .keyDown:
+                guard !event.isARepeat else { return nil }
+                setInstantVoice2HoldActive(true, source: .keyboard)
+                return nil
+            case .keyUp:
+                setInstantVoice2HoldActive(false, source: .keyboard)
                 return nil
             default:
                 return event
@@ -336,6 +462,35 @@ final class CaptureWindowController: NSWindowController {
         onInstantVoiceHoldChanged?(false)
     }
 
+    private func setInstantVoice2HoldActive(_ active: Bool, source: InstantVoiceHoldSource) {
+        guard instantVoice2Available else {
+            DevLog.log("InstantAudio2", "hold ignored unavailable source=\(source)")
+            return
+        }
+        let wasActive = !instantVoice2HoldSources.isEmpty
+        if active {
+            instantVoice2HoldSources.insert(source)
+        } else {
+            instantVoice2HoldSources.remove(source)
+        }
+        let isActive = !instantVoice2HoldSources.isEmpty
+        guard wasActive != isActive else { return }
+
+        DevLog.log("InstantAudio2", "hold active=\(isActive ? 1 : 0) source=\(source)")
+        instantVoice2HoldBtn?.title = isActive ? "Recording..." : "Hold to Talk"
+        instantVoice2HoldBtn?.setHolding(isActive)
+        onInstantVoice2HoldChanged?(isActive)
+    }
+
+    private func releaseInstantVoice2HoldSources() {
+        guard !instantVoice2HoldSources.isEmpty else { return }
+        DevLog.log("InstantAudio2", "hold release all sources=\(instantVoice2HoldSources.count)")
+        instantVoice2HoldSources.removeAll()
+        instantVoice2HoldBtn?.title = "Hold to Talk"
+        instantVoice2HoldBtn?.setHolding(false)
+        onInstantVoice2HoldChanged?(false)
+    }
+
     func setInstantVoiceAvailable(_ available: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -352,8 +507,49 @@ final class CaptureWindowController: NSWindowController {
         }
     }
 
+    func setInstantVoiceStarting() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            releaseInstantVoiceHoldSources()
+            instantVoiceAvailable = false
+            instantVoiceHoldBtn?.title = "Starting"
+            instantVoiceHoldBtn?.setAvailable(false)
+            instantVoiceHoldBtn?.toolTip = "Instant Voice is connecting its realtime session."
+            DevLog.log("InstantVoice", "availability changed starting=1")
+        }
+    }
+
+    func setInstantVoice2Available(_ available: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if !available {
+                releaseInstantVoice2HoldSources()
+            }
+            instantVoice2Available = available
+            instantVoice2HoldBtn?.title = available ? "Hold to Talk" : "Disabled"
+            instantVoice2HoldBtn?.setAvailable(available)
+            instantVoice2HoldBtn?.toolTip = available
+                ? "Hold the button or Space to send system audio to instant audio2."
+                : "Enable Instant Audio2 in Settings to use this tab."
+            DevLog.log("InstantAudio2", "availability changed available=\(available ? 1 : 0)")
+        }
+    }
+
+    func setInstantVoice2Starting() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            releaseInstantVoice2HoldSources()
+            instantVoice2Available = false
+            instantVoice2HoldBtn?.title = "Starting"
+            instantVoice2HoldBtn?.setAvailable(false)
+            instantVoice2HoldBtn?.toolTip = "Instant Audio2 is connecting its realtime session."
+            DevLog.log("InstantAudio2", "availability changed starting=1")
+        }
+    }
+
     @objc private func captureWindowDidResignKey(_ notification: Notification) {
         releaseInstantVoiceHoldSources()
+        releaseInstantVoice2HoldSources()
     }
 
     // MARK: - Self Maintenance
@@ -379,6 +575,7 @@ final class CaptureWindowController: NSWindowController {
         trimVisualNativeState(reason: reason)
         trimAudioAINativeState(reason: reason)
         trimInstantVoiceNativeState(reason: reason)
+        trimInstantVoice2NativeState(reason: reason)
         trimChatNativeState(reason: reason)
         trimOpencodeNativeState(reason: reason)
         trimFileExploreNativeState(reason: reason)
@@ -391,6 +588,9 @@ final class CaptureWindowController: NSWindowController {
         }
         if instantVoicePageReady {
             instantVoiceBridge.enqueue("performMemoryMaintenance()", immediate: true)
+        }
+        if instantVoice2PageReady {
+            instantVoice2Bridge.enqueue("performMemoryMaintenance()", immediate: true)
         }
         if chatPageReady {
             chatBridge.enqueue("performMemoryMaintenance()", immediate: true)
@@ -443,6 +643,17 @@ final class CaptureWindowController: NSWindowController {
             return
         }
         instantVoicePendingChunksByEntryID = instantVoicePendingChunksByEntryID.filter { $0.key == activeEntry }
+    }
+
+    private func trimInstantVoice2NativeState(reason: String) {
+        guard let activeEntry = instantVoice2CurrentEntry else {
+            if !instantVoice2PendingChunksByEntryID.isEmpty {
+                DevLog.log("InstantAudio2", "memory maintenance reason=\(reason) clearing stale instant2 chunks count=\(instantVoice2PendingChunksByEntryID.count)")
+                instantVoice2PendingChunksByEntryID.removeAll(keepingCapacity: false)
+            }
+            return
+        }
+        instantVoice2PendingChunksByEntryID = instantVoice2PendingChunksByEntryID.filter { $0.key == activeEntry }
     }
 
     private func trimChatNativeState(reason: String) {
@@ -718,6 +929,15 @@ final class CaptureWindowController: NSWindowController {
             audioAIPauseBtn?.title = audioAIPaused ? "Resume" : "Pause"
             audioAIPauseBtn?.contentTintColor = audioAIPaused ? .systemGreen : nil
             updateAudioAIListeningButtonState()
+            if state == .paused || state == .reconnecting || state == .unavailable {
+                audioAIActivityBar?.setLevel(0)
+            }
+        }
+    }
+
+    func updateSystemAudioLevel(_ level: Float) {
+        DispatchQueue.main.async { [weak self] in
+            self?.audioAIActivityBar?.setLevel(level)
         }
     }
 
@@ -860,6 +1080,91 @@ final class CaptureWindowController: NSWindowController {
     @objc private func instantVoiceZoomIn()  { instantVoiceBridge.enqueue("adjustZoom(1)", immediate: true) }
     @objc private func instantVoiceZoomOut() { instantVoiceBridge.enqueue("adjustZoom(-1)", immediate: true) }
 
+    // MARK: – Public — Instant Audio2 feed
+
+    func appendInstantVoice2Chunk(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard instantVoice2PageReady else {
+                DevLog.log("InstantAudio2", "chunk dropped pageReady=0 chars=\(text.count)")
+                return
+            }
+            if instantVoice2CurrentEntry == nil {
+                let entryId = instantVoice2NextEntryId
+                instantVoice2NextEntryId += 1
+                instantVoice2CurrentEntry = entryId
+                instantVoice2StreamingText = ""
+                let header = "[\(Self.timeString())]\ninstant audio2"
+                DevLog.log("InstantAudio2", "start entry=\(entryId)")
+                if let hJS = jsLiteral(header) {
+                    instantVoice2Bridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
+                }
+            }
+            guard let entryId = instantVoice2CurrentEntry else { return }
+            DevLog.log("InstantAudio2", "chunk entry=\(entryId) chars=\(text.count)")
+            appendBoundedStreamingText(text, to: &instantVoice2StreamingText, category: "InstantAudio2")
+            instantVoice2PendingChunksByEntryID[entryId, default: ""] += text
+            scheduleInstantVoice2ChunkFlush()
+        }
+    }
+
+    func finalizeInstantVoice2() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let entryId = instantVoice2CurrentEntry,
+                  let mdJS = jsLiteral(instantVoice2StreamingText) else { return }
+            DevLog.log("InstantAudio2", "finalize entry=\(entryId) chars=\(instantVoice2StreamingText.count)")
+            flushInstantVoice2StreamingChunks(for: entryId)
+            instantVoice2Bridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))", immediate: true)
+            instantVoice2CurrentEntry = nil
+            instantVoice2StreamingText = ""
+        }
+    }
+
+    func appendInstantVoice2Error(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard instantVoice2PageReady else {
+                DevLog.log("InstantAudio2", "error dropped pageReady=0 message=\(message)")
+                return
+            }
+            DevLog.log("InstantAudio2", "error message=\(message)")
+            if let entryId = instantVoice2CurrentEntry, let mdJS = jsLiteral(instantVoice2StreamingText) {
+                flushInstantVoice2StreamingChunks(for: entryId)
+                instantVoice2Bridge.enqueue("endStreamingEntry(\(entryId), \(mdJS))")
+                instantVoice2CurrentEntry = nil; instantVoice2StreamingText = ""
+            }
+            let entryId = instantVoice2NextEntryId; instantVoice2NextEntryId += 1
+            let header = "[\(Self.timeString())]"
+            if let hJS = jsLiteral(header) {
+                instantVoice2Bridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
+            }
+            if let errJS = jsLiteral("⚠ \(message)") {
+                instantVoice2Bridge.enqueue("endStreamingEntry(\(entryId), \(errJS))", immediate: true)
+            }
+        }
+    }
+
+    @objc private func instantVoice2ZoomIn()  { instantVoice2Bridge.enqueue("adjustZoom(1)", immediate: true) }
+    @objc private func instantVoice2ZoomOut() { instantVoice2Bridge.enqueue("adjustZoom(-1)", immediate: true) }
+
+    // MARK: – Public — Note tab
+
+    @objc private func noteZoomIn() {
+        setNoteFontSize(noteFontSize + 1)
+    }
+
+    @objc private func noteZoomOut() {
+        setNoteFontSize(noteFontSize - 1)
+    }
+
+    private func setNoteFontSize(_ size: CGFloat) {
+        noteFontSize = min(32, max(10, size))
+        guard let noteTextView else { return }
+        let selectedRange = noteTextView.selectedRange()
+        noteTextView.font = .systemFont(ofSize: noteFontSize)
+        noteTextView.setSelectedRange(selectedRange)
+    }
+
     // MARK: – Public — Chat feed
 
     func setChatAvailable(_ available: Bool) {
@@ -870,7 +1175,7 @@ final class CaptureWindowController: NSWindowController {
                 chatIsResponding = false
                 chatInputField?.placeholderString = "OpenAI API key required"
             } else {
-                chatInputField?.placeholderString = "Message GPT-5.5"
+                chatInputField?.placeholderString = "Message \(GPTChatController.displayName)"
             }
             updateChatControls()
             DevLog.log("Chat", "availability changed available=\(available ? 1 : 0)")
@@ -897,7 +1202,7 @@ final class CaptureWindowController: NSWindowController {
                 chatCurrentAssistantEntry = entryId
                 chatStreamingText = ""
                 DevLog.log("Chat", "start assistant entry=\(entryId)")
-                if let hJS = jsLiteral("GPT-5.5") {
+                if let hJS = jsLiteral(GPTChatController.displayName) {
                     chatBridge.enqueue("startStreamingEntry(\(hJS), null, \(entryId))")
                 }
             }
@@ -935,7 +1240,7 @@ final class CaptureWindowController: NSWindowController {
                 chatStreamingText = ""
             }
             if chatPageReady,
-               let headerJS = jsLiteral("GPT-5.5"),
+               let headerJS = jsLiteral(GPTChatController.displayName),
                let bodyJS = jsLiteral(message) {
                 chatBridge.enqueue("appendEntry(\(headerJS), \(bodyJS), true)", immediate: true)
             }
@@ -1135,6 +1440,8 @@ final class CaptureWindowController: NSWindowController {
         pauseButton.isEnabled = false
         audioAIManualTurnBtn?.isEnabled = false
         audioAIPauseBtn?.isEnabled = false
+        instantVoiceHoldBtn?.isEnabled = false
+        instantVoice2HoldBtn?.isEnabled = false
         chatSendButton?.isEnabled = false
         chatRestartBtn?.isEnabled = false
         closeCurrentSession()
@@ -1201,6 +1508,67 @@ final class CaptureWindowController: NSWindowController {
         instantVoiceWebView = instantWV
         instantVoiceBridge.attach(webView: instantWV)
 
+        // ── Instant Audio2 feed (separate Realtime session) ───────────
+        let instant2Cfg = WKWebViewConfiguration()
+        let instant2Handler = CopyCodeHandler(pageReady: { [weak self] in
+            DispatchQueue.main.async {
+                DevLog.log("InstantAudio2", "pageReady message received")
+                self?.instantVoice2PageReady = true
+                self?.instantVoice2Bridge.enqueue("setMaxRenderedEntries(\(RetentionPolicy.instantVoiceRenderedEntryLimit))", immediate: true)
+            }
+        })
+        instant2Cfg.userContentController.add(instant2Handler, name: "copyCode")
+        instant2Cfg.userContentController.add(instant2Handler, name: "pageReady")
+
+        let instant2WV = WKWebView(frame: .zero, configuration: instant2Cfg)
+        instant2WV.translatesAutoresizingMaskIntoConstraints = false
+        instant2WV.wantsLayer = true
+        instant2WV.layer?.backgroundColor = NSColor.clear.cgColor
+        instant2WV.isHidden = true
+        instantVoice2WebView = instant2WV
+        instantVoice2Bridge.attach(webView: instant2WV)
+
+        // ── Note tab content ─────────────────────────────────────
+        let noteView = NSView()
+        noteView.translatesAutoresizingMaskIntoConstraints = false
+        noteView.isHidden = true
+        noteContainerView = noteView
+
+        let noteText = NSTextView()
+        noteText.isEditable = true
+        noteText.isSelectable = true
+        noteText.isRichText = false
+        noteText.importsGraphics = false
+        noteText.allowsUndo = true
+        noteText.drawsBackground = true
+        noteText.backgroundColor = .textBackgroundColor
+        noteText.textColor = .textColor
+        noteText.insertionPointColor = .textColor
+        noteText.font = .systemFont(ofSize: noteFontSize)
+        noteText.textContainerInset = NSSize(width: 14, height: 14)
+        noteText.isAutomaticQuoteSubstitutionEnabled = false
+        noteText.isAutomaticDashSubstitutionEnabled = false
+        noteText.isAutomaticTextReplacementEnabled = false
+        noteText.minSize = NSSize(width: 0, height: 0)
+        noteText.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                  height: CGFloat.greatestFiniteMagnitude)
+        noteText.textContainer?.widthTracksTextView = true
+        noteText.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                                       height: CGFloat.greatestFiniteMagnitude)
+        noteText.isHorizontallyResizable = false
+        noteText.isVerticallyResizable = true
+        noteText.autoresizingMask = [.width]
+        noteTextView = noteText
+
+        let noteScroll = NSScrollView()
+        noteScroll.translatesAutoresizingMaskIntoConstraints = false
+        noteScroll.hasVerticalScroller = true
+        noteScroll.hasHorizontalScroller = false
+        noteScroll.autohidesScrollers = true
+        noteScroll.borderType = .noBorder
+        noteScroll.documentView = noteText
+        noteView.addSubview(noteScroll)
+
         // ── Chat tab content ───────────────────────────────────────
         let chatView = NSView()
         chatView.translatesAutoresizingMaskIntoConstraints = false
@@ -1227,7 +1595,7 @@ final class CaptureWindowController: NSWindowController {
         chatBridge.attach(webView: chatWV)
 
         let chatInput = NSTextField(string: "")
-        chatInput.placeholderString = "Message GPT-5.5"
+        chatInput.placeholderString = "Message \(GPTChatController.displayName)"
         chatInput.font = .systemFont(ofSize: 13)
         chatInput.translatesAutoresizingMaskIntoConstraints = false
         chatInput.target = self
@@ -1253,7 +1621,7 @@ final class CaptureWindowController: NSWindowController {
         chatView.addSubview(chatAttach)
         chatView.addSubview(chatSend)
 
-        // ── Opencode tab content ───────────────────────────────────
+        // ── Codex tab content ─────────────────────────────────────
         let opencodeView = NSView()
         opencodeView.translatesAutoresizingMaskIntoConstraints = false
         opencodeView.isHidden = true
@@ -1448,7 +1816,7 @@ final class CaptureWindowController: NSWindowController {
 
         // Content tab selector (left side of inner bar)
         let contentTabs = NSSegmentedControl(
-            labels: ["Visual", "Audio AI", "Instant Voice", "Chat", "Opencode"],
+            labels: ["Visual", "Audio AI", "Instant Voice", "instant audio2", "note", "Chat", "Codex"],
             trackingMode: .selectOne, target: self,
             action: #selector(contentTabChanged))
         contentTabs.selectedSegment = 0
@@ -1478,6 +1846,17 @@ final class CaptureWindowController: NSWindowController {
         let aap = barBtn("Pause", action: #selector(audioAIPauseTapped))
         aap.font = .systemFont(ofSize: 11)
         aap.isHidden = true; audioAIPauseBtn = aap
+        let activityLabel = NSTextField(labelWithString: "SYS")
+        activityLabel.font = .monospacedSystemFont(ofSize: 9, weight: .semibold)
+        activityLabel.textColor = .secondaryLabelColor
+        activityLabel.translatesAutoresizingMaskIntoConstraints = false
+        activityLabel.isHidden = true
+        audioAIActivityLabel = activityLabel
+        let activityBar = AudioActivityBarView(frame: .zero)
+        activityBar.translatesAutoresizingMaskIntoConstraints = false
+        activityBar.isHidden = true
+        activityBar.toolTip = "Live system audio level sent to Audio AI"
+        audioAIActivityBar = activityBar
 
         // Instant Voice-tab buttons (hidden initially)
         let ivo = barBtn("−", action: #selector(instantVoiceZoomOut)); ivo.isHidden = true; instantVoiceZoomOutBtn = ivo
@@ -1497,6 +1876,28 @@ final class CaptureWindowController: NSWindowController {
         }
         instantVoiceHoldBtn = holdBtn
 
+        // Instant Audio2-tab buttons (hidden initially)
+        let iv2o = barBtn("−", action: #selector(instantVoice2ZoomOut)); iv2o.isHidden = true; instantVoice2ZoomOutBtn = iv2o
+        let iv2i = barBtn("+", action: #selector(instantVoice2ZoomIn));  iv2i.isHidden = true; instantVoice2ZoomInBtn  = iv2i
+        let iv2c = barBtn("Clear", action: #selector(clearInstantVoice2))
+        iv2c.font = .systemFont(ofSize: 11); iv2c.isHidden = true; instantVoice2ClearBtn = iv2c
+        let hold2Btn = HoldToTalkButton(title: "Hold to Talk", target: nil, action: nil)
+        hold2Btn.bezelStyle = .rounded
+        hold2Btn.font = .systemFont(ofSize: 11, weight: .medium)
+        hold2Btn.translatesAutoresizingMaskIntoConstraints = false
+        hold2Btn.isHidden = true
+        hold2Btn.isEnabled = false
+        hold2Btn.toolTip = "Enable Instant Audio2 in Settings to use this tab."
+        hold2Btn.setAvailable(false)
+        hold2Btn.onHoldChanged = { [weak self] isHolding in
+            self?.setInstantVoice2HoldActive(isHolding, source: .mouse)
+        }
+        instantVoice2HoldBtn = hold2Btn
+
+        // Note-tab buttons (hidden initially)
+        let nzo = barBtn("−", action: #selector(noteZoomOut)); nzo.isHidden = true; noteZoomOutBtn = nzo
+        let nzi = barBtn("+", action: #selector(noteZoomIn));  nzi.isHidden = true; noteZoomInBtn = nzi
+
         // Chat-tab buttons (hidden initially)
         let czo = barBtn("−", action: #selector(chatZoomOut)); czo.isHidden = true; chatZoomOutBtn = czo
         let czi = barBtn("+", action: #selector(chatZoomIn));  czi.isHidden = true; chatZoomInBtn  = czi
@@ -1505,7 +1906,7 @@ final class CaptureWindowController: NSWindowController {
         cr.isHidden = true
         chatRestartBtn = cr
 
-        [zo, zi, vr, vc, azo, azi, aac, aam, aap, ivo, ivi, ivc, holdBtn, czo, czi, cr].forEach { innerBar.addSubview($0) }
+        [zo, zi, vr, vc, activityLabel, activityBar, azo, azi, aac, aam, aap, ivo, ivi, ivc, holdBtn, iv2o, iv2i, iv2c, hold2Btn, nzo, nzi, czo, czi, cr].forEach { innerBar.addSubview($0) }
 
         let divider = NSBox(); divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
@@ -1513,6 +1914,8 @@ final class CaptureWindowController: NSWindowController {
         container.addSubview(wv)
         container.addSubview(aiWV)
         container.addSubview(instantWV)
+        container.addSubview(instant2WV)
+        container.addSubview(noteView)
         container.addSubview(chatView)
         container.addSubview(opencodeView)
         container.addSubview(fileExploreView)
@@ -1539,6 +1942,13 @@ final class CaptureWindowController: NSWindowController {
             vc.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
 
             // Audio AI buttons (shown/hidden on tab switch)
+            activityLabel.leadingAnchor.constraint(greaterThanOrEqualTo: contentTabs.trailingAnchor, constant: 12),
+            activityLabel.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            activityBar.leadingAnchor.constraint(equalTo: activityLabel.trailingAnchor, constant: 5),
+            activityBar.trailingAnchor.constraint(equalTo: azo.leadingAnchor, constant: -12),
+            activityBar.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            activityBar.widthAnchor.constraint(equalToConstant: 64),
+            activityBar.heightAnchor.constraint(equalToConstant: 6),
             azo.trailingAnchor.constraint(equalTo: azi.leadingAnchor, constant: -2),
             azo.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
             azi.trailingAnchor.constraint(equalTo: aac.leadingAnchor, constant: -10),
@@ -1561,6 +1971,25 @@ final class CaptureWindowController: NSWindowController {
             holdBtn.trailingAnchor.constraint(equalTo: ivo.leadingAnchor, constant: -12),
             holdBtn.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
             holdBtn.widthAnchor.constraint(equalToConstant: 104),
+
+            // Instant Audio2 buttons (shown/hidden on tab switch)
+            iv2o.trailingAnchor.constraint(equalTo: iv2i.leadingAnchor, constant: -2),
+            iv2o.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            iv2i.trailingAnchor.constraint(equalTo: iv2c.leadingAnchor, constant: -10),
+            iv2i.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            iv2c.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            iv2c.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            hold2Btn.trailingAnchor.constraint(equalTo: iv2o.leadingAnchor, constant: -12),
+            hold2Btn.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            hold2Btn.widthAnchor.constraint(equalToConstant: 104),
+
+            // Note buttons (shown/hidden on tab switch)
+            nzo.trailingAnchor.constraint(equalTo: nzi.leadingAnchor, constant: -2),
+            nzo.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            nzo.widthAnchor.constraint(equalToConstant: 28),
+            nzi.trailingAnchor.constraint(equalTo: innerBar.trailingAnchor, constant: -14),
+            nzi.centerYAnchor.constraint(equalTo: innerBar.centerYAnchor),
+            nzi.widthAnchor.constraint(equalToConstant: 28),
 
             // Chat buttons (shown/hidden on tab switch)
             czo.trailingAnchor.constraint(equalTo: czi.leadingAnchor, constant: -2),
@@ -1591,6 +2020,16 @@ final class CaptureWindowController: NSWindowController {
             instantWV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             instantWV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
 
+            instant2WV.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            instant2WV.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            instant2WV.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            instant2WV.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            noteView.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            noteView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            noteView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            noteView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
             chatView.topAnchor.constraint(equalTo: divider.bottomAnchor),
             chatView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             chatView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
@@ -1605,6 +2044,11 @@ final class CaptureWindowController: NSWindowController {
             fileExploreView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             fileExploreView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             fileExploreView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            noteScroll.topAnchor.constraint(equalTo: noteView.topAnchor),
+            noteScroll.leadingAnchor.constraint(equalTo: noteView.leadingAnchor),
+            noteScroll.trailingAnchor.constraint(equalTo: noteView.trailingAnchor),
+            noteScroll.bottomAnchor.constraint(equalTo: noteView.bottomAnchor),
 
             chatWV.topAnchor.constraint(equalTo: chatView.topAnchor),
             chatWV.leadingAnchor.constraint(equalTo: chatView.leadingAnchor),
@@ -1686,17 +2130,18 @@ final class CaptureWindowController: NSWindowController {
             fileExploreSplitView.bottomAnchor.constraint(equalTo: fileExploreView.bottomAnchor, constant: -12),
         ])
 
-        setOpencodeStatus("Session not started.", isError: false)
+        setOpencodeStatus("Codex session not started.", isError: false)
         updateOpencodeControls()
 
         let baseURL: URL? = Self.resourcesBaseURL()
         wv.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         aiWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         instantWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
+        instant2WV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         chatWV.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         opencodeChatWebView.loadHTMLString(Self.htmlTemplate, baseURL: baseURL)
         fileExplorePreviewWebView.loadHTMLString(Self.fileExploreHTMLTemplate, baseURL: baseURL)
-        renderFileExploreDocument(kind: "text", content: "Start Opencode to open File Explore.")
+        renderFileExploreDocument(kind: "text", content: "Start Codex to open File Explore.")
         return container
     }
 
@@ -1705,14 +2150,18 @@ final class CaptureWindowController: NSWindowController {
         let isVisual = activeContentTab == ContentTab.visual.rawValue
         let isAudioAI = activeContentTab == ContentTab.audioAI.rawValue
         let isInstantVoice = activeContentTab == ContentTab.instantVoice.rawValue
+        let isInstantAudio2 = activeContentTab == ContentTab.instantAudio2.rawValue
+        let isNote = activeContentTab == ContentTab.note.rawValue
         let isChat = activeContentTab == ContentTab.chat.rawValue
         let isOpencode = activeContentTab == ContentTab.opencode.rawValue
         let isFileExplore = fileExploreTabIndex == activeContentTab
-        DevLog.log("CaptureUI", "contentTabChanged index=\(activeContentTab) audioAI=\(isAudioAI ? 1 : 0) instant=\(isInstantVoice ? 1 : 0) chat=\(isChat ? 1 : 0)")
+        DevLog.log("CaptureUI", "contentTabChanged index=\(activeContentTab) audioAI=\(isAudioAI ? 1 : 0) instant=\(isInstantVoice ? 1 : 0) instant2=\(isInstantAudio2 ? 1 : 0) note=\(isNote ? 1 : 0) chat=\(isChat ? 1 : 0)")
 
         webView.isHidden         = !isVisual
         audioAIWebView.isHidden  = !isAudioAI
         instantVoiceWebView.isHidden = !isInstantVoice
+        instantVoice2WebView.isHidden = !isInstantAudio2
+        noteContainerView.isHidden = !isNote
         chatContainerView.isHidden = !isChat
         opencodeContainerView.isHidden = !isOpencode
         fileExploreContainerView?.isHidden = !isFileExplore
@@ -1726,6 +2175,8 @@ final class CaptureWindowController: NSWindowController {
         audioAIClearBtn.isHidden   = !isAudioAI
         audioAIManualTurnBtn.isHidden = !isAudioAI
         audioAIPauseBtn.isHidden   = !isAudioAI
+        audioAIActivityLabel.isHidden = !isAudioAI
+        audioAIActivityBar.isHidden = !isAudioAI
         if isAudioAI {
             updateAudioAIListeningButtonState()
         }
@@ -1735,6 +2186,18 @@ final class CaptureWindowController: NSWindowController {
         instantVoiceHoldBtn.isHidden    = !isInstantVoice
         if !isInstantVoice {
             releaseInstantVoiceHoldSources()
+        }
+        instantVoice2ZoomOutBtn.isHidden = !isInstantAudio2
+        instantVoice2ZoomInBtn.isHidden  = !isInstantAudio2
+        instantVoice2ClearBtn.isHidden   = !isInstantAudio2
+        instantVoice2HoldBtn.isHidden    = !isInstantAudio2
+        if !isInstantAudio2 {
+            releaseInstantVoice2HoldSources()
+        }
+        noteZoomOutBtn.isHidden = !isNote
+        noteZoomInBtn.isHidden  = !isNote
+        if isNote {
+            window?.makeFirstResponder(noteTextView)
         }
         chatZoomOutBtn.isHidden = !isChat
         chatZoomInBtn.isHidden  = !isChat
@@ -2375,6 +2838,9 @@ final class CaptureWindowController: NSWindowController {
         let initialPromptRaw = opencodeInitialPromptTextView.string
         let initialPrompt = initialPromptRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         UserDefaults.standard.set(initialPromptRaw, forKey: opencodeInitialPromptDefaultsKey)
+        logOpencode(
+            "start tapped sourceInput=\(sourceDir) workingInput=\(workingDir) promptChars=\(initialPrompt.count) activeSession=\(opencodeActiveSessionID ?? "nil") busy=\(opencodeIsBusy ? 1 : 0)"
+        )
         guard !sourceDir.isEmpty, !workingDir.isEmpty else {
             setOpencodeStatus("Please enter both source dir and working dir.", isError: true)
             return
@@ -2382,7 +2848,7 @@ final class CaptureWindowController: NSWindowController {
 
         stopActiveOpencodeProcess(resetSession: true, closeRemoteSession: true)
         let startToken = opencodeCommandToken
-        setOpencodeStatus("Preparing input directory…", isError: false)
+        setOpencodeStatus("Preparing input directory… Skipping generated folders.", isError: false)
 
         runOpencodeStart(
             sourceDirInput: sourceDir,
@@ -2407,55 +2873,72 @@ final class CaptureWindowController: NSWindowController {
         let workingURL = resolveUserPath(workingDir)
         let sourceURL = resolveUserPath(sourceDir, relativeTo: workingURL)
         let inputURL = workingURL.appendingPathComponent("input", isDirectory: true).standardizedFileURL
+        logOpencode(
+            "start resolve token=\(token) allowPermissionPrompt=\(allowPermissionPrompt ? 1 : 0) source=\(sourceURL.path) working=\(workingURL.path) input=\(inputURL.path)"
+        )
 
         do {
             var workingExistsIsDir: ObjCBool = false
             if fm.fileExists(atPath: workingURL.path, isDirectory: &workingExistsIsDir) {
                 guard workingExistsIsDir.boolValue else {
+                    logOpencode("start failed invalid working path file=\(workingURL.path)")
                     setOpencodeStatus("Invalid working dir: path points to a file.", isError: true)
                     return
                 }
             } else {
+                logOpencode("creating working dir path=\(workingURL.path)")
                 try fm.createDirectory(at: workingURL, withIntermediateDirectories: true)
             }
 
             var sourceIsDir: ObjCBool = false
             guard fm.fileExists(atPath: sourceURL.path, isDirectory: &sourceIsDir) else {
+                logOpencode("start failed missing source path=\(sourceURL.path)")
                 setOpencodeStatus("Source path does not exist: \(sourceURL.path)", isError: true)
                 return
             }
 
             if sourceIsDir.boolValue && (sourceURL == inputURL || sourceURL.path.hasPrefix(inputURL.path + "/")) {
+                logOpencode("start failed unsafe source source=\(sourceURL.path) input=\(inputURL.path)")
                 setOpencodeStatus("Unsafe source dir: cannot be input/ itself or inside input/.", isError: true)
                 return
             }
 
             // Show File Explore immediately so startup feels responsive even while input sync runs.
+            logOpencode("activating file explore working=\(workingURL.path)")
             activateFileExploreTab(with: workingURL)
 
             let isDir = sourceIsDir.boolValue
             let prepStart = CapturePerf.begin()
+            logOpencode("prepare input begin sourceIsDir=\(isDir ? 1 : 0)")
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
                 do {
                     let copiedCount = try self.prepareInputDirectory(from: sourceURL, isDirectory: isDir, in: workingURL)
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
-                        guard token == opencodeCommandToken else { return }
-                        NSLog("Opencode start complete. sourceDir=%@ workingDir=%@ initialPrompt=%@ inputDir=%@",
-                              sourceDir, workingDir, initialPrompt, inputURL.path)
+                        guard token == opencodeCommandToken else {
+                            self.logOpencode("prepare input ignored stale token=\(token) current=\(self.opencodeCommandToken)")
+                            return
+                        }
+                        self.logOpencode("prepare input complete copiedCount=\(copiedCount) input=\(inputURL.path)")
                         CapturePerf.end(prepStart, "opencode.prepareInputDirectory", details: "items=\(copiedCount)")
-                        setOpencodeStatus("Prepared \(inputURL.path) · Copied \(copiedCount) item(s). Starting session…", isError: false)
+                        setOpencodeStatus("Prepared \(inputURL.path) · Copied \(copiedCount) item(s). Starting Codex…", isError: false)
                         startNewOpencodeSession(workingURL: workingURL, initialPrompt: initialPrompt)
                     }
                 } catch {
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
-                        guard token == opencodeCommandToken else { return }
+                        guard token == opencodeCommandToken else {
+                            self.logOpencode("prepare input failure ignored stale token=\(token) current=\(self.opencodeCommandToken) error=\(error.localizedDescription)")
+                            return
+                        }
+                        self.logOpencode("prepare input failed error=\(error.localizedDescription)")
                         if allowPermissionPrompt, isPermissionError(error),
                            shouldPromptForExplicitFolderAccess(sourceURL: sourceURL, workingURL: workingURL) {
+                            self.logOpencode("requesting explicit folder access source=\(sourceURL.path) working=\(workingURL.path)")
                             let granted = requestOpencodeFolderAccess(sourceURL: sourceURL, workingURL: workingURL)
                             if granted {
+                                self.logOpencode("folder access granted; retrying start")
                                 runOpencodeStart(
                                     sourceDirInput: sourceDirInput,
                                     workingDirInput: workingDirInput,
@@ -2465,6 +2948,7 @@ final class CaptureWindowController: NSWindowController {
                                 )
                                 return
                             }
+                            self.logOpencode("folder access denied")
                             setOpencodeStatus("Folder permission was not granted.", isError: true)
                             return
                         }
@@ -2473,11 +2957,17 @@ final class CaptureWindowController: NSWindowController {
                 }
             }
         } catch {
-            guard token == opencodeCommandToken else { return }
+            guard token == opencodeCommandToken else {
+                logOpencode("start failure ignored stale token=\(token) current=\(opencodeCommandToken) error=\(error.localizedDescription)")
+                return
+            }
+            logOpencode("start failed before prepare error=\(error.localizedDescription)")
             if allowPermissionPrompt, isPermissionError(error),
                shouldPromptForExplicitFolderAccess(sourceURL: sourceURL, workingURL: workingURL) {
+                logOpencode("requesting explicit folder access source=\(sourceURL.path) working=\(workingURL.path)")
                 let granted = requestOpencodeFolderAccess(sourceURL: sourceURL, workingURL: workingURL)
                 if granted {
+                    logOpencode("folder access granted; retrying start")
                     runOpencodeStart(
                         sourceDirInput: sourceDirInput,
                         workingDirInput: workingDirInput,
@@ -2487,6 +2977,7 @@ final class CaptureWindowController: NSWindowController {
                     )
                     return
                 }
+                logOpencode("folder access denied")
                 setOpencodeStatus("Folder permission was not granted.", isError: true)
                 return
             }
@@ -2497,17 +2988,24 @@ final class CaptureWindowController: NSWindowController {
     private func prepareInputDirectory(from source: URL, isDirectory: Bool, in workingDir: URL) throws -> Int {
         let fm = FileManager.default
         let inputDir = workingDir.appendingPathComponent("input", isDirectory: true).standardizedFileURL
+        logOpencode("prepareInputDirectory source=\(source.path) isDirectory=\(isDirectory ? 1 : 0) working=\(workingDir.path) input=\(inputDir.path)")
+        logOpencode(
+            "prepareInputDirectory excludes dirs=\(opencodeInputExcludedDirectoryNames.sorted().joined(separator: ",")) files=\(opencodeInputExcludedFileNames.sorted().joined(separator: ","))"
+        )
 
         if isDirectory {
             if !fm.fileExists(atPath: inputDir.path) {
+                logOpencode("prepareInputDirectory creating input dir path=\(inputDir.path)")
                 try fm.createDirectory(at: inputDir, withIntermediateDirectories: true)
             }
 
             if let changed = try syncInputDirectoryIncremental(source: source, inputDir: inputDir, workingDir: workingDir) {
+                logOpencode("prepareInputDirectory rsync changedCount=\(changed)")
                 return changed
             }
 
             // Fallback path when rsync is unavailable/fails.
+            logOpencode("prepareInputDirectory using full copy fallback")
             if fm.fileExists(atPath: inputDir.path) {
                 try fm.removeItem(at: inputDir)
             }
@@ -2518,8 +3016,7 @@ final class CaptureWindowController: NSWindowController {
                 // Avoid recursively copying input/ into itself when source == workingDir.
                 if item.standardizedFileURL == inputDir { continue }
                 let destination = inputDir.appendingPathComponent(item.lastPathComponent, isDirectory: false)
-                try fm.copyItem(at: item, to: destination)
-                copiedCount += 1
+                copiedCount += try copyOpencodeInputItem(from: item, to: destination, inputDir: inputDir, fileManager: fm)
             }
             return copiedCount
         } else {
@@ -2528,51 +3025,134 @@ final class CaptureWindowController: NSWindowController {
             }
             try fm.createDirectory(at: inputDir, withIntermediateDirectories: true)
             let destination = inputDir.appendingPathComponent(source.lastPathComponent, isDirectory: false)
+            logOpencode("prepareInputDirectory copying file destination=\(destination.path)")
             try fm.copyItem(at: source, to: destination)
             return 1
         }
     }
 
+    private func copyOpencodeInputItem(
+        from source: URL,
+        to destination: URL,
+        inputDir: URL,
+        fileManager fm: FileManager
+    ) throws -> Int {
+        guard !shouldSkipOpencodeInputItem(source, inputDir: inputDir, fileManager: fm) else {
+            logOpencode("prepareInputDirectory fallback skipped path=\(source.path)")
+            return 0
+        }
+
+        let resourceValues = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        let isDirectory = resourceValues.isDirectory == true && resourceValues.isSymbolicLink != true
+        guard isDirectory else {
+            try fm.copyItem(at: source, to: destination)
+            return 1
+        }
+
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        let children = try fm.contentsOfDirectory(
+            at: source,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        )
+
+        var copiedCount = 1
+        for child in children {
+            let childDestination = destination.appendingPathComponent(child.lastPathComponent, isDirectory: false)
+            copiedCount += try copyOpencodeInputItem(
+                from: child,
+                to: childDestination,
+                inputDir: inputDir,
+                fileManager: fm
+            )
+        }
+        return copiedCount
+    }
+
+    private func shouldSkipOpencodeInputItem(_ url: URL, inputDir: URL, fileManager fm: FileManager) -> Bool {
+        let standardized = url.standardizedFileURL
+        if standardized == inputDir || standardized.path.hasPrefix(inputDir.path + "/") {
+            return true
+        }
+
+        let name = url.lastPathComponent
+        var isDirectory: ObjCBool = false
+        if fm.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return opencodeInputExcludedDirectoryNames.contains(name)
+        }
+        return opencodeInputExcludedFileNames.contains(name)
+    }
+
     private func syncInputDirectoryIncremental(source: URL, inputDir: URL, workingDir: URL) throws -> Int? {
         let rsyncPath = "/usr/bin/rsync"
-        guard FileManager.default.isReadableFile(atPath: rsyncPath) else { return nil }
+        guard FileManager.default.isReadableFile(atPath: rsyncPath) else {
+            logOpencode("rsync unavailable path=\(rsyncPath)")
+            return nil
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: rsyncPath)
 
-        var args = ["-a", "--delete", "--itemize-changes"]
+        var args = ["-a", "--delete", "--delete-excluded", "--itemize-changes"]
+        for directoryName in opencodeInputExcludedDirectoryNames.sorted() {
+            args.append(contentsOf: ["--exclude", "\(directoryName)/"])
+        }
+        for fileName in opencodeInputExcludedFileNames.sorted() {
+            args.append(contentsOf: ["--exclude", fileName])
+        }
         if source.standardizedFileURL == workingDir.standardizedFileURL {
             args.append(contentsOf: ["--exclude", "input/"])
         }
         args.append(source.path.hasSuffix("/") ? source.path : source.path + "/")
         args.append(inputDir.path.hasSuffix("/") ? inputDir.path : inputDir.path + "/")
         process.arguments = args
+        logOpencode("rsync run args=\(args.joined(separator: " "))")
 
         let outputPipe = Pipe()
         process.standardOutput = outputPipe
         process.standardError = outputPipe
+        let outputLock = NSLock()
+        let maxCapturedOutputBytes = 32_000
+        var capturedOutput = Data()
+        var outputBytes = 0
+        var changedCount = 0
+
+        func recordOutput(_ data: Data) {
+            guard !data.isEmpty else { return }
+            outputLock.lock()
+            outputBytes += data.count
+            changedCount += data.reduce(0) { $0 + ($1 == 10 ? 1 : 0) }
+            if capturedOutput.count < maxCapturedOutputBytes {
+                let remaining = maxCapturedOutputBytes - capturedOutput.count
+                capturedOutput.append(contentsOf: data.prefix(remaining))
+            }
+            outputLock.unlock()
+        }
+
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            recordOutput(handle.availableData)
+        }
 
         do {
             try process.run()
             process.waitUntilExit()
         } catch {
-            CapturePerf.log("opencode.rsync unavailable, falling back to full copy: \(error.localizedDescription)")
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            logOpencode("rsync run failed, falling back to full copy error=\(error.localizedDescription)")
             return nil
         }
 
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: outputData, encoding: .utf8) ?? ""
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        recordOutput(outputPipe.fileHandleForReading.readDataToEndOfFile())
+
+        let output = String(data: capturedOutput, encoding: .utf8) ?? ""
+        logOpencode("rsync exited status=\(process.terminationStatus) outputBytes=\(outputBytes) changedLines=\(changedCount)")
         if process.terminationStatus != 0 {
             let snippet = output.trimmingCharacters(in: .whitespacesAndNewlines)
             let msg = snippet.isEmpty ? "Unknown rsync error." : String(snippet.prefix(300))
             throw makeOpencodeError("Failed to sync input directory: \(msg)")
         }
 
-        let changedCount = output
-            .split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .count
         return changedCount
     }
 
@@ -2591,20 +3171,23 @@ final class CaptureWindowController: NSWindowController {
     private func expandTildeToRealHome(_ path: String) -> String {
         guard path.hasPrefix("~") else { return path }
 
-        let homePath: String
-        if let pw = getpwuid(getuid()), let cHome = pw.pointee.pw_dir {
-            homePath = String(cString: cHome)
-        } else if let fallback = NSHomeDirectoryForUser(NSUserName()) {
-            homePath = fallback
-        } else {
-            homePath = NSHomeDirectory()
-        }
+        let homePath = realUserHomePath()
 
         if path == "~" { return homePath }
         if path.hasPrefix("~/") {
             return homePath + "/" + path.dropFirst(2)
         }
         return NSString(string: path).expandingTildeInPath
+    }
+
+    private func realUserHomePath() -> String {
+        if let pw = getpwuid(getuid()), let cHome = pw.pointee.pw_dir {
+            return String(cString: cHome)
+        }
+        if let fallback = NSHomeDirectoryForUser(NSUserName()) {
+            return fallback
+        }
+        return NSHomeDirectory()
     }
 
     private func normalizedPathInput(_ value: String) -> String {
@@ -2689,32 +3272,25 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func documentsRootURL() -> URL {
-        let homePath: String
-        if let pw = getpwuid(getuid()), let cHome = pw.pointee.pw_dir {
-            homePath = String(cString: cHome)
-        } else if let fallback = NSHomeDirectoryForUser(NSUserName()) {
-            homePath = fallback
-        } else {
-            homePath = NSHomeDirectory()
-        }
-        return URL(fileURLWithPath: homePath, isDirectory: true)
+        return URL(fileURLWithPath: realUserHomePath(), isDirectory: true)
             .appendingPathComponent("Documents", isDirectory: true)
             .standardizedFileURL
     }
 
     @objc private func opencodeSendTapped() {
         let message = opencodeSendField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        logOpencode("send tapped chars=\(message.count) busy=\(opencodeIsBusy ? 1 : 0) session=\(opencodeActiveSessionID ?? "nil")")
         guard !message.isEmpty else { return }
         guard let workingURL = opencodeActiveWorkingURL else {
-            setOpencodeStatus("No active session. Press Start first.", isError: true)
+            setOpencodeStatus("No active Codex session. Press Start first.", isError: true)
             return
         }
         guard !opencodeIsBusy else {
-            setOpencodeStatus("Opencode is currently processing. Please wait.", isError: true)
+            setOpencodeStatus("Codex is currently processing. Please wait.", isError: true)
             return
         }
         guard let sessionID = opencodeActiveSessionID else {
-            setOpencodeStatus("No active session ID. Press Start to create a new session.", isError: true)
+            setOpencodeStatus("No active Codex session ID. Press Start to create a new session.", isError: true)
             return
         }
 
@@ -2724,6 +3300,7 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func startNewOpencodeSession(workingURL: URL, initialPrompt: String) {
+        logOpencode("startNewSession working=\(workingURL.path) promptChars=\(initialPrompt.count)")
         opencodeActiveWorkingURL = workingURL
         opencodeActiveSessionID = nil
         updateOpencodeControls()
@@ -2736,53 +3313,509 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func runOpencodeMessage(_ message: String, in workingURL: URL, sessionID: String?, isInitialStart: Bool) {
+        logOpencode("runMessage begin initial=\(isInitialStart ? 1 : 0) session=\(sessionID ?? "nil") working=\(workingURL.path) chars=\(message.count)")
         setOpencodeBusy(true)
-        setOpencodeStatus(isInitialStart ? "Starting opencode session…" : "Sending message…", isError: false)
+        setOpencodeStatus(isInitialStart ? "Starting Codex session…" : "Sending message to Codex…", isError: false)
 
         opencodeCommandToken += 1
         let token = opencodeCommandToken
+        logOpencode("runMessage token=\(token)")
+        resetOpencodeStreamingState()
 
-        if let sessionID {
-            beginStreamingOpencodeMessage(
-                message,
-                sessionID: sessionID,
-                workingURL: workingURL,
-                isInitialStart: isInitialStart,
-                token: token
-            )
-            return
-        }
-
-        guard isInitialStart else {
+        if !isInitialStart && sessionID == nil {
             setOpencodeBusy(false)
-            setOpencodeStatus("No active session ID. Press Start to create a new session.", isError: true)
+            setOpencodeStatus("No active Codex session ID. Press Start to create a new session.", isError: true)
             return
         }
 
-        createOpencodeSession(workingURL: workingURL) { [weak self] result in
+        let entryID = opencodeNextStreamingEntryID
+        opencodeNextStreamingEntryID += 1
+        opencodeCurrentStreamingEntryID = entryID
+        startOpencodeStreamingEntry(entryID: entryID, header: "Codex")
+        runCodexProcess(
+            message: codexPrompt(for: message, workingURL: workingURL, isInitialStart: isInitialStart),
+            workingURL: workingURL,
+            sessionID: sessionID,
+            isInitialStart: isInitialStart,
+            entryID: entryID,
+            token: token
+        )
+    }
+
+    private func codexPrompt(for message: String, workingURL: URL, isInitialStart: Bool) -> String {
+        guard isInitialStart else { return message }
+        let inputPath = workingURL.appendingPathComponent("input", isDirectory: true).path
+        return """
+        You are running from CameraShot's Codex tab.
+        The selected source project has been synchronized into `\(inputPath)`.
+        Treat `\(workingURL.path)` as the working directory and inspect `./input` first unless the user says otherwise.
+
+        User prompt:
+        \(message)
+        """
+    }
+
+    private func runCodexProcess(
+        message: String,
+        workingURL: URL,
+        sessionID: String?,
+        isInitialStart: Bool,
+        entryID: Int,
+        token: Int
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            guard token == self.opencodeCommandToken else {
-                if case .success(let newSessionID) = result {
-                    self.closeOpencodeSession(sessionID: newSessionID, workingURL: workingURL)
-                }
-                return
-            }
-            switch result {
-            case .failure(let error):
-                self.setOpencodeBusy(false)
-                self.setOpencodeStatus(error.localizedDescription, isError: true)
-            case .success(let newSessionID):
-                self.opencodeActiveSessionID = newSessionID
-                self.updateOpencodeControls()
-                self.beginStreamingOpencodeMessage(
-                    message,
-                    sessionID: newSessionID,
+
+            do {
+                let codexURL = try self.resolveCodexExecutableURL()
+                let outputURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("camerashot-codex-\(UUID().uuidString).md", isDirectory: false)
+                let process = Process()
+                process.executableURL = codexURL
+                process.currentDirectoryURL = workingURL
+                process.environment = self.codexProcessEnvironment(codexURL: codexURL)
+                process.arguments = self.codexArguments(
+                    sessionID: sessionID,
                     workingURL: workingURL,
-                    isInitialStart: true,
-                    token: token
+                    outputURL: outputURL
                 )
+
+                let stdinPipe = Pipe()
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardInput = stdinPipe
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                let state = CodexProcessOutputState()
+                stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    guard !data.isEmpty else { return }
+                    self.consumeCodexStdout(data, state: state, token: token)
+                }
+                stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    guard !data.isEmpty else { return }
+                    self.consumeCodexStderr(data, state: state)
+                }
+
+                process.terminationHandler = { [weak self, weak process] completedProcess in
+                    stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                    stderrPipe.fileHandleForReading.readabilityHandler = nil
+                    self?.consumeCodexStdout(stdoutPipe.fileHandleForReading.readDataToEndOfFile(), state: state, token: token)
+                    self?.flushCodexStdoutRemainder(state: state, token: token)
+                    self?.consumeCodexStderr(stderrPipe.fileHandleForReading.readDataToEndOfFile(), state: state)
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        guard token == self.opencodeCommandToken else {
+                            self.logOpencode("codex result ignored stale token=\(token) current=\(self.opencodeCommandToken)")
+                            try? FileManager.default.removeItem(at: outputURL)
+                            return
+                        }
+                        if self.opencodeCodexProcess === process {
+                            self.opencodeCodexProcess = nil
+                        }
+                        self.finishCodexProcess(
+                            completedProcess,
+                            state: state,
+                            outputURL: outputURL,
+                            isInitialStart: isInitialStart,
+                            entryID: entryID
+                        )
+                    }
+                }
+
+                logOpencode("codex run executable=\(codexURL.path) args=\(process.arguments?.joined(separator: " ") ?? "") working=\(workingURL.path)")
+                try process.run()
+                DispatchQueue.main.async { [weak self, weak process] in
+                    guard let self, token == self.opencodeCommandToken else {
+                        process?.terminate()
+                        return
+                    }
+                    guard process?.isRunning == true else { return }
+                    self.opencodeCodexProcess = process
+                }
+
+                let input = Data(message.utf8)
+                try stdinPipe.fileHandleForWriting.write(contentsOf: input)
+                try stdinPipe.fileHandleForWriting.close()
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    guard token == self.opencodeCommandToken else { return }
+                    self.logOpencode("codex launch failed error=\(error.localizedDescription)")
+                    self.finishOpencodeStreaming(withError: error.localizedDescription)
+                }
             }
         }
+    }
+
+    private func codexArguments(sessionID: String?, workingURL: URL, outputURL: URL) -> [String] {
+        if let sessionID {
+            return [
+                "exec", "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-o", outputURL.path,
+                sessionID,
+                "-"
+            ]
+        }
+
+        return [
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C", workingURL.path,
+            "-o", outputURL.path,
+            "-"
+        ]
+    }
+
+    private func resolveCodexExecutableURL() throws -> URL {
+        for candidate in codexExecutableCandidatePaths() {
+            let expanded = expandTildeToRealHome(candidate)
+            if isExecutableFile(atPath: expanded) {
+                logOpencode("codex resolved candidate=\(expanded)")
+                return URL(fileURLWithPath: expanded).standardizedFileURL
+            }
+        }
+
+        let shells = [
+            ProcessInfo.processInfo.environment["SHELL"],
+            "/bin/zsh",
+            "/bin/bash"
+        ]
+            .compactMap { $0 }
+            .reduce(into: [String]()) { result, shell in
+                if !result.contains(shell) { result.append(shell) }
+            }
+
+        for shell in shells {
+            if let url = try resolveCodexExecutableURLWithShell(shell) {
+                return url
+            }
+        }
+
+        throw makeOpencodeError("Cannot find Codex CLI. Searched PATH, Homebrew, ~/.local/bin, ~/.bun/bin, and ~/.nvm/versions/node/*/bin/codex.")
+    }
+
+    private func resolveCodexExecutableURLWithShell(_ shellPath: String) throws -> URL? {
+        guard isExecutableFile(atPath: shellPath) else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: shellPath)
+        process.arguments = ["-lc", "command -v codex"]
+        process.environment = shellLoginEnvironment()
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        try process.run()
+        process.waitUntilExit()
+
+        let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if process.terminationStatus == 0, !output.isEmpty {
+            let firstLine = output.split(whereSeparator: \.isNewline).first.map(String.init) ?? output
+            logOpencode("codex resolved shell=\(shellPath) path=\(firstLine)")
+            return URL(fileURLWithPath: firstLine).standardizedFileURL
+        }
+
+        let error = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !error.isEmpty {
+            logOpencode("codex shell lookup failed shell=\(shellPath) error=\(error)")
+        }
+        return nil
+    }
+
+    private func codexExecutableCandidatePaths() -> [String] {
+        var candidates: [String] = []
+        let env = ProcessInfo.processInfo.environment
+
+        if let bundled = Bundle.main.executableURL?
+            .deletingLastPathComponent()
+            .appendingPathComponent("codex", isDirectory: false)
+            .path {
+            candidates.append(bundled)
+        }
+
+        if let configured = env["CODEX_BIN"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            candidates.append(configured)
+            candidates.append(contentsOf: nativeCodexExecutableCandidates(forCodexWrapperPath: configured))
+        }
+
+        if let path = env["PATH"] {
+            for dir in path.split(separator: ":").map(String.init) where !dir.isEmpty {
+                let codexPath = URL(fileURLWithPath: expandTildeToRealHome(dir), isDirectory: true)
+                    .appendingPathComponent("codex", isDirectory: false).path
+                candidates.append(codexPath)
+                candidates.append(contentsOf: nativeCodexExecutableCandidates(forCodexWrapperPath: codexPath))
+            }
+        }
+
+        let commonCandidates = [
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            "/usr/bin/codex",
+            "~/.local/bin/codex",
+            "~/.bun/bin/codex",
+            "~/.nvm/current/bin/codex"
+        ]
+        candidates.append(contentsOf: commonCandidates)
+        for candidate in commonCandidates {
+            candidates.append(contentsOf: nativeCodexExecutableCandidates(forCodexWrapperPath: candidate))
+        }
+
+        let nvmNodeVersionsPath = expandTildeToRealHome("~/.nvm/versions/node")
+        if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmNodeVersionsPath) {
+            for version in versions.sorted(by: >) {
+                let wrapper = URL(fileURLWithPath: nvmNodeVersionsPath, isDirectory: true)
+                    .appendingPathComponent(version, isDirectory: true)
+                    .appendingPathComponent("bin", isDirectory: true)
+                    .appendingPathComponent("codex", isDirectory: false).path
+                candidates.append(wrapper)
+                candidates.append(contentsOf: nativeCodexExecutableCandidates(forCodexWrapperPath: wrapper))
+            }
+        }
+
+        var seen = Set<String>()
+        return candidates.filter { candidate in
+            let expanded = expandTildeToRealHome(candidate)
+            guard !expanded.isEmpty, !seen.contains(expanded) else { return false }
+            seen.insert(expanded)
+            return true
+        }
+    }
+
+    private func nativeCodexExecutableCandidates(forCodexWrapperPath wrapperPath: String) -> [String] {
+        let expanded = expandTildeToRealHome(wrapperPath)
+        let realPath = (expanded as NSString).resolvingSymlinksInPath
+        guard realPath.hasSuffix("/@openai/codex/bin/codex.js") else { return [] }
+
+        let packageRoot = URL(fileURLWithPath: realPath, isDirectory: false)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        var candidates: [String] = []
+        let fm = FileManager.default
+
+        func addVendorCandidates(under root: URL) {
+            guard let triples = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
+            for triple in triples {
+                candidates.append(triple.appendingPathComponent("bin/codex", isDirectory: false).path)
+                candidates.append(triple.appendingPathComponent("codex/codex", isDirectory: false).path)
+            }
+        }
+
+        addVendorCandidates(under: packageRoot.appendingPathComponent("vendor", isDirectory: true))
+
+        let nodeModules = packageRoot.appendingPathComponent("node_modules/@openai", isDirectory: true)
+        if let packages = try? fm.contentsOfDirectory(at: nodeModules, includingPropertiesForKeys: nil) {
+            for package in packages where package.lastPathComponent.hasPrefix("codex-") {
+                addVendorCandidates(under: package.appendingPathComponent("vendor", isDirectory: true))
+            }
+        }
+
+        return candidates
+    }
+
+    private func isExecutableFile(atPath path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        let expanded = expandTildeToRealHome(path)
+        guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else { return false }
+        return FileManager.default.isExecutableFile(atPath: expanded)
+    }
+
+    private func shellLoginEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let realHome = realUserHomePath()
+        env["HOME"] = realHome
+        env["CODEX_HOME"] = URL(fileURLWithPath: realHome, isDirectory: true)
+            .appendingPathComponent(".codex", isDirectory: true)
+            .path
+        env["USER"] = env["USER"] ?? NSUserName()
+        env["LOGNAME"] = env["LOGNAME"] ?? NSUserName()
+        env["SHELL"] = env["SHELL"] ?? "/bin/zsh"
+        return env
+    }
+
+    private func codexProcessEnvironment(codexURL: URL) -> [String: String] {
+        var env = shellLoginEnvironment()
+        var pathParts = [
+            codexURL.deletingLastPathComponent().path,
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ]
+        if let current = env["PATH"], !current.isEmpty {
+            pathParts.append(contentsOf: current.split(separator: ":").map(String.init))
+        }
+
+        var seen = Set<String>()
+        env["PATH"] = pathParts.filter { part in
+            guard !part.isEmpty, !seen.contains(part) else { return false }
+            seen.insert(part)
+            return true
+        }.joined(separator: ":")
+        env["TERM"] = "dumb"
+        env["NO_COLOR"] = "1"
+        logOpencode("codex env HOME=\(env["HOME"] ?? "nil") CODEX_HOME=\(env["CODEX_HOME"] ?? "nil")")
+        return env
+    }
+
+    private func consumeCodexStdout(_ data: Data, state: CodexProcessOutputState, token: Int) {
+        guard !data.isEmpty else { return }
+        let lines = state.consumeStdout(data)
+        for line in lines {
+            handleCodexOutputLine(line, state: state, token: token)
+        }
+    }
+
+    private func flushCodexStdoutRemainder(state: CodexProcessOutputState, token: Int) {
+        for line in state.flushStdoutRemainder() {
+            handleCodexOutputLine(line, state: state, token: token)
+        }
+    }
+
+    private func consumeCodexStderr(_ data: Data, state: CodexProcessOutputState) {
+        guard !data.isEmpty else { return }
+        state.appendStderr(data)
+    }
+
+    private func handleCodexOutputLine(_ line: String, state: CodexProcessOutputState, token: Int) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{"),
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = object["type"] as? String
+        else {
+            if !trimmed.isEmpty {
+                logOpencode("codex stdout \(String(trimmed.prefix(240)))")
+            }
+            return
+        }
+
+        switch type {
+        case "thread.started":
+            if let threadID = object["thread_id"] as? String {
+                state.setThreadID(threadID)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, token == self.opencodeCommandToken else { return }
+                    self.opencodeActiveSessionID = threadID
+                    self.updateOpencodeControls()
+                    self.logOpencode("codex thread started id=\(threadID)")
+                }
+            }
+
+        case "item.completed":
+            guard let item = object["item"] as? [String: Any],
+                  let itemType = item["type"] as? String
+            else { return }
+            if itemType == "agent_message", let text = item["text"] as? String {
+                state.setFinalText(text)
+            } else if itemType == "exec_command", let command = item["command"] as? String {
+                logOpencode("codex command completed command=\(command)")
+            }
+
+        case "turn.completed":
+            if let usage = object["usage"] as? [String: Any] {
+                logOpencode("codex turn completed usage=\(usage)")
+            } else {
+                logOpencode("codex turn completed")
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func finishCodexProcess(
+        _ process: Process,
+        state: CodexProcessOutputState,
+        outputURL: URL,
+        isInitialStart: Bool,
+        entryID: Int
+    ) {
+        let status = process.terminationStatus
+        let finalText = codexFinalText(state: state, outputURL: outputURL)
+        try? FileManager.default.removeItem(at: outputURL)
+        logOpencode("codex exited status=\(status) finalChars=\(finalText.count) stderrChars=\(state.stderrText.count)")
+
+        guard status == 0 else {
+            let message = codexFailureMessage(status: status, stderr: state.stderrText)
+            if isInitialStart {
+                opencodeActiveSessionID = nil
+            }
+            finishOpencodeStreaming(withError: message)
+            return
+        }
+
+        guard let threadID = state.threadID ?? opencodeActiveSessionID else {
+            finalizeOpencodeStreamingEntry(entryID: entryID, markdown: finalText.isEmpty ? "Codex finished without a response." : finalText)
+            finishOpencodeStreaming(withError: "Codex did not report a session id. Press Restart to begin a new session.")
+            return
+        }
+
+        opencodeActiveSessionID = threadID
+        if finalText.isEmpty {
+            finalizeOpencodeStreamingEntry(entryID: entryID, markdown: "Codex finished without a response.")
+        } else {
+            finalizeOpencodeStreamingEntry(entryID: entryID, markdown: cleanOpencodeAssistantText(finalText))
+        }
+        setOpencodeBusy(false)
+        if isInitialStart {
+            setOpencodeStatus("Codex completed. Session: \(threadID)", isError: false)
+        } else {
+            setOpencodeStatus("Codex completed.", isError: false)
+        }
+        resetOpencodeStreamingState()
+        updateOpencodeControls()
+    }
+
+    private func codexFinalText(state: CodexProcessOutputState, outputURL: URL) -> String {
+        if let text = state.finalText?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+            return text
+        }
+        if let data = try? Data(contentsOf: outputURL),
+           let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !text.isEmpty {
+            return text
+        }
+        return ""
+    }
+
+    private func codexFailureMessage(status: Int32, stderr: String) -> String {
+        let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Codex failed with exit status \(status)."
+        }
+
+        if trimmed.localizedCaseInsensitiveContains("401 Unauthorized") {
+            let codexHome = URL(fileURLWithPath: realUserHomePath(), isDirectory: true)
+                .appendingPathComponent(".codex", isDirectory: true)
+                .path
+            return "Codex authentication failed (401 Unauthorized). CameraShot is using \(codexHome); run `codex login` in Terminal if the session has expired."
+        }
+
+        let uniqueLines = trimmed
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .reduce(into: [String]()) { lines, line in
+                if lines.last != line { lines.append(line) }
+            }
+        let snippet = uniqueLines.joined(separator: "\n")
+        return "Codex failed with exit status \(status): \(String(snippet.suffix(1200)))"
     }
 
     private func beginStreamingOpencodeMessage(
@@ -2793,11 +3826,13 @@ final class CaptureWindowController: NSWindowController {
         token: Int
     ) {
         guard let eventURL = opencodeRequestURL(path: "event", workingURL: workingURL) else {
+            logOpencode("stream begin failed invalid event URL session=\(sessionID)")
             setOpencodeBusy(false)
             setOpencodeStatus("Invalid opencode server URL.", isError: true)
             return
         }
 
+        logOpencode("stream begin session=\(sessionID) eventURL=\(eventURL.absoluteString) initial=\(isInitialStart ? 1 : 0) token=\(token)")
         stopOpencodeEventStream()
         resetOpencodeStreamingState()
 
@@ -2805,14 +3840,21 @@ final class CaptureWindowController: NSWindowController {
             onEvent: { [weak self] event in
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    guard token == self.opencodeCommandToken else { return }
+                    guard token == self.opencodeCommandToken else {
+                        self.logOpencode("stream event ignored stale token=\(token) current=\(self.opencodeCommandToken)")
+                        return
+                    }
                     self.handleOpencodeStreamEvent(event, sessionID: sessionID, isInitialStart: isInitialStart)
                 }
             },
             onFailure: { [weak self] message in
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    guard token == self.opencodeCommandToken else { return }
+                    guard token == self.opencodeCommandToken else {
+                        self.logOpencode("stream failure ignored stale token=\(token) current=\(self.opencodeCommandToken) message=\(message)")
+                        return
+                    }
+                    self.logOpencode("stream failed message=\(message)")
                     self.finishOpencodeStreaming(withError: message)
                 }
             }
@@ -2823,8 +3865,12 @@ final class CaptureWindowController: NSWindowController {
 
         postOpencodePromptAsync(message, sessionID: sessionID, workingURL: workingURL) { [weak self] result in
             guard let self else { return }
-            guard token == self.opencodeCommandToken else { return }
+            guard token == self.opencodeCommandToken else {
+                self.logOpencode("prompt_async result ignored stale token=\(token) current=\(self.opencodeCommandToken)")
+                return
+            }
             if case .failure(let error) = result {
+                self.logOpencode("prompt_async failed error=\(error.localizedDescription)")
                 self.finishOpencodeStreaming(withError: error.localizedDescription)
             }
         }
@@ -2838,8 +3884,17 @@ final class CaptureWindowController: NSWindowController {
             opencodePerfEventCount = 0
             opencodePerfLastLogAt = now
         }
-        guard let type = event["type"] as? String else { return }
-        guard let properties = event["properties"] as? [String: Any] else { return }
+        guard let type = event["type"] as? String else {
+            logOpencode("stream event ignored missing type keys=\(event.keys.sorted().joined(separator: ","))")
+            return
+        }
+        guard let properties = event["properties"] as? [String: Any] else {
+            logOpencode("stream event ignored missing properties type=\(type)")
+            return
+        }
+        if type == "session.error" || type == "session.idle" || type == "message.updated" {
+            logOpencode("stream event type=\(type)")
+        }
 
         switch type {
         case "message.updated":
@@ -2940,6 +3995,7 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func finishOpencodeStreamingSuccessfully(isInitialStart: Bool, sessionID: String) {
+        logOpencode("stream finished successfully initial=\(isInitialStart ? 1 : 0) session=\(sessionID)")
         cancelOpencodeStreamTimeout()
         stopOpencodeEventStream()
         setOpencodeBusy(false)
@@ -2958,14 +4014,17 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func finishOpencodeStreaming(withError message: String) {
+        logOpencode("stream finish error message=\(message)")
         cancelOpencodeStreamTimeout()
         stopOpencodeEventStream()
         setOpencodeBusy(false)
         setOpencodeStatus(message, isError: true)
+        appendOpencodeChatEntry(header: "Codex", markdown: message, isError: true)
         resetOpencodeStreamingState()
     }
 
     private func resetOpencodeStreamingState() {
+        logOpencode("reset streaming state currentEntry=\(opencodeCurrentStreamingEntryID.map(String.init) ?? "nil") pendingChunks=\(opencodePendingStreamingChunksByEntryID.count)")
         opencodeStreamingAssistantMessageID = nil
         opencodeStreamingAssistantText = ""
         opencodeStreamingEntryIDByMessageID.removeAll(keepingCapacity: false)
@@ -2977,17 +4036,29 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func stopOpencodeEventStream() {
+        if opencodeEventStreamClient != nil {
+            logOpencode("stop event stream")
+        }
         cancelOpencodeStreamTimeout()
         opencodeEventStreamClient?.stop()
         opencodeEventStreamClient = nil
     }
 
+    private func stopOpencodeCodexProcess() {
+        guard let process = opencodeCodexProcess else { return }
+        logOpencode("stop codex process pid=\(process.processIdentifier)")
+        process.terminate()
+        opencodeCodexProcess = nil
+    }
+
     private func scheduleOpencodeStreamTimeout(token: Int) {
         cancelOpencodeStreamTimeout()
+        logOpencode("schedule stream timeout token=\(token)")
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             guard token == opencodeCommandToken else { return }
-            finishOpencodeStreaming(withError: "Opencode response timed out. You can send a follow-up message to retry.")
+            logOpencode("stream timeout fired token=\(token)")
+            finishOpencodeStreaming(withError: "Codex response timed out. You can send a follow-up message to retry.")
         }
         opencodeStreamTimeoutWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 120, execute: item)
@@ -3037,9 +4108,11 @@ final class CaptureWindowController: NSWindowController {
 
     private func createOpencodeSession(workingURL: URL, completion: @escaping (Result<String, Error>) -> Void) {
         guard let requestURL = opencodeRequestURL(path: "session", workingURL: workingURL) else {
+            logOpencode("createSession invalid request URL working=\(workingURL.path)")
             completion(.failure(makeOpencodeError("Invalid opencode server URL.")))
             return
         }
+        logOpencode("createSession request url=\(requestURL.absoluteString)")
         var request = URLRequest(url: requestURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -3062,9 +4135,11 @@ final class CaptureWindowController: NSWindowController {
             path: "session/\(sessionID)/prompt_async",
             workingURL: workingURL
         ) else {
+            logOpencode("prompt_async invalid request URL session=\(sessionID) working=\(workingURL.path)")
             completion(.failure(makeOpencodeError("Invalid opencode server URL.")))
             return
         }
+        logOpencode("prompt_async request session=\(sessionID) url=\(requestURL.absoluteString) chars=\(message.count)")
 
         var request = URLRequest(url: requestURL)
         request.httpMethod = "POST"
@@ -3073,6 +4148,7 @@ final class CaptureWindowController: NSWindowController {
         do {
             request.httpBody = try JSONEncoder().encode(payload)
         } catch {
+            logOpencode("prompt_async encode failed error=\(error.localizedDescription)")
             completion(.failure(makeOpencodeError("Failed to encode prompt payload: \(error.localizedDescription)")))
             return
         }
@@ -3083,6 +4159,7 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func closeOpencodeSession(sessionID: String, workingURL: URL) {
+        logOpencode("close session session=\(sessionID) working=\(workingURL.path)")
         abortOpencodeSession(sessionID: sessionID, workingURL: workingURL) { [weak self] in
             self?.deleteOpencodeSession(sessionID: sessionID, workingURL: workingURL)
         }
@@ -3097,9 +4174,11 @@ final class CaptureWindowController: NSWindowController {
             path: "session/\(sessionID)/abort",
             workingURL: workingURL
         ) else {
+            logOpencode("abort session skipped invalid URL session=\(sessionID)")
             completion()
             return
         }
+        logOpencode("abort session request session=\(sessionID) url=\(requestURL.absoluteString)")
 
         var request = URLRequest(url: requestURL)
         request.httpMethod = "POST"
@@ -3108,7 +4187,7 @@ final class CaptureWindowController: NSWindowController {
 
         performOpencodeRequest(request, completion: { (result: Result<Bool, Error>) in
             if case .failure(let error) = result {
-                NSLog("Failed to abort opencode session %@: %@", sessionID, error.localizedDescription)
+                self.logOpencode("abort session failed session=\(sessionID) error=\(error.localizedDescription)")
             }
             completion()
         }) { _ in
@@ -3120,14 +4199,18 @@ final class CaptureWindowController: NSWindowController {
         guard let requestURL = opencodeRequestURL(
             path: "session/\(sessionID)",
             workingURL: workingURL
-        ) else { return }
+        ) else {
+            logOpencode("delete session skipped invalid URL session=\(sessionID)")
+            return
+        }
+        logOpencode("delete session request session=\(sessionID) url=\(requestURL.absoluteString)")
 
         var request = URLRequest(url: requestURL)
         request.httpMethod = "DELETE"
 
         performOpencodeRequest(request, completion: { (result: Result<Bool, Error>) in
             if case .failure(let error) = result {
-                NSLog("Failed to delete opencode session %@: %@", sessionID, error.localizedDescription)
+                self.logOpencode("delete session failed session=\(sessionID) error=\(error.localizedDescription)")
             }
         }) { _ in
             true
@@ -3138,8 +4221,10 @@ final class CaptureWindowController: NSWindowController {
         if let configured = UserDefaults.standard.string(forKey: "opencode.attachURL")?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !configured.isEmpty {
+            logOpencode("attachURL configured=\(configured)")
             return configured
         }
+        logOpencode("attachURL default=\(opencodeDefaultAttachURL)")
         return opencodeDefaultAttachURL
     }
 
@@ -3164,7 +4249,9 @@ final class CaptureWindowController: NSWindowController {
         queryItems.removeAll(where: { $0.name == "directory" })
         queryItems.append(URLQueryItem(name: "directory", value: workingURL.path))
         components.queryItems = queryItems
-        return components.url
+        let url = components.url
+        logOpencode("requestURL path=\(path) working=\(workingURL.path) url=\(url?.absoluteString ?? "nil")")
+        return url
     }
 
     private func performOpencodeRequest<T>(
@@ -3172,18 +4259,24 @@ final class CaptureWindowController: NSWindowController {
         completion: @escaping (Result<T, Error>) -> Void,
         decode: @escaping (Data) throws -> T
     ) {
+        let method = request.httpMethod ?? "GET"
+        let urlString = request.url?.absoluteString ?? "nil"
+        logOpencode("HTTP request method=\(method) url=\(urlString) bodyBytes=\(request.httpBody?.count ?? 0)")
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
             if let urlError = error as? URLError {
                 let message = self.opencodeConnectionErrorMessage(urlError)
+                self.logOpencode("HTTP url error method=\(method) url=\(urlString) code=\(urlError.code.rawValue) message=\(message)")
                 DispatchQueue.main.async { completion(.failure(self.makeOpencodeError(message))) }
                 return
             }
             if let error {
+                self.logOpencode("HTTP error method=\(method) url=\(urlString) error=\(error.localizedDescription)")
                 DispatchQueue.main.async { completion(.failure(error)) }
                 return
             }
 
             guard let httpResponse = response as? HTTPURLResponse else {
+                self.logOpencode("HTTP invalid response method=\(method) url=\(urlString)")
                 DispatchQueue.main.async {
                     completion(.failure(self.makeOpencodeError("Opencode server returned an invalid response.")))
                 }
@@ -3191,11 +4284,13 @@ final class CaptureWindowController: NSWindowController {
             }
 
             let payload = data ?? Data()
+            self.logOpencode("HTTP response method=\(method) url=\(urlString) status=\(httpResponse.statusCode) bytes=\(payload.count)")
             guard (200..<300).contains(httpResponse.statusCode) else {
                 let detail = self.parseOpencodeHTTPError(payload)
                 let message = detail.isEmpty
                     ? "Opencode server error (HTTP \(httpResponse.statusCode))."
                     : "Opencode server error (HTTP \(httpResponse.statusCode)): \(detail)"
+                self.logOpencode("HTTP non-2xx method=\(method) url=\(urlString) message=\(message)")
                 DispatchQueue.main.async { completion(.failure(self.makeOpencodeError(message))) }
                 return
             }
@@ -3204,6 +4299,7 @@ final class CaptureWindowController: NSWindowController {
                 let value = try decode(payload)
                 DispatchQueue.main.async { completion(.success(value)) }
             } catch {
+                self.logOpencode("HTTP decode failed method=\(method) url=\(urlString) error=\(error.localizedDescription)")
                 DispatchQueue.main.async {
                     completion(.failure(self.makeOpencodeError("Failed to parse opencode response: \(error.localizedDescription)")))
                 }
@@ -3220,9 +4316,9 @@ final class CaptureWindowController: NSWindowController {
         switch error.code {
         case .cannotConnectToHost, .cannotFindHost, .timedOut, .notConnectedToInternet, .networkConnectionLost:
             let attach = opencodeAttachURL() ?? opencodeDefaultAttachURL
-            return "Cannot reach opencode server at \(attach). Start it with ./run.sh and try again."
+            return "Legacy Opencode server request failed at \(attach). The Codex tab now uses the local Codex CLI."
         default:
-            return "Opencode request failed: \(error.localizedDescription)"
+            return "Legacy Opencode request failed: \(error.localizedDescription)"
         }
     }
 
@@ -3249,6 +4345,66 @@ final class CaptureWindowController: NSWindowController {
 
     private struct OpencodePromptRequest: Encodable {
         let parts: [OpencodePromptTextPart]
+    }
+
+    private final class CodexProcessOutputState {
+        private let lock = NSLock()
+        private var stdoutRemainder = Data()
+        private(set) var threadID: String?
+        private(set) var finalText: String?
+        private(set) var stderrText = ""
+        private let maxStderrCharacters = 12_000
+
+        func consumeStdout(_ data: Data) -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+
+            stdoutRemainder.append(data)
+            var lines: [String] = []
+            let newline = Data([0x0A])
+            while let range = stdoutRemainder.range(of: newline) {
+                let lineData = stdoutRemainder.subdata(in: 0..<range.lowerBound)
+                stdoutRemainder.removeSubrange(0..<range.upperBound)
+                if var line = String(data: lineData, encoding: .utf8) {
+                    if line.hasSuffix("\r") { line.removeLast() }
+                    lines.append(line)
+                }
+            }
+            return lines
+        }
+
+        func appendStderr(_ data: Data) {
+            guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
+            lock.lock()
+            stderrText += text
+            if stderrText.count > maxStderrCharacters {
+                stderrText = String(stderrText.suffix(maxStderrCharacters))
+            }
+            lock.unlock()
+        }
+
+        func flushStdoutRemainder() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !stdoutRemainder.isEmpty else { return [] }
+            let data = stdoutRemainder
+            stdoutRemainder.removeAll(keepingCapacity: false)
+            guard var line = String(data: data, encoding: .utf8) else { return [] }
+            if line.hasSuffix("\r") { line.removeLast() }
+            return line.isEmpty ? [] : [line]
+        }
+
+        func setThreadID(_ id: String) {
+            lock.lock()
+            threadID = id
+            lock.unlock()
+        }
+
+        func setFinalText(_ text: String) {
+            lock.lock()
+            finalText = text
+            lock.unlock()
+        }
     }
 
     private final class FileExploreNode: NSObject {
@@ -3282,6 +4438,7 @@ final class CaptureWindowController: NSWindowController {
 
         func start(url: URL) {
             guard !isStopped else { return }
+            DevLog.log("Opencode", "SSE start url=\(url.absoluteString)")
             let configuration = URLSessionConfiguration.default
             configuration.timeoutIntervalForRequest = 0
             configuration.timeoutIntervalForResource = 0
@@ -3299,6 +4456,7 @@ final class CaptureWindowController: NSWindowController {
 
         func stop() {
             guard !isStopped else { return }
+            DevLog.log("Opencode", "SSE stop")
             isStopped = true
             task?.cancel()
             task = nil
@@ -3315,10 +4473,12 @@ final class CaptureWindowController: NSWindowController {
             completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
         ) {
             guard let http = response as? HTTPURLResponse else {
+                DevLog.log("Opencode", "SSE invalid response")
                 fail("Opencode stream returned an invalid response.")
                 completionHandler(.cancel)
                 return
             }
+            DevLog.log("Opencode", "SSE response status=\(http.statusCode)")
             guard (200..<300).contains(http.statusCode) else {
                 fail("Opencode stream failed (HTTP \(http.statusCode)).")
                 completionHandler(.cancel)
@@ -3347,12 +4507,15 @@ final class CaptureWindowController: NSWindowController {
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
             guard !isStopped else { return }
             if let urlError = error as? URLError, urlError.code == .cancelled {
+                DevLog.log("Opencode", "SSE completed cancelled")
                 return
             }
             if let error {
+                DevLog.log("Opencode", "SSE completed error=\(error.localizedDescription)")
                 fail("Opencode stream disconnected: \(error.localizedDescription)")
                 return
             }
+            DevLog.log("Opencode", "SSE completed without error before idle")
             fail("Opencode stream ended unexpectedly before completion.")
         }
 
@@ -3375,12 +4538,16 @@ final class CaptureWindowController: NSWindowController {
             let payload = dataLines.joined(separator: "\n")
             dataLines.removeAll(keepingCapacity: true)
             guard let raw = payload.data(using: .utf8) else { return }
-            guard let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { return }
+            guard let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+                DevLog.log("Opencode", "SSE ignored invalid JSON bytes=\(raw.count)")
+                return
+            }
             onEvent(object)
         }
 
         private func fail(_ message: String) {
             guard !isStopped else { return }
+            DevLog.log("Opencode", "SSE fail message=\(message)")
             isStopped = true
             onFailure(message)
             task?.cancel()
@@ -3415,7 +4582,7 @@ final class CaptureWindowController: NSWindowController {
     private func appendOpencodeLine(_ role: String, _ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard role == "You" || role == "Opencode" else { return }
+        guard role == "You" || role == "Codex" || role == "Opencode" else { return }
         appendOpencodeChatEntry(header: role, markdown: trimmed, isError: false)
     }
 
@@ -3473,14 +4640,17 @@ final class CaptureWindowController: NSWindowController {
     }
 
     private func setOpencodeBusy(_ busy: Bool) {
+        logOpencode("busy changed busy=\(busy ? 1 : 0)")
         opencodeIsBusy = busy
         updateOpencodeControls()
     }
 
     private func stopActiveOpencodeProcess(resetSession: Bool, closeRemoteSession: Bool = false) {
-        let sessionToClose = closeRemoteSession ? opencodeActiveSessionID : nil
-        let workingURLToClose = closeRemoteSession ? opencodeActiveWorkingURL : nil
+        logOpencode(
+            "stop active resetSession=\(resetSession ? 1 : 0) closeRemote=\(closeRemoteSession ? 1 : 0) session=\(opencodeActiveSessionID ?? "nil") working=\(opencodeActiveWorkingURL?.path ?? "nil")"
+        )
         opencodeCommandToken += 1
+        stopOpencodeCodexProcess()
         stopOpencodeEventStream()
         resetOpencodeStreamingState()
         opencodeIsBusy = false
@@ -3489,23 +4659,26 @@ final class CaptureWindowController: NSWindowController {
             opencodeActiveWorkingURL = nil
         }
         updateOpencodeControls()
-
-        if let sessionID = sessionToClose, let workingURL = workingURLToClose {
-            closeOpencodeSession(sessionID: sessionID, workingURL: workingURL)
-        }
     }
 
     private func updateOpencodeControls() {
-        let hasSession = opencodeActiveWorkingURL != nil
-        opencodeSendField?.isEnabled = hasSession && !opencodeIsBusy
-        opencodeSendButton?.isEnabled = hasSession && !opencodeIsBusy
-        opencodeStartButton?.title = hasSession ? "Restart" : "Start"
+        let hasWorkingDirectory = opencodeActiveWorkingURL != nil
+        let hasSession = opencodeActiveSessionID != nil
+        opencodeSendField?.isEnabled = hasWorkingDirectory && hasSession && !opencodeIsBusy
+        opencodeSendButton?.isEnabled = hasWorkingDirectory && hasSession && !opencodeIsBusy
+        opencodeStartButton?.title = hasWorkingDirectory ? "Restart" : "Start"
+        logOpencode("controls updated hasWorking=\(hasWorkingDirectory ? 1 : 0) hasSession=\(hasSession ? 1 : 0) busy=\(opencodeIsBusy ? 1 : 0) startTitle=\(hasWorkingDirectory ? "Restart" : "Start")")
     }
 
     private func setOpencodeStatus(_ message: String, isError: Bool) {
+        logOpencode("status isError=\(isError ? 1 : 0) message=\(message)")
         opencodeStatusLabel.stringValue = message
         opencodeStatusLabel.textColor = isError ? .systemRed : .secondaryLabelColor
         opencodeStatusLabel.isHidden = message.isEmpty
+    }
+
+    private func logOpencode(_ message: @autoclosure () -> String) {
+        DevLog.log("Codex", message())
     }
 
     @objc private func clearAudioAI() {
@@ -3524,6 +4697,15 @@ final class CaptureWindowController: NSWindowController {
         instantVoiceChunkFlushWorkItem = nil
         instantVoiceCurrentEntry = nil
         instantVoiceStreamingText = ""
+    }
+
+    @objc private func clearInstantVoice2() {
+        instantVoice2Bridge.enqueue("clearFeed()", immediate: true)
+        instantVoice2PendingChunksByEntryID.removeAll(keepingCapacity: false)
+        instantVoice2ChunkFlushWorkItem?.cancel()
+        instantVoice2ChunkFlushWorkItem = nil
+        instantVoice2CurrentEntry = nil
+        instantVoice2StreamingText = ""
     }
 
     // MARK: – AI helpers
@@ -3641,6 +4823,33 @@ final class CaptureWindowController: NSWindowController {
             instantVoiceBridge.enqueue("appendStreamingChunk(\(id), \(js))")
         }
         instantVoiceBridge.flushNow()
+    }
+
+    private func scheduleInstantVoice2ChunkFlush() {
+        guard instantVoice2ChunkFlushWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            self?.instantVoice2ChunkFlushWorkItem = nil
+            self?.flushInstantVoice2StreamingChunks()
+        }
+        instantVoice2ChunkFlushWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: item)
+    }
+
+    private func flushInstantVoice2StreamingChunks(for entryID: Int? = nil) {
+        guard !instantVoice2PendingChunksByEntryID.isEmpty else { return }
+        let targets: [(Int, String)]
+        if let entryID {
+            guard let text = instantVoice2PendingChunksByEntryID.removeValue(forKey: entryID), !text.isEmpty else { return }
+            targets = [(entryID, text)]
+        } else {
+            targets = instantVoice2PendingChunksByEntryID.map { ($0.key, $0.value) }
+            instantVoice2PendingChunksByEntryID.removeAll(keepingCapacity: true)
+        }
+        for (id, text) in targets.sorted(by: { $0.0 < $1.0 }) {
+            guard let js = jsLiteral(text) else { continue }
+            instantVoice2Bridge.enqueue("appendStreamingChunk(\(id), \(js))")
+        }
+        instantVoice2Bridge.flushNow()
     }
 
     private func scheduleChatChunkFlush() {
@@ -4187,7 +5396,7 @@ final class CaptureWindowController: NSWindowController {
       .entry-user {
         background: rgba(10,132,255,0.10);
       }
-      .entry-opencode {
+      .entry-opencode, .entry-codex {
         background: rgba(142,142,147,0.10);
       }
 
@@ -4326,8 +5535,8 @@ final class CaptureWindowController: NSWindowController {
         var normalized = (header || '').trim().split('\\n')[0].toLowerCase();
         if (normalized === 'you') {
           entry.classList.add('entry-card', 'entry-user');
-        } else if (normalized === 'opencode') {
-          entry.classList.add('entry-card', 'entry-opencode');
+        } else if (normalized === 'opencode' || normalized === 'codex') {
+          entry.classList.add('entry-card', normalized === 'codex' ? 'entry-codex' : 'entry-opencode');
         }
       }
       function startStreamingEntry(header, imageDataURL, entryId) {

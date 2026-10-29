@@ -1,61 +1,76 @@
 # CameraShot
 
-High-performance macOS camera capture tool written in Swift + AVFoundation.  
-Saves a JPEG from any connected camera every **N** seconds.
+A native macOS assistant that watches your camera or screen, listens to audio, and streams AI answers into a floating window that stays hidden from screen sharing.
 
-## Why Swift / AVFoundation
+Built in Swift with AppKit, AVFoundation, and ScreenCaptureKit. It has no package dependencies.
 
-| What | How |
-|---|---|
-| Zero-latency preview | `AVCaptureVideoPreviewLayer` as the NSView's own backing layer — frames go GPU → display with **zero CPU copies** |
-| Frame capture | `AVCaptureVideoDataOutput` on a dedicated `.userInteractive` queue, late frames discarded immediately |
-| JPEG encoding | Metal-backed `CIContext` — hardware accelerator, not the CPU |
-| Save I/O | Dedicated serial queue, never blocks capture or the UI |
-| Auto-focus / exposure | Locked to `continuousAutoFocus` + `continuousAutoExposure` for sharpest frames |
-| Frame rate | Requests up to 60 fps (`activeVideoMinFrameDuration = 1/60`) |
+## Features
+
+- **Interval capture.** Grabs a frame from any camera (including Continuity Camera), a display, or a single window every *N* seconds. A change filter skips frames that look the same as the last one.
+- **Visual AI.** Sends each new frame with your own prompt to Google Gemini (default `gemini-3.5-flash`) or OpenAI. The answer streams in as Markdown, with code highlighting and Mermaid diagrams.
+- **Realtime audio.** Connects to the OpenAI Realtime API over WebSocket and offers three modes:
+  - *Audio AI*: listens all the time and answers system audio as it plays.
+  - *Instant Voice* and *Instant Audio2*: push-to-talk, each with its own prompt.
+- **Chat.** A text chat that can use the latest screenshot as context.
+- **Codex tab.** Runs the [OpenAI Codex CLI](https://github.com/openai/codex) inside the app, if you have it installed.
+- **Hidden from screen sharing.** Every window sets `NSWindow.sharingType = .none`, so it doesn't appear in Zoom, Meet, Teams, or screen recordings.
+- **Encrypted keys.** API keys are encrypted with AES-256-GCM, using a key derived with PBKDF2 from this Mac's hardware UUID, and stored in `~/.camerashot/`. They never appear in plain text on disk.
+- **Bounded memory.** Old screenshots and rendered entries are removed automatically, so the app can run for hours (see `RetentionPolicy.swift`).
 
 ## Requirements
 
-- macOS 13 Ventura or later
+- macOS 14 Sonoma or later
 - Xcode Command Line Tools (`xcode-select --install`)
+- A Google Gemini and/or OpenAI API key
+- Optional: the `codex` CLI on your `PATH` for the Codex tab
 
-No third-party dependencies.
-
-## Build
+## Build and run
 
 ```bash
+git clone https://github.com/zeinalii/CameraShot.git
 cd CameraShot
-make build
+
+make build          # builds and signs CameraShot.app
+./run.sh            # opens the app (builds it first if needed)
+./run.sh --build    # rebuilds, then opens the app
+make dev            # debug build that prints logs to the terminal
+make install        # copies the app to /Applications
 ```
 
-This produces `CameraShot.app` — a minimal, ad-hoc-signed app bundle that gives the binary access to the camera permission dialog.
+`make build` signs the app with the first **Developer ID Application** identity in your keychain. If you don't have one, it falls back to ad-hoc signing. To choose an identity yourself, pass `SIGN_IDENTITY="Developer ID Application: …"`.
 
-## Run
+The first time it runs, macOS asks for camera, microphone, and screen-recording permission. CameraShot is a menu-bar app (`LSUIElement`), so it doesn't show a Dock icon.
 
-```bash
-# Camera menu + 5-second interval
-make run ARGS="5"
+## Usage
 
-# Camera index 1, 10-second interval
-make run ARGS="10 1"
+1. Open **Settings → API Keys** and paste your Gemini and/or OpenAI key. Keys are encrypted as soon as you save them.
+2. On the **Capture** tab, choose a camera or a screen/window source, an interval, an image quality, and an output folder. Then turn on the AI tabs you want.
+3. Edit the visual and audio system prompts on the **Prompts** and **Audio Prompts** tabs.
+4. Click **Start Capture**. Answers appear in the floating capture window, one tab per mode.
 
-# Or run the binary directly
-./CameraShot.app/Contents/MacOS/CameraShot <interval_seconds> [camera_index]
-```
+Frames are saved to `~/Documents/CameraShot/` by default. Only the 30 most recent frames are kept.
 
-**Arguments:**
+## Project layout
 
-| # | Name | Default | Description |
-|---|---|---|---|
-| 1 | `interval_seconds` | — | Seconds between saved frames (e.g. `5`) |
-| 2 | `camera_index` | interactive menu | Camera to use (0 = first, 1 = second, …) |
+| File | Purpose |
+|---|---|
+| `AppDelegate.swift` | App lifecycle, permissions, and wiring between the controllers |
+| `SetupWindowController.swift` | Settings window (capture source, prompts, API keys) |
+| `CaptureWindowController.swift` | Floating results window and its WebView tabs |
+| `CameraController.swift` / `ScreenCaptureController.swift` | Frame capture |
+| `FrameChangeFilter.swift` | Skips near-duplicate frames |
+| `AIProcessor.swift` | Gemini and OpenAI vision requests |
+| `RealtimeAudioAIController.swift` | OpenAI Realtime WebSocket audio |
+| `GPTChatController.swift` | Text chat |
+| `EncryptedKeyStore.swift` / `PassphraseManager.swift` | Encrypted API key storage |
 
-## Output
+Rendering uses bundled copies of [marked](https://github.com/markedjs/marked), [highlight.js](https://github.com/highlightjs/highlight.js), and [Mermaid](https://github.com/mermaid-js/mermaid), found in `Sources/CameraShot/Resources/`.
 
-Frames are saved by default to `~/Documents/CameraShot/frame_YYYYMMDD_HHMMSS.png` at 100% quality. You can choose a different folder in the setup window (Browse…) if you prefer.
+## Privacy
 
-## Notes
+- Captured frames and audio go only to the AI provider you configure. They are sent directly from your Mac, with no relay server in between.
+- The key encryption is tied to this specific Mac. It stops someone from reading your keys from a copied file. It does **not** protect them from another process running as your user, because the derivation formula is visible in the source.
 
-- **Zoom / Teams conflict** — if the target app has exclusive camera access, quit it first, or pass a different camera index to use a different device (e.g. a continuity camera or USB webcam).
-- **Resolution** — the session requests 4K, falls back to 1080p, then "high", depending on what the camera supports.
-- **Quit** — press ⌘Q or close the preview window.
+## Disclaimer
+
+The hide-from-screen-sharing feature makes this tool easy to misuse. Use it only where you are allowed to: respect the rules of interviews, exams, meetings, and recordings, and the laws that apply to you.

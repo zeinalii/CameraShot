@@ -18,6 +18,7 @@
     <array>
         <string>/Documents</string>
         <string>/Documents/CameraShot</string>
+        <string>/.codex</string>
     </array>
 </dict>
 </plist>

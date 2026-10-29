@@ -5,8 +5,9 @@ CONFIG    ?= release
 SIGN_IDENTITY ?=
 NOTARY_PROFILE ?=
 HIDE_DOCK ?= 0
+INSTALL_DIR ?= /Applications
 
-.PHONY: build run dev clean
+.PHONY: build install run dev clean
 
 build:
 	swift build -c $(CONFIG)
@@ -40,22 +41,23 @@ build:
 	fi; \
 	if [ -z "$$SIGNER" ]; then SIGNER="-"; fi; \
 	echo "Using signer: $$SIGNER"; \
-	OPENCODE_BIN=$$(command -v opencode || true); \
-	if [ -n "$$OPENCODE_BIN" ]; then \
-		REAL_BIN=$$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$$OPENCODE_BIN"); \
-		cp "$$REAL_BIN" $(MACOS)/opencode; \
-		rm -f $(RESOURCES)/opencode; \
-		chmod 755 $(MACOS)/opencode; \
-		xattr -d com.apple.quarantine $(MACOS)/opencode 2>/dev/null || true; \
-		xattr -d com.apple.provenance $(MACOS)/opencode 2>/dev/null || true; \
+	rm -f $(MACOS)/opencode $(RESOURCES)/opencode; \
+	CODEX_BIN=$$(command -v codex || true); \
+	if [ -n "$$CODEX_BIN" ]; then \
+		NATIVE_CODEX=$$(python3 -c 'import glob, os, sys; p=os.path.realpath(sys.argv[1]); pkg=os.path.dirname(os.path.dirname(p)) if p.endswith("/@openai/codex/bin/codex.js") else ""; pats=[os.path.join(pkg,"vendor","*","bin","codex"), os.path.join(pkg,"vendor","*","codex","codex"), os.path.join(pkg,"node_modules","@openai","codex-*","vendor","*","bin","codex"), os.path.join(pkg,"node_modules","@openai","codex-*","vendor","*","codex","codex")] if pkg else []; matches=[m for pat in pats for m in glob.glob(pat) if os.path.isfile(m) and os.access(m, os.X_OK)]; print(matches[0] if matches else p)' "$$CODEX_BIN"); \
+		if [ ! -x "$$NATIVE_CODEX" ]; then echo "✗ Resolved Codex is not executable: $$NATIVE_CODEX" >&2; exit 1; fi; \
+		cp "$$NATIVE_CODEX" $(MACOS)/codex; \
+		chmod 755 $(MACOS)/codex; \
+		xattr -d com.apple.quarantine $(MACOS)/codex 2>/dev/null || true; \
+		xattr -d com.apple.provenance $(MACOS)/codex 2>/dev/null || true; \
 		if [ "$$SIGNER" = "-" ]; then \
-			codesign --force --sign - $(MACOS)/opencode; \
+			codesign --force --sign - $(MACOS)/codex; \
 		else \
-			codesign --force --sign "$$SIGNER" --options runtime --timestamp $(MACOS)/opencode; \
+			codesign --force --sign "$$SIGNER" --options runtime --timestamp $(MACOS)/codex; \
 		fi; \
-		echo "✓ Bundled opencode: $$REAL_BIN"; \
+		echo "✓ Bundled Codex CLI: $$NATIVE_CODEX"; \
 	else \
-		echo "⚠ opencode not found in PATH while building"; \
+		echo "⚠ Codex CLI not found in PATH while building; Codex tab will ask for it at runtime"; \
 	fi
 	@cp Info.plist $(APP)/Contents/Info.plist
 	@xattr -dr com.apple.quarantine $(APP) 2>/dev/null || true
@@ -72,16 +74,24 @@ build:
 	fi
 	@echo "✓ Built: $(APP)"
 
+install: build
+	@ditto "$(APP)" "$(INSTALL_DIR)/$(APP)"
+	@/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$(INSTALL_DIR)/$(APP)"
+	@mdimport "$(INSTALL_DIR)/$(APP)" 2>/dev/null || true
+	@echo "✓ Installed: $(INSTALL_DIR)/$(APP)"
+
 # Usage: make run ARGS="5"         (5-second interval, camera menu)
 #        make run ARGS="5 1"       (5-second interval, camera index 1)
 #        make run HIDE_DOCK=1      (launch without a Dock icon)
 run: build
-	CAMERASHOT_HIDE_DOCK=$(HIDE_DOCK) ./$(APP)/Contents/MacOS/CameraShot $(ARGS)
+	@CODEX_BIN=$$(command -v codex || true); \
+	CAMERASHOT_HIDE_DOCK=$(HIDE_DOCK) CODEX_BIN="$$CODEX_BIN" ./$(APP)/Contents/MacOS/CameraShot $(ARGS)
 
 dev:
 	$(MAKE) build CONFIG=debug SIGN_IDENTITY=-
 	@echo "✓ Launching debug build. Logs will appear below."
-	CAMERASHOT_HIDE_DOCK=$(HIDE_DOCK) ./$(APP)/Contents/MacOS/CameraShot $(ARGS)
+	@CODEX_BIN=$$(command -v codex || true); \
+	CAMERASHOT_HIDE_DOCK=$(HIDE_DOCK) CODEX_BIN="$$CODEX_BIN" ./$(APP)/Contents/MacOS/CameraShot $(ARGS)
 
 clean:
 	rm -rf .build $(APP)

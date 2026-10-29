@@ -11,8 +11,10 @@ struct RealtimeAudioConfig {
 
     var passiveEnabled: Bool = false
     var instantEnabled: Bool = false
+    var instant2Enabled: Bool = false
     var passiveSystemPrompt: String = Self.defaultPassivePrompt
     var instantSystemPrompt: String = Self.defaultInstantPrompt
+    var instant2SystemPrompt: String = Self.defaultInstantPrompt
 
-    var enabled: Bool { passiveEnabled || instantEnabled }
+    var enabled: Bool { passiveEnabled || instantEnabled || instant2Enabled }
 }

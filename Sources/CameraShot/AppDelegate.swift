@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: – Realtime Audio controllers
     private var passiveAudioCtrl: RealtimeAudioAIController?
     private var instantVoiceCtrl: RealtimeAudioAIController?
+    private var instantVoice2Ctrl: RealtimeAudioAIController?
     private var chatCtrl: GPTChatController?
     private var windowPrivacyObserversInstalled = false
     private var documentsScopeURL: URL?
@@ -49,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         screenCtrl?.stop()
         passiveAudioCtrl?.stop()
         instantVoiceCtrl?.stop()
+        instantVoice2Ctrl?.stop()
         chatCtrl?.cancel()
         documentsScopeURL?.stopAccessingSecurityScopedResource()
         documentsScopeURL = nil
@@ -231,15 +233,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildMenu() {
         let bar  = NSMenu()
-        let item = NSMenuItem()
-        let menu = NSMenu(title: "CameraShot")
-        menu.addItem(withTitle: "Settings…",       action: #selector(openSettings),               keyEquivalent: ",")
-        menu.addItem(withTitle: "AI Responses…",   action: #selector(showAIResults),              keyEquivalent: "r")
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit CameraShot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        item.submenu = menu
-        bar.addItem(item)
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu(title: "CameraShot")
+        appMenu.addItem(withTitle: "Settings…",       action: #selector(openSettings),               keyEquivalent: ",")
+        appMenu.addItem(withTitle: "AI Responses…",   action: #selector(showAIResults),              keyEquivalent: "r")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit CameraShot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        bar.addItem(appItem)
+
+        let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editItem.submenu = makeEditMenu()
+        bar.addItem(editItem)
         NSApp.mainMenu = bar
+    }
+
+    private func makeEditMenu() -> NSMenu {
+        let menu = NSMenu(title: "Edit")
+
+        menu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+
+        let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(redo)
+
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        menu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        menu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        menu.addItem(withTitle: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: "")
+
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        return menu
     }
 
     @objc private func openSettings() {
@@ -251,6 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         aiProcessor = nil
         passiveAudioCtrl?.stop(); passiveAudioCtrl = nil
         instantVoiceCtrl?.stop(); instantVoiceCtrl = nil
+        instantVoice2Ctrl?.stop(); instantVoice2Ctrl = nil
         chatCtrl?.cancel(); chatCtrl = nil
         showSetup()
     }
@@ -438,6 +465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.aiPaused = false
                 self.passiveAudioCtrl?.stop(); self.passiveAudioCtrl = nil
                 self.instantVoiceCtrl?.stop(); self.instantVoiceCtrl = nil
+                self.instantVoice2Ctrl?.stop(); self.instantVoice2Ctrl = nil
                 self.chatCtrl?.cancel(); self.chatCtrl = nil
                 self.captureCtrl = nil
                 self.showSetup()
@@ -464,9 +492,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startRealtimeAudioControllersIfNeeded(config: RealtimeAudioConfig) {
         DevLog.log(
             "RealtimeAudio",
-            "start requested passiveEnabled=\(config.passiveEnabled ? 1 : 0) instantEnabled=\(config.instantEnabled ? 1 : 0) openAIKey=\((sessionCredentials.openAIAPIKey?.isEmpty == false) ? 1 : 0) passivePromptChars=\(config.passiveSystemPrompt.count) instantPromptChars=\(config.instantSystemPrompt.count)"
+            "start requested passiveEnabled=\(config.passiveEnabled ? 1 : 0) instantEnabled=\(config.instantEnabled ? 1 : 0) instant2Enabled=\(config.instant2Enabled ? 1 : 0) openAIKey=\((sessionCredentials.openAIAPIKey?.isEmpty == false) ? 1 : 0) passivePromptChars=\(config.passiveSystemPrompt.count) instantPromptChars=\(config.instantSystemPrompt.count) instant2PromptChars=\(config.instant2SystemPrompt.count)"
         )
-        captureCtrl?.setInstantVoiceAvailable(config.instantEnabled)
+        if config.instantEnabled {
+            captureCtrl?.setInstantVoiceStarting()
+        } else {
+            captureCtrl?.setInstantVoiceAvailable(false)
+        }
+        if config.instant2Enabled {
+            captureCtrl?.setInstantVoice2Starting()
+        } else {
+            captureCtrl?.setInstantVoice2Available(false)
+        }
         if !config.passiveEnabled {
             captureCtrl?.updateAudioAIState(.unavailable)
         }
@@ -477,12 +514,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let apiKey = sessionCredentials.openAIAPIKey, !apiKey.isEmpty else {
             DevLog.log("RealtimeAudio", "start failed: missing OpenAI API key")
             captureCtrl?.setInstantVoiceAvailable(false)
+            captureCtrl?.setInstantVoice2Available(false)
             if config.passiveEnabled {
                 captureCtrl?.updateAudioAIState(.unavailable)
                 captureCtrl?.appendAudioAIError("No OpenAI API key is saved. Add it in the API Keys tab.")
             }
             if config.instantEnabled {
                 captureCtrl?.appendInstantVoiceError("No OpenAI API key is saved. Add it in the API Keys tab.")
+            }
+            if config.instant2Enabled {
+                captureCtrl?.appendInstantVoice2Error("No OpenAI API key is saved. Add it in the API Keys tab.")
             }
             return
         }
@@ -499,6 +540,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             passive.onDone  = { [weak captureWindow] in captureWindow?.finalizeAudioAI() }
             passive.onError = { [weak captureWindow] msg in captureWindow?.appendAudioAIError(msg) }
             passive.onStatus = { msg in DevLog.log("RealtimeAudio", "passive status=\(msg)") }
+            passive.onAudioLevel = { [weak captureWindow] level in
+                captureWindow?.updateSystemAudioLevel(level)
+            }
             passive.onPassiveState = { [weak captureWindow] state in
                 DevLog.log("RealtimeAudio", "passive state=\(state)")
                 captureWindow?.updateAudioAIState(state)
@@ -535,6 +579,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             instant.onDone  = { [weak captureWindow] in captureWindow?.finalizeInstantVoice() }
             instant.onError = { [weak captureWindow] msg in captureWindow?.appendInstantVoiceError(msg) }
             instant.onStatus = { msg in DevLog.log("RealtimeAudio", "instant status=\(msg)") }
+            instant.onReadyChanged = { [weak captureWindow] ready in
+                DevLog.log("RealtimeAudio", "instant ready=\(ready ? 1 : 0)")
+                if ready {
+                    captureWindow?.setInstantVoiceAvailable(true)
+                } else {
+                    captureWindow?.setInstantVoiceStarting()
+                }
+            }
             instantVoiceCtrl = instant
 
             captureCtrl?.onInstantVoiceHoldChanged = { [weak instant] isHolding in
@@ -560,6 +612,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             instantVoiceCtrl = nil
             captureCtrl?.onInstantVoiceHoldChanged = nil
+        }
+
+        if config.instant2Enabled {
+            let instant2 = RealtimeAudioAIController(
+                apiKey: apiKey,
+                systemPrompt: config.instant2SystemPrompt,
+                mode: .pushToTalkSystemAudio
+            )
+            instant2.onChunk = { [weak captureWindow] chunk in captureWindow?.appendInstantVoice2Chunk(chunk) }
+            instant2.onDone  = { [weak captureWindow] in captureWindow?.finalizeInstantVoice2() }
+            instant2.onError = { [weak captureWindow] msg in captureWindow?.appendInstantVoice2Error(msg) }
+            instant2.onStatus = { msg in DevLog.log("RealtimeAudio", "instant2 status=\(msg)") }
+            instant2.onReadyChanged = { [weak captureWindow] ready in
+                DevLog.log("RealtimeAudio", "instant2 ready=\(ready ? 1 : 0)")
+                if ready {
+                    captureWindow?.setInstantVoice2Available(true)
+                } else {
+                    captureWindow?.setInstantVoice2Starting()
+                }
+            }
+            instantVoice2Ctrl = instant2
+
+            captureCtrl?.onInstantVoice2HoldChanged = { [weak instant2] isHolding in
+                DevLog.log("RealtimeAudio", "instant2 hold changed active=\(isHolding ? 1 : 0)")
+                if isHolding {
+                    instant2?.beginPushToTalk()
+                } else {
+                    instant2?.endPushToTalk()
+                }
+            }
+
+            Task { [weak instant2] in
+                do { try await instant2?.start() }
+                catch {
+                    DevLog.log("RealtimeAudio", "instant2 start failed error=\(error.localizedDescription)")
+                    await MainActor.run {
+                        captureWindow?.setInstantVoice2Available(false)
+                        captureWindow?.appendInstantVoice2Error(
+                            "Instant Audio2 setup failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        } else {
+            instantVoice2Ctrl = nil
+            captureCtrl?.onInstantVoice2HoldChanged = nil
         }
     }
 
@@ -600,6 +697,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.aiPaused = false
             self.passiveAudioCtrl?.stop(); self.passiveAudioCtrl = nil
             self.instantVoiceCtrl?.stop(); self.instantVoiceCtrl = nil
+            self.instantVoice2Ctrl?.stop(); self.instantVoice2Ctrl = nil
             self.chatCtrl?.cancel(); self.chatCtrl = nil
             self.captureCtrl = nil
             self.showSetup()

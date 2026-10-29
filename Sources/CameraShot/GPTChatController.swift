@@ -3,7 +3,8 @@ import Foundation
 // MARK: - GPTChatController
 
 final class GPTChatController: @unchecked Sendable {
-    static let model = "gpt-5.5"
+    static let model = "gpt-5.6-sol"
+    static let displayName = "GPT-5.6 Sol"
 
     var onChunk: ((String) -> Void)?
     var onDone: (() -> Void)?
@@ -50,7 +51,7 @@ final class GPTChatController: @unchecked Sendable {
         let task = Task { [weak self] in
             guard let self else { return }
             do {
-                self.fire { self.onStatus?("Sending message to GPT-5.5...") }
+                self.fire { self.onStatus?("Sending message to \(Self.displayName)...") }
                 let completedID = try await self.run(
                     message: trimmed,
                     attachmentURL: attachmentURL,
@@ -300,7 +301,7 @@ enum GPTChatError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .emptyResponse:
-            return "GPT-5.5 returned an empty response."
+            return "\(GPTChatController.displayName) returned an empty response."
         case .http(let status, let message):
             return "OpenAI chat HTTP \(status): \(message)"
         case .requestBuildFailed:

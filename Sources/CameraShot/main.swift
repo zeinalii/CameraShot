@@ -4,8 +4,7 @@ let app      = NSApplication.shared
 let delegate = AppDelegate()
 NSWindow.allowsAutomaticWindowTabbing = false
 
-let hideDockIcon = ProcessInfo.processInfo.environment["CAMERASHOT_HIDE_DOCK"] == "1"
-    || CommandLine.arguments.contains("--hide-dock")
-app.setActivationPolicy(hideDockIcon ? .accessory : .regular)
+// CameraShot is a windowed utility, but it should not occupy space in the Dock.
+app.setActivationPolicy(.accessory)
 app.delegate = delegate
 app.run()

@@ -512,7 +512,7 @@ private final class VisualAICallbackBox: @unchecked Sendable {
 
 // MARK: - AIProcessor
 
-/// Latest-only visual AI processor with Gemini primary and optional OpenAI hedged fallback.
+/// Latest-only visual AI processor with OpenAI primary and optional Gemini fallback.
 final class AIProcessor: @unchecked Sendable {
     var onProcessingStarted: ((URL, Int, Int) -> Void)? {
         get { callbacks.onProcessingStarted }
@@ -604,7 +604,7 @@ private actor VisualAIOrchestrator {
         case providerDelta(AIProviderID, String)
         case providerCompleted(AIProviderID)
         case providerFailed(AIProviderID, String)
-        case startOpenAI
+        case startSecondary
         case firstTokenDeadline
         case completionDeadline
         case visibleStall(AIProviderID, Int)
@@ -749,8 +749,7 @@ private actor VisualAIOrchestrator {
             DevLog.log("VisualAI", "starting runLoop")
             Task { await self.runLoop() }
         } else {
-            DevLog.log("VisualAI", "superseding active attempt for enqueued screenshot gen=\(generationCounter) reason=\(reason)")
-            activeAttempt?.supersede()
+            DevLog.log("VisualAI", "queued latest screenshot behind active attempt gen=\(generationCounter) reason=\(reason)")
         }
     }
 
@@ -803,10 +802,6 @@ private actor VisualAIOrchestrator {
                 callbacks.discard(imageURL: image.url)
                 return
             case .failed(let message):
-                if pendingImage != nil {
-                    callbacks.discard(imageURL: image.url)
-                    return
-                }
                 guard retryIndex < maxRetries else {
                     callbacks.error(message, imageURL: image.url)
                     return
@@ -829,13 +824,15 @@ private actor VisualAIOrchestrator {
             return .failed("Could not read screenshot at \(image.url.lastPathComponent)")
         }
 
-        guard let geminiClient else {
-            DevLog.log("VisualAI", "runAttempt failed no Gemini client")
-            return .failed("No Google Gemini API key is saved. Add it in the API Keys tab.")
+        guard let primaryClient = openAIClient else {
+            DevLog.log("VisualAI", "runAttempt failed no OpenAI client")
+            return .failed("No OpenAI API key is saved. Add it in the API Keys tab.")
         }
+        let secondaryClient = geminiClient
+        let primaryProvider = primaryClient.providerID
 
         let mimeType = image.url.pathExtension.lowercased() == "png" ? "image/png" : "image/jpeg"
-        DevLog.log("VisualAI", "runAttempt image loaded bytes=\(imageData.count) mime=\(mimeType) openAIConfigured=\(openAIClient == nil ? 0 : 1)")
+        DevLog.log("VisualAI", "runAttempt image loaded bytes=\(imageData.count) mime=\(mimeType) primary=\(primaryProvider.rawValue) geminiConfigured=\(secondaryClient == nil ? 0 : 1)")
         var continuation: AsyncStream<AttemptEvent>.Continuation?
         let events = AsyncStream<AttemptEvent> { continuation = $0 }
         guard let eventSink = continuation else {
@@ -845,7 +842,9 @@ private actor VisualAIOrchestrator {
 
         let attemptControl = AttemptControl(eventSink: eventSink)
         activeAttempt = attemptControl
+        var stallTask: Task<Void, Never>?
         defer {
+            stallTask?.cancel()
             attemptControl.finish()
             if activeAttempt === attemptControl {
                 activeAttempt = nil
@@ -858,12 +857,9 @@ private actor VisualAIOrchestrator {
         var providerFailed = Set<AIProviderID>()
         var visibleProvider: AIProviderID?
         var firstTextSeen = false
+        var completionDeadlineScheduled = false
         var finished = false
         var stallToken = 0
-
-        func hasNewerScreenshot() -> Bool {
-            generationCounter > image.generation
-        }
 
         func finishSuperseded() -> AttemptOutcome {
             DevLog.log("VisualAI", "finishSuperseded gen=\(image.generation) file=\(image.url.lastPathComponent)")
@@ -882,8 +878,7 @@ private actor VisualAIOrchestrator {
         func startProvider(_ client: AIProviderClient) {
             guard !startedProviders.contains(client.providerID),
                   !finished,
-                  !attemptControl.isStopped,
-                  !hasNewerScreenshot() else { return }
+                  !attemptControl.isStopped else { return }
             startedProviders.insert(client.providerID)
             DevLog.log("VisualAI", "provider start provider=\(client.providerID.rawValue) gen=\(image.generation) retry=\(retryIndex)")
             callbacks.status("\(client.providerID.displayName) started", imageURL: image.url)
@@ -913,26 +908,28 @@ private actor VisualAIOrchestrator {
             attemptControl.addTask(task)
         }
 
-        func startOpenAIIfAvailable() {
-            guard let openAIClient,
-                  !startedProviders.contains(openAIClient.providerID),
+        func startSecondaryIfAvailable() {
+            guard let secondaryClient,
+                  !startedProviders.contains(secondaryClient.providerID),
                   !finished,
-                  !attemptControl.isStopped,
-                  !hasNewerScreenshot() else {
+                  !attemptControl.isStopped else {
                 DevLog.log(
                     "VisualAI",
-                    "startOpenAI skipped configured=\(openAIClient == nil ? 0 : 1) alreadyStarted=\(startedProviders.contains(.openAI) ? 1 : 0) finished=\(finished ? 1 : 0) stopped=\(attemptControl.isStopped ? 1 : 0) newer=\(hasNewerScreenshot() ? 1 : 0)"
+                    "startSecondary skipped configured=\(secondaryClient == nil ? 0 : 1) alreadyStarted=\(startedProviders.contains(.gemini) ? 1 : 0) finished=\(finished ? 1 : 0) stopped=\(attemptControl.isStopped ? 1 : 0)"
                 )
                 return
             }
-            DevLog.log("VisualAI", "startOpenAI")
-            startProvider(openAIClient)
+            DevLog.log("VisualAI", "startSecondary provider=\(secondaryClient.providerID.rawValue)")
+            startProvider(secondaryClient)
         }
 
         func completedProviderWithText() -> AIProviderID? {
-            providerCompleted
+            let completedWithText = providerCompleted
                 .filter { !(providerText[$0] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                .max { (providerText[$0] ?? "").count < (providerText[$1] ?? "").count }
+            if completedWithText.contains(primaryProvider) {
+                return primaryProvider
+            }
+            return completedWithText.max { (providerText[$0] ?? "").count < (providerText[$1] ?? "").count }
         }
 
         func providerWithBestText(excluding excluded: AIProviderID? = nil) -> AIProviderID? {
@@ -944,19 +941,40 @@ private actor VisualAIOrchestrator {
                 .key
         }
 
+        func hasUsableText(_ provider: AIProviderID) -> Bool {
+            !(providerText[provider] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        func providerIsActive(_ provider: AIProviderID) -> Bool {
+            startedProviders.contains(provider) &&
+                !providerCompleted.contains(provider) &&
+                !providerFailed.contains(provider)
+        }
+
+        func scheduleCompletionDeadlineIfNeeded() {
+            guard !completionDeadlineScheduled else { return }
+            completionDeadlineScheduled = true
+            attemptControl.addTask(Task {
+                try? await Task.sleep(nanoseconds: 23_000_000_000)
+                guard !Task.isCancelled else { return }
+                DevLog.log("VisualAI", "timer 23s completionDeadline gen=\(image.generation)")
+                eventSink.yield(.completionDeadline)
+            })
+        }
+
         func scheduleVisibleStallCheck(for provider: AIProviderID) {
             stallToken += 1
             let token = stallToken
-            let task = Task {
+            stallTask?.cancel()
+            stallTask = Task {
                 try? await Task.sleep(nanoseconds: 11_000_000_000)
                 guard !Task.isCancelled else { return }
                 eventSink.yield(.visibleStall(provider, token))
             }
-            attemptControl.addTask(task)
         }
 
         func finishDelivered(provider: AIProviderID, partial: Bool) -> AttemptOutcome {
-            guard !attemptControl.isSuperseded, !hasNewerScreenshot() else {
+            guard !attemptControl.isSuperseded else {
                 return finishSuperseded()
             }
             guard !attemptControl.isCancelled, !isCancelled else {
@@ -980,7 +998,7 @@ private actor VisualAIOrchestrator {
         }
 
         func failAttempt(_ message: String) -> AttemptOutcome {
-            if attemptControl.isSuperseded || hasNewerScreenshot() {
+            if attemptControl.isSuperseded {
                 return finishSuperseded()
             }
             if attemptControl.isCancelled || isCancelled {
@@ -988,17 +1006,17 @@ private actor VisualAIOrchestrator {
             }
             finished = true
             attemptControl.finish()
-            DevLog.log("VisualAI", "failAttempt gen=\(image.generation) retry=\(retryIndex) message=\(message) pendingNewer=\(pendingImage == nil ? 0 : 1)")
-            return pendingImage != nil ? .superseded : .failed(message)
+            DevLog.log("VisualAI", "failAttempt gen=\(image.generation) retry=\(retryIndex) message=\(message) pendingQueued=\(pendingImage == nil ? 0 : 1)")
+            return .failed(message)
         }
 
-        startProvider(geminiClient)
+        startProvider(primaryClient)
 
         attemptControl.addTask(Task {
             try? await Task.sleep(nanoseconds: 8_000_000_000)
             guard !Task.isCancelled else { return }
-            DevLog.log("VisualAI", "timer 8s startOpenAI gen=\(image.generation)")
-            eventSink.yield(.startOpenAI)
+            DevLog.log("VisualAI", "timer 8s startSecondary gen=\(image.generation)")
+            eventSink.yield(.startSecondary)
         })
         attemptControl.addTask(Task {
             try? await Task.sleep(nanoseconds: 18_000_000_000)
@@ -1009,7 +1027,7 @@ private actor VisualAIOrchestrator {
 
         for await event in events {
             DevLog.log("VisualAI", "attempt event gen=\(image.generation) event=\(event)")
-            if attemptControl.isSuperseded || hasNewerScreenshot() {
+            if attemptControl.isSuperseded {
                 return finishSuperseded()
             }
             if attemptControl.isCancelled {
@@ -1026,11 +1044,11 @@ private actor VisualAIOrchestrator {
             case .cancelled:
                 return finishCancelled()
 
-            case .startOpenAI:
+            case .startSecondary:
                 if !firstTextSeen {
-                    startOpenAIIfAvailable()
+                    startSecondaryIfAvailable()
                 } else {
-                    DevLog.log("VisualAI", "startOpenAI timer ignored firstTextSeen=1 gen=\(image.generation)")
+                    DevLog.log("VisualAI", "startSecondary timer ignored firstTextSeen=1 gen=\(image.generation)")
                 }
 
             case .firstTokenDeadline:
@@ -1039,6 +1057,10 @@ private actor VisualAIOrchestrator {
                 }
 
             case .completionDeadline:
+                if hasUsableText(primaryProvider), providerIsActive(primaryProvider) {
+                    DevLog.log("VisualAI", "completionDeadline ignored primaryActive=1 provider=\(primaryProvider.rawValue) chars=\((providerText[primaryProvider] ?? "").count) gen=\(image.generation)")
+                    break
+                }
                 if let completed = completedProviderWithText() {
                     return finishDelivered(provider: completed, partial: false)
                 }
@@ -1049,6 +1071,10 @@ private actor VisualAIOrchestrator {
 
             case .visibleStall(let provider, let token):
                 guard token == stallToken, visibleProvider == provider, !finished else { break }
+                if provider == primaryProvider, hasUsableText(primaryProvider), providerIsActive(primaryProvider) {
+                    DevLog.log("VisualAI", "visibleStall keeping active primary provider=\(primaryProvider.rawValue) chars=\((providerText[primaryProvider] ?? "").count) gen=\(image.generation)")
+                    break
+                }
                 if let completed = completedProviderWithText(), completed != provider {
                     callbacks.status("Switched to \(completed.displayName) after stall", imageURL: image.url)
                     visibleProvider = completed
@@ -1075,12 +1101,13 @@ private actor VisualAIOrchestrator {
                     callbacks.status("Streaming from \(provider.displayName)", imageURL: image.url)
                     callbacks.stream(accumulated, imageURL: image.url)
                     scheduleVisibleStallCheck(for: provider)
-                    attemptControl.addTask(Task {
-                        try? await Task.sleep(nanoseconds: 23_000_000_000)
-                        guard !Task.isCancelled else { return }
-                        DevLog.log("VisualAI", "timer 23s completionDeadline gen=\(image.generation)")
-                        eventSink.yield(.completionDeadline)
-                    })
+                    scheduleCompletionDeadlineIfNeeded()
+                } else if provider == primaryProvider, visibleProvider != primaryProvider {
+                    visibleProvider = provider
+                    DevLog.log("VisualAI", "primary provider takeover provider=\(provider.rawValue) chars=\(accumulated.count) gen=\(image.generation)")
+                    callbacks.status("Switched to \(provider.displayName) primary", imageURL: image.url)
+                    callbacks.replace(accumulated, imageURL: image.url)
+                    scheduleVisibleStallCheck(for: provider)
                 } else if visibleProvider == nil {
                     visibleProvider = provider
                     DevLog.log("VisualAI", "visible provider set provider=\(provider.rawValue) chars=\(accumulated.count) gen=\(image.generation)")
@@ -1099,8 +1126,8 @@ private actor VisualAIOrchestrator {
                 let text = providerText[provider] ?? ""
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     providerFailed.insert(provider)
-                    if provider == .gemini && !firstTextSeen {
-                        startOpenAIIfAvailable()
+                    if provider == primaryProvider && !firstTextSeen {
+                        startSecondaryIfAvailable()
                     }
                     if providerFailed.count == startedProviders.count && !firstTextSeen {
                         return failAttempt("AI providers returned empty responses.")
@@ -1109,6 +1136,17 @@ private actor VisualAIOrchestrator {
                 }
 
                 providerCompleted.insert(provider)
+                if provider == primaryProvider {
+                    if visibleProvider != provider {
+                        visibleProvider = provider
+                        callbacks.replace(text, imageURL: image.url)
+                    }
+                    return finishDelivered(provider: provider, partial: false)
+                }
+                if hasUsableText(primaryProvider), providerIsActive(primaryProvider) {
+                    DevLog.log("VisualAI", "secondary completed while primary active provider=\(provider.rawValue) primaryChars=\((providerText[primaryProvider] ?? "").count) gen=\(image.generation)")
+                    break
+                }
                 if visibleProvider == nil {
                     firstTextSeen = true
                     visibleProvider = provider
@@ -1121,8 +1159,8 @@ private actor VisualAIOrchestrator {
             case .providerFailed(let provider, let message):
                 providerFailed.insert(provider)
                 callbacks.status("\(provider.displayName) failed: \(message)", imageURL: image.url)
-                if provider == .gemini && !firstTextSeen {
-                    startOpenAIIfAvailable()
+                if provider == primaryProvider && !firstTextSeen {
+                    startSecondaryIfAvailable()
                 }
 
                 if visibleProvider == provider {
@@ -1147,7 +1185,7 @@ private actor VisualAIOrchestrator {
             }
         }
 
-        if attemptControl.isSuperseded || hasNewerScreenshot() {
+        if attemptControl.isSuperseded {
             return finishSuperseded()
         }
         if attemptControl.isCancelled || isCancelled {

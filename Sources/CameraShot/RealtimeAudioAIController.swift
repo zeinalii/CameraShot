@@ -25,6 +25,9 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
     var onError: ((String) -> Void)?
     var onStatus: ((String) -> Void)?
     var onPassiveState: ((PassiveState) -> Void)?
+    var onReadyChanged: ((Bool) -> Void)?
+    /// Normalized level (0...1) of the system audio currently entering passive Audio AI.
+    var onAudioLevel: ((Float) -> Void)?
 
     private let apiKey: String
     private let systemPrompt: String
@@ -33,6 +36,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
     private let session = URLSession(configuration: .ephemeral)
     private let stateLock = NSLock()
     private let sendStateQueue = DispatchQueue(label: "camerashot.realtime.send-state")
+    private let metricsQueue = DispatchQueue(label: "camerashot.realtime.metrics")
 
     private var wsTask: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
@@ -56,6 +60,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
     private var passiveSampleByteCount = 0
     private var passiveDroppedBeforeReady = 0
     private var passiveLastSampleLogAt: CFAbsoluteTime = 0
+    private var passiveLastLevelEmitAt: CFAbsoluteTime = 0
 
     private var isRecordingPushToTalk = false
     private var recordedPushToTalkAudio = Data()
@@ -73,6 +78,14 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
     private let rotationRetryInterval: TimeInterval = 30
     private let maxReconnectAttempts = 8
 
+    private enum PushToTalkStartResult {
+        case started(Int)
+        case wrongMode
+        case stopped
+        case alreadyRecording
+        case notReady
+    }
+
     init(
         apiKey: String,
         systemPrompt: String,
@@ -87,11 +100,12 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
 
     func start() async throws {
         log("start model=\(model)")
+        guard !isStopped else { throw CancellationError() }
         notifyPassiveState(.starting)
         try connectWebSocket()
+        guard !isStopped else { throw CancellationError() }
         if mode == .passiveSystemAudio {
-            passiveCaptureToken += 1
-            try await startPassiveSystemAudioCapture(token: passiveCaptureToken)
+            try await startPassiveSystemAudioCapture(token: nextPassiveCaptureToken())
         }
         log("start complete")
     }
@@ -102,50 +116,53 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         rotationWorkItem = nil
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
-        receiveTask?.cancel()
-        receiveTask = nil
+        takeReceiveTask()?.cancel()
         let task = locked {
             stopped = true
-            realtimeReady = false
             didSendSessionUpdate = false
             responseInFlight = false
+            isRecordingPushToTalk = false
+            pushToTalkSystemCaptureToken += 1
             let current = wsTask
             wsTask = nil
             return current
         }
+        setRealtimeReady(false)
         task?.cancel(with: .goingAway, reason: nil)
         clearPassiveSendBacklog()
+        recordingQueue.async { [weak self] in
+            self?.recordedPushToTalkAudio.removeAll(keepingCapacity: false)
+            self?.pushToTalkLimitReached = false
+        }
         stopSystemAudioCapture(reason: "controller stop")
+        notifyAudioLevel(0, force: true)
         log("stop complete")
     }
 
     func beginPushToTalk() {
-        guard mode == .pushToTalkSystemAudio else {
+        let startResult = beginPushToTalkState()
+        let token: Int
+        switch startResult {
+        case .started(let value):
+            token = value
+        case .wrongMode:
             log("beginPushToTalk ignored wrong-mode")
             return
-        }
-        guard !isStopped else {
+        case .stopped:
             log("beginPushToTalk ignored stopped")
             return
-        }
-        guard !isRecordingPushToTalk else {
+        case .alreadyRecording:
             log("beginPushToTalk ignored already-recording")
             return
-        }
-        guard isRealtimeReady else {
+        case .notReady:
             log("beginPushToTalk ignored realtime-not-ready")
             fire { self.onStatus?("Realtime is reconnecting. Try again in a moment.") }
             return
         }
         log("beginPushToTalk start")
-        isRecordingPushToTalk = true
-        pushToTalkSystemCaptureToken += 1
-        let token = pushToTalkSystemCaptureToken
-        instantSampleBufferCount = 0
-        instantSampleByteCount = 0
-        instantLastSampleLogAt = 0
+        resetInstantSampleMetrics()
         recordingQueue.sync {
-            recordedPushToTalkAudio.removeAll(keepingCapacity: true)
+            recordedPushToTalkAudio.removeAll(keepingCapacity: false)
             pushToTalkLimitReached = false
         }
         if hasResponseInFlight {
@@ -163,17 +180,15 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             log("endPushToTalk ignored wrong-mode")
             return
         }
-        guard isRecordingPushToTalk else {
+        guard endPushToTalkState() else {
             log("endPushToTalk ignored not-recording")
             return
         }
-        isRecordingPushToTalk = false
-        pushToTalkSystemCaptureToken += 1
         stopSystemAudioCapture(reason: "instant release")
 
         let audio = recordingQueue.sync { recordedPushToTalkAudio }
         recordingQueue.async { [weak self] in
-            self?.recordedPushToTalkAudio.removeAll(keepingCapacity: true)
+            self?.recordedPushToTalkAudio.removeAll(keepingCapacity: false)
         }
 
         guard audio.count > 1_000 else {
@@ -204,18 +219,15 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             log("setPassiveAudioPaused ignored wrong-mode paused=\(paused ? 1 : 0)")
             return
         }
-        guard passiveAudioPaused != paused else {
+        guard let token = setPassiveAudioPausedIfChanged(paused) else {
             log("setPassiveAudioPaused unchanged paused=\(paused ? 1 : 0)")
             return
         }
 
-        passiveAudioPaused = paused
-        passiveCaptureToken += 1
-        let token = passiveCaptureToken
-
         if paused {
             log("passive audio paused")
             stopSystemAudioCapture(reason: "passive pause")
+            notifyAudioLevel(0, force: true)
             clearPassiveSendBacklog()
             notifyPassiveState(.paused)
             if hasResponseInFlight {
@@ -249,7 +261,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             log("forcePassiveTurnEnd ignored stopped")
             return
         }
-        guard !passiveAudioPaused else {
+        guard !isPassiveAudioPaused else {
             log("forcePassiveTurnEnd ignored paused")
             fire { self.onStatus?("Audio AI is paused.") }
             return
@@ -284,6 +296,10 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             log("connectWebSocket skipped existing-task")
             return
         }
+        guard !isStopped else {
+            log("connectWebSocket skipped stopped")
+            throw CancellationError()
+        }
         guard let url = URL(string: "wss://api.openai.com/v1/realtime?model=\(model)") else {
             throw RealtimeAudioAIError.invalidURL
         }
@@ -293,18 +309,35 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
         let task = session.webSocketTask(with: req)
-        locked {
+        let assigned = locked {
+            guard !stopped, wsTask == nil else { return false }
             wsTask = task
-            stopped = false
             didSendSessionUpdate = false
             responseInFlight = false
-            realtimeReady = false
+            return true
         }
+        guard assigned else {
+            task.cancel(with: .goingAway, reason: nil)
+            log("connectWebSocket skipped stale start")
+            throw CancellationError()
+        }
+        setRealtimeReady(false)
         clearPassiveSendBacklog()
         task.resume()
         sendSessionUpdate()
         scheduleSessionRotation()
-        receiveTask = Task { [weak self] in await self?.receiveLoop() }
+        let newReceiveTask = Task { [weak self] in
+            guard let self else { return }
+            await self.receiveLoop()
+        }
+        let shouldKeepReceiveTask = locked {
+            guard !stopped, wsTask === task else { return false }
+            receiveTask = newReceiveTask
+            return true
+        }
+        if !shouldKeepReceiveTask {
+            newReceiveTask.cancel()
+        }
         log("connectWebSocket resumed")
     }
 
@@ -355,7 +388,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
 
     private func sendAudioAppend(_ pcm16: Data, live: Bool) {
         guard !pcm16.isEmpty, !isStopped else { return }
-        if live, mode == .passiveSystemAudio, passiveAudioPaused {
+        if live, mode == .passiveSystemAudio, isPassiveAudioPaused {
             return
         }
         if live, !isRealtimeReady {
@@ -363,7 +396,6 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             return
         }
 
-        let eventStartCount = audioAppendEventCount
         var offset = 0
         while offset < pcm16.count {
             let end = min(offset + maxAudioEventChunkBytes, pcm16.count)
@@ -384,12 +416,8 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
                     }
                 }
             }
-            audioAppendEventCount += 1
-            audioAppendByteCount += chunk.count
+            noteAudioAppendEvent(live: live, sourceBytes: pcm16.count, chunkBytes: chunk.count)
             offset = end
-        }
-        if !live || audioAppendEventCount == eventStartCount + 1 && audioAppendEventCount % 100 == 1 {
-            log("sent audio append live=\(live ? 1 : 0) bytes=\(pcm16.count) totalEvents=\(audioAppendEventCount) totalBytes=\(audioAppendByteCount)")
         }
     }
 
@@ -421,7 +449,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             self.log("send failed event=\(type) error=\(error.localizedDescription)")
             self.scheduleReconnect(reason: "send failed")
             if reportErrors {
-                self.fire { self.onError?("Realtime send failed: \(error.localizedDescription)") }
+                self.fire { self.onStatus?("Realtime send failed; reconnecting...") }
             }
         }
     }
@@ -447,7 +475,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
                 guard !isStopped else { return }
                 log("receiveLoop lost error=\(error.localizedDescription)")
                 notifyPassiveState(.reconnecting)
-                fire { self.onError?("Realtime connection lost: \(error.localizedDescription)") }
+                fire { self.onStatus?("Realtime connection lost; reconnecting...") }
                 scheduleReconnect(reason: "connection lost")
                 break
             }
@@ -476,28 +504,26 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             }
         case "response.done":
             locked { responseInFlight = false }
-            if !passiveAudioPaused {
+            if !isPassiveAudioPaused {
                 notifyPassiveState(.listening)
             }
             fire { self.onDone?() }
         case "response.cancelled":
             locked { responseInFlight = false }
         case "input_audio_buffer.speech_started":
-            if !passiveAudioPaused {
+            if !isPassiveAudioPaused {
                 notifyPassiveState(.listening)
             }
             fire { self.onStatus?("Listening...") }
         case "input_audio_buffer.speech_stopped":
-            if !passiveAudioPaused {
+            if !isPassiveAudioPaused {
                 notifyPassiveState(.waiting)
             }
             fire { self.onStatus?("Thinking...") }
         case "session.updated":
-            locked {
-                realtimeReady = true
-                reconnectAttempt = 0
-            }
-            if mode == .passiveSystemAudio, passiveCaptureActive, !passiveAudioPaused {
+            locked { reconnectAttempt = 0 }
+            setRealtimeReady(true)
+            if isPassiveCaptureListening {
                 notifyPassiveState(.listening)
             }
             fire { self.onStatus?("Realtime ready.") }
@@ -526,20 +552,14 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
     private func startPassiveSystemAudioCapture(token: Int) async throws {
         let stream = try await startSystemAudioCapture { [weak self] in
             guard let self else { return false }
-            return !self.isStopped
-                && self.mode == .passiveSystemAudio
-                && !self.passiveAudioPaused
-                && token == self.passiveCaptureToken
+            return self.shouldUsePassiveCapture(token: token)
         }
-        guard !isStopped,
-              mode == .passiveSystemAudio,
-              !passiveAudioPaused,
-              token == passiveCaptureToken else {
-            log("passive system audio capture started stale token=\(token) current=\(passiveCaptureToken) paused=\(passiveAudioPaused ? 1 : 0)")
+        guard shouldUsePassiveCapture(token: token) else {
+            log("passive system audio capture started stale token=\(token) state=\(passiveCaptureDebugState())")
             stopSystemAudioCapture(stream: stream, reason: "stale passive capture")
             return
         }
-        passiveCaptureActive = true
+        markPassiveCaptureActive(true)
         log("passive system audio capture ready token=\(token)")
         notifyPassiveState(.listening)
         fire { self.onStatus?("Audio AI listening.") }
@@ -550,10 +570,10 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             try await startPassiveSystemAudioCapture(token: token)
         } catch {
             if error is CancellationError {
-                log("passive system audio capture cancelled before activation token=\(token) current=\(passiveCaptureToken)")
+                log("passive system audio capture cancelled before activation token=\(token) state=\(passiveCaptureDebugState())")
                 return
             }
-            guard token == passiveCaptureToken, !passiveAudioPaused else {
+            guard shouldUsePassiveCapture(token: token) else {
                 log("passive system audio capture stale failure token=\(token) error=\(error.localizedDescription)")
                 return
             }
@@ -585,14 +605,14 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         }
 
         let stream = SCStream(filter: filter, configuration: cfg, delegate: nil)
-        scStream = stream
+        setSystemAudioStream(stream)
         do {
             try stream.addStreamOutput(self, type: .audio,
                                        sampleHandlerQueue: .global(qos: .userInteractive))
             try await stream.startCapture()
         } catch {
-            if stream === scStream {
-                scStream = nil
+            if isCurrentSystemAudioStream(stream) {
+                setSystemAudioStream(nil)
             }
             throw error
         }
@@ -604,16 +624,10 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         do {
             let stream = try await startSystemAudioCapture { [weak self] in
                 guard let self else { return false }
-                return !self.isStopped
-                    && self.mode == .pushToTalkSystemAudio
-                    && self.isRecordingPushToTalk
-                    && token == self.pushToTalkSystemCaptureToken
+                return self.shouldUsePushToTalkCapture(token: token)
             }
-            guard !isStopped,
-                  mode == .pushToTalkSystemAudio,
-                  isRecordingPushToTalk,
-                  token == pushToTalkSystemCaptureToken else {
-                log("instant system audio capture started after release token=\(token) current=\(pushToTalkSystemCaptureToken)")
+            guard shouldUsePushToTalkCapture(token: token) else {
+                log("instant system audio capture started after release token=\(token)")
                 stopSystemAudioCapture(stream: stream, reason: "stale instant capture")
                 return
             }
@@ -621,33 +635,23 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             fire { self.onStatus?("Recording system audio...") }
         } catch {
             if error is CancellationError {
-                log("instant system audio capture cancelled before activation token=\(token) current=\(pushToTalkSystemCaptureToken)")
+                log("instant system audio capture cancelled before activation token=\(token)")
                 return
             }
-            guard token == pushToTalkSystemCaptureToken else {
+            guard isCurrentPushToTalkToken(token) else {
                 log("instant system audio capture stale failure token=\(token) error=\(error.localizedDescription)")
                 return
             }
-            isRecordingPushToTalk = false
+            cancelPushToTalkRecording()
             log("instant system audio capture failed error=\(error.localizedDescription)")
             fire { self.onError?("Failed to capture system audio: \(error.localizedDescription)") }
         }
     }
 
     private func stopSystemAudioCapture(stream target: SCStream? = nil, reason: String) {
-        let stream: SCStream
-        if let target {
-            stream = target
-            if target === scStream {
-                scStream = nil
-            }
-        } else {
-            guard let current = scStream else { return }
-            stream = current
-            scStream = nil
-        }
+        guard let stream = takeSystemAudioStream(target: target) else { return }
         if mode == .passiveSystemAudio {
-            passiveCaptureActive = false
+            markPassiveCaptureActive(false)
         }
         log("system audio capture stopping reason=\(reason)")
         stream.stopCapture { [weak self] error in
@@ -666,14 +670,14 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             guard data.count > remaining, !self.pushToTalkLimitReached else { return }
             self.pushToTalkLimitReached = true
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.isRecordingPushToTalk else { return }
+                guard let self, self.isPushToTalkRecording() else { return }
                 self.onStatus?("Instant Voice reached 3 minutes; sending captured system audio.")
                 self.endPushToTalk()
             }
         }
     }
 
-    private func pcm16FromSampleBuffer(_ buf: CMSampleBuffer) -> Data? {
+    private func pcm16AndLevelFromSampleBuffer(_ buf: CMSampleBuffer) -> (pcm16: Data, level: Float)? {
         guard let block = CMSampleBufferGetDataBuffer(buf) else { return nil }
         var total: Int = 0
         var ptr: UnsafeMutablePointer<CChar>? = nil
@@ -685,8 +689,32 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
 
         let floatCount = total / MemoryLayout<Float32>.size
         return base.withMemoryRebound(to: Float32.self, capacity: floatCount) { fp in
-            pcm16FromFloatSamples(fp, count: floatCount)
+            let pcm16 = pcm16FromFloatSamples(fp, count: floatCount)
+            guard floatCount > 0 else { return (pcm16, 0) }
+
+            var sumSquares: Double = 0
+            for i in 0..<floatCount {
+                let sample = Double(max(-1, min(1, fp[i])))
+                sumSquares += sample * sample
+            }
+            let rms = sqrt(sumSquares / Double(floatCount))
+            // Map roughly -55 dB...-10 dB to the visible 0...1 meter range.
+            let decibels = 20 * log10(max(rms, 0.000_001))
+            let normalized = Float(max(0, min(1, (decibels + 55) / 45)))
+            return (pcm16, normalized)
         }
+    }
+
+    private func notifyAudioLevel(_ level: Float, force: Bool = false) {
+        guard mode == .passiveSystemAudio else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let shouldEmit = metricsQueue.sync { () -> Bool in
+            guard force || now - passiveLastLevelEmitAt >= 0.05 else { return false }
+            passiveLastLevelEmitAt = now
+            return true
+        }
+        guard shouldEmit else { return }
+        fire { self.onAudioLevel?(level) }
     }
 
     private func pcm16FromFloatSamples(_ samples: UnsafePointer<Float32>, count: Int) -> Data {
@@ -701,6 +729,130 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         return out
     }
 
+    private func nextPassiveCaptureToken() -> Int {
+        locked {
+            passiveCaptureToken += 1
+            return passiveCaptureToken
+        }
+    }
+
+    private func setPassiveAudioPausedIfChanged(_ paused: Bool) -> Int? {
+        locked {
+            guard passiveAudioPaused != paused else { return nil }
+            passiveAudioPaused = paused
+            passiveCaptureToken += 1
+            return passiveCaptureToken
+        }
+    }
+
+    private var isPassiveAudioPaused: Bool {
+        locked { passiveAudioPaused }
+    }
+
+    private var isPassiveCaptureListening: Bool {
+        locked {
+            mode == .passiveSystemAudio &&
+                passiveCaptureActive &&
+                !passiveAudioPaused &&
+                realtimeReady
+        }
+    }
+
+    private func shouldUsePassiveCapture(token: Int) -> Bool {
+        locked {
+            !stopped &&
+                mode == .passiveSystemAudio &&
+                !passiveAudioPaused &&
+                token == passiveCaptureToken
+        }
+    }
+
+    private func markPassiveCaptureActive(_ active: Bool) {
+        locked {
+            passiveCaptureActive = active
+        }
+    }
+
+    private func passiveCaptureDebugState() -> String {
+        locked {
+            "current=\(passiveCaptureToken) paused=\(passiveAudioPaused ? 1 : 0) stopped=\(stopped ? 1 : 0)"
+        }
+    }
+
+    private func setSystemAudioStream(_ stream: SCStream?) {
+        locked {
+            scStream = stream
+        }
+    }
+
+    private func isCurrentSystemAudioStream(_ stream: SCStream) -> Bool {
+        locked { stream === scStream }
+    }
+
+    private func takeSystemAudioStream(target: SCStream?) -> SCStream? {
+        locked {
+            if let target {
+                if target === scStream {
+                    scStream = nil
+                }
+                return target
+            }
+            guard let current = scStream else { return nil }
+            scStream = nil
+            return current
+        }
+    }
+
+    private func beginPushToTalkState() -> PushToTalkStartResult {
+        locked {
+            guard mode == .pushToTalkSystemAudio else { return .wrongMode }
+            guard !stopped else { return .stopped }
+            guard !isRecordingPushToTalk else { return .alreadyRecording }
+            guard realtimeReady else { return .notReady }
+
+            isRecordingPushToTalk = true
+            pushToTalkSystemCaptureToken += 1
+            return .started(pushToTalkSystemCaptureToken)
+        }
+    }
+
+    private func endPushToTalkState() -> Bool {
+        locked {
+            guard isRecordingPushToTalk else { return false }
+            isRecordingPushToTalk = false
+            pushToTalkSystemCaptureToken += 1
+            return true
+        }
+    }
+
+    private func cancelPushToTalkRecording() {
+        locked {
+            isRecordingPushToTalk = false
+            pushToTalkSystemCaptureToken += 1
+        }
+        recordingQueue.async { [weak self] in
+            self?.recordedPushToTalkAudio.removeAll(keepingCapacity: false)
+            self?.pushToTalkLimitReached = false
+        }
+    }
+
+    private func isPushToTalkRecording() -> Bool {
+        locked { isRecordingPushToTalk }
+    }
+
+    private func shouldUsePushToTalkCapture(token: Int) -> Bool {
+        locked {
+            !stopped &&
+                mode == .pushToTalkSystemAudio &&
+                isRecordingPushToTalk &&
+                token == pushToTalkSystemCaptureToken
+        }
+    }
+
+    private func isCurrentPushToTalkToken(_ token: Int) -> Bool {
+        locked { token == pushToTalkSystemCaptureToken }
+    }
+
     private func fire(_ block: @escaping () -> Void) {
         DispatchQueue.main.async(execute: block)
     }
@@ -710,10 +862,22 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         fire { self.onPassiveState?(state) }
     }
 
+    private func setRealtimeReady(_ ready: Bool) {
+        let changed = locked {
+            guard realtimeReady != ready else { return false }
+            realtimeReady = ready
+            return true
+        }
+        guard changed else { return }
+        fire { self.onReadyChanged?(ready) }
+    }
+
     private func passiveStateAfterServerError() -> PassiveState {
-        if passiveAudioPaused { return .paused }
-        if passiveCaptureActive, isRealtimeReady { return .listening }
-        return .unavailable
+        locked {
+            if passiveAudioPaused { return .paused }
+            if passiveCaptureActive, realtimeReady { return .listening }
+            return .unavailable
+        }
     }
 
     private var modeLabel: String {
@@ -766,6 +930,14 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         locked { wsTask }
     }
 
+    private func takeReceiveTask() -> Task<Void, Never>? {
+        locked {
+            let task = receiveTask
+            receiveTask = nil
+            return task
+        }
+    }
+
     private func locked<T>(_ block: () -> T) -> T {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -793,7 +965,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
 
     private func rotateSessionIfIdle() {
         guard !isStopped else { return }
-        if mode == .pushToTalkSystemAudio, isRecordingPushToTalk {
+        if mode == .pushToTalkSystemAudio, isPushToTalkRecording() {
             scheduleSessionRotation(after: rotationRetryInterval)
             return
         }
@@ -809,6 +981,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         }
         guard !isStopped, reconnectWorkItem == nil else { return }
         notifyPassiveState(.reconnecting)
+        setRealtimeReady(false)
         let attempt = locked {
             reconnectAttempt += 1
             return reconnectAttempt
@@ -833,19 +1006,18 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         log("restartConnection reason=\(reason)")
         notifyPassiveState(.reconnecting)
         fire { self.onStatus?("Realtime reconnecting (\(reason))...") }
-        receiveTask?.cancel()
-        receiveTask = nil
+        takeReceiveTask()?.cancel()
         rotationWorkItem?.cancel()
         rotationWorkItem = nil
 
         let oldTask = locked {
-            realtimeReady = false
             didSendSessionUpdate = false
             responseInFlight = false
             let current = wsTask
             wsTask = nil
             return current
         }
+        setRealtimeReady(false)
         oldTask?.cancel(with: .goingAway, reason: nil)
         clearPassiveSendBacklog()
 
@@ -853,7 +1025,7 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
             try connectWebSocket()
         } catch {
             log("restartConnection failed error=\(error.localizedDescription)")
-            fire { self.onError?("Realtime reconnect failed: \(error.localizedDescription)") }
+            fire { self.onStatus?("Realtime reconnect failed; retrying...") }
             scheduleReconnect(reason: reason)
         }
     }
@@ -890,31 +1062,63 @@ final class RealtimeAudioAIController: NSObject, @unchecked Sendable {
         }
     }
 
-    private func notePassiveSample(bytes: Int) {
-        passiveSampleBufferCount += 1
-        passiveSampleByteCount += bytes
-        let now = CFAbsoluteTimeGetCurrent()
-        if passiveSampleBufferCount == 1 || now - passiveLastSampleLogAt >= 10 {
-            passiveLastSampleLogAt = now
-            log("passive audio samples=\(passiveSampleBufferCount) bytes=\(passiveSampleByteCount) ready=\(isRealtimeReady ? 1 : 0)")
+    private func noteAudioAppendEvent(live: Bool, sourceBytes: Int, chunkBytes: Int) {
+        let metrics = metricsQueue.sync { () -> (shouldLog: Bool, events: Int, bytes: Int) in
+            audioAppendEventCount += 1
+            audioAppendByteCount += chunkBytes
+            let shouldLog = !live || audioAppendEventCount % 100 == 1
+            return (shouldLog, audioAppendEventCount, audioAppendByteCount)
         }
+        guard metrics.shouldLog else { return }
+        log("sent audio append live=\(live ? 1 : 0) bytes=\(sourceBytes) totalEvents=\(metrics.events) totalBytes=\(metrics.bytes)")
+    }
+
+    private func resetInstantSampleMetrics() {
+        metricsQueue.sync {
+            instantSampleBufferCount = 0
+            instantSampleByteCount = 0
+            instantLastSampleLogAt = 0
+        }
+    }
+
+    private func notePassiveSample(bytes: Int) {
+        let now = CFAbsoluteTimeGetCurrent()
+        let metrics = metricsQueue.sync { () -> (shouldLog: Bool, count: Int, totalBytes: Int) in
+            passiveSampleBufferCount += 1
+            passiveSampleByteCount += bytes
+            let shouldLog = passiveSampleBufferCount == 1 || now - passiveLastSampleLogAt >= 10
+            if shouldLog {
+                passiveLastSampleLogAt = now
+            }
+            return (shouldLog, passiveSampleBufferCount, passiveSampleByteCount)
+        }
+        guard metrics.shouldLog else { return }
+        log("passive audio samples=\(metrics.count) bytes=\(metrics.totalBytes) ready=\(isRealtimeReady ? 1 : 0)")
     }
 
     private func notePassiveAudioDroppedBeforeReady(bytes: Int) {
-        passiveDroppedBeforeReady += 1
-        if passiveDroppedBeforeReady == 1 || passiveDroppedBeforeReady % 100 == 0 {
-            log("dropping passive audio before session.updated drops=\(passiveDroppedBeforeReady) lastBytes=\(bytes)")
+        let metrics = metricsQueue.sync { () -> (shouldLog: Bool, drops: Int) in
+            passiveDroppedBeforeReady += 1
+            return (passiveDroppedBeforeReady == 1 || passiveDroppedBeforeReady % 100 == 0,
+                    passiveDroppedBeforeReady)
         }
+        guard metrics.shouldLog else { return }
+        log("dropping passive audio before session.updated drops=\(metrics.drops) lastBytes=\(bytes)")
     }
 
     private func noteInstantSample(bytes: Int) {
-        instantSampleBufferCount += 1
-        instantSampleByteCount += bytes
         let now = CFAbsoluteTimeGetCurrent()
-        if instantSampleBufferCount == 1 || now - instantLastSampleLogAt >= 5 {
-            instantLastSampleLogAt = now
-            log("instant system audio samples=\(instantSampleBufferCount) bytes=\(instantSampleByteCount)")
+        let metrics = metricsQueue.sync { () -> (shouldLog: Bool, count: Int, totalBytes: Int) in
+            instantSampleBufferCount += 1
+            instantSampleByteCount += bytes
+            let shouldLog = instantSampleBufferCount == 1 || now - instantLastSampleLogAt >= 5
+            if shouldLog {
+                instantLastSampleLogAt = now
+            }
+            return (shouldLog, instantSampleBufferCount, instantSampleByteCount)
         }
+        guard metrics.shouldLog else { return }
+        log("instant system audio samples=\(metrics.count) bytes=\(metrics.totalBytes)")
     }
 }
 
@@ -923,17 +1127,18 @@ extension RealtimeAudioAIController: SCStreamOutput {
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
         guard type == .audio, !isStopped else { return }
-        guard stream === scStream else { return }
-        guard let pcm16 = pcm16FromSampleBuffer(sampleBuffer) else { return }
+        guard isCurrentSystemAudioStream(stream) else { return }
+        guard let audio = pcm16AndLevelFromSampleBuffer(sampleBuffer) else { return }
         switch mode {
         case .passiveSystemAudio:
-            guard !passiveAudioPaused else { return }
-            notePassiveSample(bytes: pcm16.count)
-            sendAudioAppend(pcm16, live: true)
+            guard !isPassiveAudioPaused else { return }
+            notifyAudioLevel(audio.level)
+            notePassiveSample(bytes: audio.pcm16.count)
+            sendAudioAppend(audio.pcm16, live: true)
         case .pushToTalkSystemAudio:
-            guard isRecordingPushToTalk else { return }
-            noteInstantSample(bytes: pcm16.count)
-            appendPushToTalkSystemAudio(pcm16)
+            guard isPushToTalkRecording() else { return }
+            noteInstantSample(bytes: audio.pcm16.count)
+            appendPushToTalkSystemAudio(audio.pcm16)
         }
     }
 }
